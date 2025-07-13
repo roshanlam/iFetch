@@ -19,6 +19,7 @@ from ifetch.chunker import FileChunker
 from ifetch.tracker import DownloadTracker
 from ifetch.utils import can_read_file
 from ifetch.plugin import PluginManager
+from ifetch.versioning import VersionManager
 
 
 class DownloadManager:
@@ -47,6 +48,10 @@ class DownloadManager:
 
         # Load plugins once during instantiation
         self.plugin_manager = PluginManager()
+
+        # Will be set when download() is invoked
+        self.root_path: Optional[Path] = None
+        self.version_manager: Optional[VersionManager] = None
 
     def authenticate(self) -> None:
         """Handle iCloud authentication including 2FA/2SA if needed."""
@@ -172,6 +177,15 @@ class DownloadManager:
                 bytes_to_download = sum(end - start + 1 for start, end in changed_ranges)
                 temp_path = local_path.with_suffix(local_path.suffix + '.temp')
 
+                # Backup current file before modifications for rollback/versioning
+                if local_path.exists() and self.version_manager:
+                    try:
+                        old_checksum = self.calculate_checksum(local_path)
+                        rel_path = local_path.relative_to(self.root_path) if self.root_path else local_path.name
+                        self.version_manager.record_version(rel_path, old_checksum, local_path)
+                    except Exception:
+                        pass  # Non-fatal; continue with download
+
                 # Create parent directories if they don't exist
                 local_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -228,6 +242,19 @@ class DownloadManager:
                     changes=len(changed_ranges)
                 ))
                 tracker.cleanup()
+                # Update version metadata with new checksum
+                if self.version_manager:
+                    new_checksum = temp_checksum
+                    rel_path2 = local_path.relative_to(self.root_path) if self.root_path else local_path.name
+                    # Only create baseline entry if none exists yet
+                    if str(rel_path2) not in self.version_manager._data:
+                        self.version_manager._data[str(rel_path2)] = [{
+                            "version": 0,
+                            "checksum": new_checksum,
+                            "archived_path": str(local_path),
+                            "timestamp": time.strftime("%Y%m%dT%H%M%S"),
+                        }]
+                        self.version_manager._save()
 
                 # Notify plugins about successful download
                 self.plugin_manager.dispatch(
@@ -399,6 +426,11 @@ class DownloadManager:
 
         # Convert local_path to Path if it's a string
         local_path_obj = Path(local_path).resolve()
+
+        # Initialise version manager for this download session
+        self.root_path = local_path_obj
+        self.version_manager = VersionManager(local_path_obj)
+
         item = self.get_drive_item(icloud_path)
 
         self.logger.info(json.dumps({
