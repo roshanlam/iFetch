@@ -1,3 +1,5 @@
 pyicloud
 tqdm
 keyring
+pytest
+pytest-cov

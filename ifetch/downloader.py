@@ -13,11 +13,12 @@ from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
     PyiCloudNoStoredPasswordAvailableException
 )
-from logger import setup_logging
-from models import DownloadStatus
-from chunker import FileChunker
-from tracker import DownloadTracker
-from utils import can_read_file
+from ifetch.logger import setup_logging
+from ifetch.models import DownloadStatus
+from ifetch.chunker import FileChunker
+from ifetch.tracker import DownloadTracker
+from ifetch.utils import can_read_file
+from ifetch.plugin import PluginManager
 
 
 class DownloadManager:
@@ -43,6 +44,9 @@ class DownloadManager:
         self._active_downloads: Set[str] = set()
         self._download_lock = threading.Lock()
         self.chunker = FileChunker(chunk_size)
+
+        # Load plugins once during instantiation
+        self.plugin_manager = PluginManager()
 
     def authenticate(self) -> None:
         """Handle iCloud authentication including 2FA/2SA if needed."""
@@ -89,6 +93,9 @@ class DownloadManager:
             raise Exception("No stored password found. Please run 'icloud --username=you@example.com'")
         except Exception as e:
             raise Exception(f"Authentication failed: {e}")
+
+        # Notify plugins that authentication completed successfully
+        self.plugin_manager.dispatch("on_authenticated", downloader=self)
 
     def get_drive_item(self, path: str) -> Any:
         """Navigate to a specific path in iCloud Drive."""
@@ -190,6 +197,16 @@ class DownloadManager:
                         pbar.update(len(chunk))
                         tracker.save_status(end + 1)
 
+                        # Streaming progress event (generic)
+                        self.plugin_manager.dispatch(
+                            "on_event",
+                            name="download_progress",
+                            remote_item=item,
+                            local_path=local_path,
+                            downloaded=end,
+                            total_size=total_size,
+                        )
+
                 # Only calculate checksum if temp_path exists and has content
                 if temp_path.exists() and temp_path.stat().st_size > 0:
                     temp_checksum = self.calculate_checksum(temp_path)
@@ -211,6 +228,14 @@ class DownloadManager:
                     changes=len(changed_ranges)
                 ))
                 tracker.cleanup()
+
+                # Notify plugins about successful download
+                self.plugin_manager.dispatch(
+                    "after_download",
+                    remote_item=item,
+                    local_path=local_path,
+                    success=True,
+                )
                 return True
 
         except Exception as e:
@@ -238,6 +263,8 @@ class DownloadManager:
             ))
             return False
 
+        # Notify plugins about before/after failures handled above
+
     def process_item_parallel(self, item: Any, local_path: Path) -> None:
         """Process files and directories in parallel."""
         try:
@@ -249,6 +276,10 @@ class DownloadManager:
                     self._active_downloads.add(local_path_str)
 
                 try:
+                    # before_download hook
+                    self.plugin_manager.dispatch(
+                        "before_download", remote_item=item, local_path=local_path
+                    )
                     if self.download_drive_item(item, local_path):
                         self.logger.info(json.dumps({
                             "event": "download_success",
@@ -284,6 +315,15 @@ class DownloadManager:
                                     "error": str(e)
                                 }))
 
+                        # after_download hook success/failure already inside download_drive_item,
+                        # but make sure to send event even if function returned False
+                        self.plugin_manager.dispatch(
+                            "after_download",
+                            remote_item=item,
+                            local_path=local_path,
+                            success=False,
+                        )
+
         except Exception as e:
             self.logger.error(json.dumps({
                 "event": "processing_error",
@@ -308,6 +348,14 @@ class DownloadManager:
                         for name in contents
                     ]
                 }))
+
+                # Notify plugins about listing event
+                self.plugin_manager.dispatch(
+                    "on_list_contents", path=path, contents=[
+                        {"name": name, "type": "file" if can_read_file(item[name]) else "folder"}
+                        for name in contents
+                    ]
+                )
             else:
                 self.logger.info(json.dumps({"event": "item_info", "path": path, "type": "file"}))
         except Exception as e:
@@ -365,6 +413,9 @@ class DownloadManager:
 
         report = self.generate_summary_report()
         self.logger.info(json.dumps({"event": "download_completed", "summary": report}))
+
+        # Notify plugins with generic completion event
+        self.plugin_manager.dispatch("on_event", name="download_session_completed", summary=report)
 
         # Create report file in the same location as downloads
         report_path = local_path_obj / "download_report.json"
