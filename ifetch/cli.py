@@ -2,7 +2,20 @@
 import sys
 import argparse
 from pathlib import Path
-from downloader import DownloadManager
+
+# ---------------------------------------------------------------------------
+# Import DownloadManager whether this script is executed as a module inside
+# the ifetch package or run directly via `python ifetch/cli.py`.
+# ---------------------------------------------------------------------------
+
+if __package__ in (None, ""):
+    # Running as a standalone script: add project root to path and import absolute
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from ifetch.downloader import DownloadManager  # type: ignore
+else:
+    # Running as part of package (python -m ifetch.cli)
+    from .downloader import DownloadManager  # type: ignore
+
 
 def main():
     parser = argparse.ArgumentParser(

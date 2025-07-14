@@ -13,13 +13,13 @@ from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
     PyiCloudNoStoredPasswordAvailableException
 )
-from logger import setup_logging
-from models import DownloadStatus
-from chunker import FileChunker
-from tracker import DownloadTracker
-from utils import can_read_file
-from plugin import PluginManager
-from versioning import VersionManager
+from .logger import setup_logging
+from .models import DownloadStatus
+from .chunker import FileChunker
+from .tracker import DownloadTracker
+from .utils import can_read_file
+from .plugin import PluginManager
+from .versioning import VersionManager
 
 
 class DownloadManager:
