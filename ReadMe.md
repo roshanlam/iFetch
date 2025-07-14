@@ -13,6 +13,10 @@ A robust Python utility for efficiently downloading files and folders from iClou
 - 📝 **Structured JSON logging** (console + optional file)
 - 📊 **Download summary report** (successes, failures, stats)
 - 🔍 **Directory listing mode** (without downloading)
+- 🤝 **Shared-folder support** (`--list-shared`, download shared items)
+- 🧩 **Plugin system** – hook into authentication, progress & completion events
+- 🗂 **Profile-based include/exclude filters** for personalised sync sets
+- 🗄 **On-disk version history & rollback** with automatic archiving of prior versions
 
 ## Why This Tool?
 
@@ -96,7 +100,55 @@ python cli.py Documents/Programming ~/Work/Code \
 | `--chunk-size BYTES`    | Byte size for each differential-download chunk                   | 1 MB            |
 | `--log-file PATH`       | Path to save structured JSON logs                                | (console only)  |
 | `--list`                | List contents only (no downloads)                                | off             |
+| `--list-shared`         | List top-level items shared *with* you                            | off             |
+| `--profile NAME`        | Apply include/exclude patterns from profile file                  | (no filter)     |
+| `--profile-file PATH`   | Custom path to profile JSON (defaults to `~/.ifetch_profiles.json`) | default path    |
 
+### List Shared Items
+List everything that has been shared with your account (no path needed):
+```sh
+python ifetch/cli.py --list-shared --email you@apple.com
+```
+
+### Use a Profile
+Create a profile file (JSON) – default location `~/.ifetch_profiles.json`:
+
+```json
+{
+  "pdf_backup": {
+    "include": ["Documents/**/*.pdf"],
+    "exclude": ["Documents/Private/*"]
+  }
+}
+```
+
+Download only PDFs according to the above profile:
+```sh
+python ifetch/cli.py Documents ~/PDFs \
+  --profile pdf_backup \
+  --email you@apple.com
+```
+
+Specify another profile file:
+```sh
+python ifetch/cli.py Documents ~/PDFs \
+  --profile pdf_backup \
+  --profile-file ./my_profiles.json \
+  --email you@apple.com
+```
+
+### Extend with Plugins
+Drop a Python file inside a `plugins/` folder:
+
+```python
+from ifetch.plugin import BasePlugin
+
+class Notify(BasePlugin):
+    def after_download(self, remote_item, local_path, success, **kw):
+        if success:
+            print(f"Downloaded {remote_item.name} → {local_path}")
+```
+iFetch auto-discovers plugins on startup.
 
 ## Contributing
 Contributions are welcome! Please feel free to submit a Pull Request.
