@@ -73,6 +73,17 @@ def main():
         help='List top-level items that have been shared with you'
     )
 
+    parser.add_argument(
+        '--profile',
+        help='Profile name from ~/.ifetch_profiles.json to use for include/exclude patterns'
+    )
+
+    parser.add_argument(
+        '--profile-file',
+        dest='profile_file',
+        help='Custom path to a profile JSON file (overrides default ~/.ifetch_profiles.json)'
+    )
+
     args = parser.parse_args()
 
     try:
@@ -85,12 +96,24 @@ def main():
         print(f"Parallel Workers: {args.max_workers}")
         print("=" * 70)
 
+        # Load profile patterns
+        from ifetch.profiles import ProfileManager  # local import to avoid overhead if unused
+
+        pm = None
+        if args.profile:
+            from pathlib import Path as _P
+            cfg_path = _P(args.profile_file).expanduser() if args.profile_file else None
+            pm = ProfileManager(args.profile, config_path=cfg_path)  # type: ignore[arg-type]
+        include_pats, exclude_pats = pm.get_patterns() if pm else ([], [])
+
         # Initialize the downloader
         downloader = DownloadManager(
             email=args.email,
             max_workers=args.max_workers,
             max_retries=args.max_retries,
-            chunk_size=args.chunk_size
+            chunk_size=args.chunk_size,
+            include_patterns=include_pats,
+            exclude_patterns=exclude_pats
         )
 
         # Authenticate (will prompt for password if needed)

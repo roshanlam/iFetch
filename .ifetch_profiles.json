@@ -1,0 +1,6 @@
+{
+    "pdf_backup": {
+      "include": ["Documents/**/*.pdf"],
+      "exclude": ["Documents/Private/*"]
+    }
+  }

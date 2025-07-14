@@ -29,7 +29,9 @@ class DownloadManager:
         email: Optional[str] = None,
         max_workers: int = 4,
         max_retries: int = 3,
-        chunk_size: int = 1024 * 1024
+        chunk_size: int = 1024 * 1024,
+        include_patterns: Optional[List[str]] = None,
+        exclude_patterns: Optional[List[str]] = None,
     ):
         self.email = email or os.environ.get('ICLOUD_EMAIL')
         if not self.email:
@@ -45,6 +47,9 @@ class DownloadManager:
         self._active_downloads: Set[str] = set()
         self._download_lock = threading.Lock()
         self.chunker = FileChunker(chunk_size)
+
+        self.include_patterns = include_patterns or []
+        self.exclude_patterns = exclude_patterns or []
 
         # Load plugins once during instantiation
         self.plugin_manager = PluginManager()
@@ -318,6 +323,11 @@ class DownloadManager:
     def process_item_parallel(self, item: Any, local_path: Path) -> None:
         """Process files and directories in parallel."""
         try:
+            # If file/dir is excluded by patterns, skip
+            rel_path = local_path.relative_to(self.root_path) if self.root_path else local_path
+            if not self._should_process(rel_path, is_dir=False if can_read_file(item) else True):
+                return
+
             if can_read_file(item):
                 with self._download_lock:
                     local_path_str = str(local_path)
@@ -505,3 +515,19 @@ class DownloadManager:
         report_path = local_path_obj / "download_report.json"
         with report_path.open('w') as f:
             json.dump(report, f, indent=2)
+
+    def _should_process(self, rel_path: Path, is_dir: bool) -> bool:
+        """Return True if path should be downloaded/traversed based on include/exclude patterns."""
+        from fnmatch import fnmatch
+
+        path_str = rel_path.as_posix()
+
+        # Exclude check first
+        for pat in self.exclude_patterns:
+            if fnmatch(path_str, pat):
+                return False
+
+        # Include logic: if include list empty -> include all; else must match one
+        if not self.include_patterns:
+            return True
+        return any(fnmatch(path_str, pat) for pat in self.include_patterns)
