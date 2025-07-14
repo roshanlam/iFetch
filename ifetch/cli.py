@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import sys
 import argparse
-from ifetch.downloader import DownloadManager
+from pathlib import Path
+from downloader import DownloadManager
 
 def main():
     parser = argparse.ArgumentParser(
@@ -9,7 +10,9 @@ def main():
     )
     parser.add_argument(
         'icloud_path',
-        help='Remote iCloud Drive path (e.g., "Documents/MyFolder")'
+        nargs='?',
+        default=None,
+        help='Remote iCloud Drive path (e.g., "Documents/MyFolder"). Required unless --list-shared is supplied.'
     )
     parser.add_argument(
         'local_path',
@@ -50,13 +53,21 @@ def main():
         help='List directory contents instead of downloading'
     )
 
+    parser.add_argument(
+        '--list-shared',
+        dest='list_shared',
+        action='store_true',
+        help='List top-level items that have been shared with you'
+    )
+
     args = parser.parse_args()
 
     try:
         # Create a progress banner
         print("=" * 70)
         print(f"iCloud Drive Downloader")
-        print(f"Remote Path: {args.icloud_path}")
+        if args.icloud_path:
+            print(f"Remote Path: {args.icloud_path}")
         print(f"Local Path: {args.local_path}")
         print(f"Parallel Workers: {args.max_workers}")
         print("=" * 70)
@@ -75,11 +86,17 @@ def main():
         print("Authentication successful!")
 
         # Perform the requested operation
-        if args.list_only:
+        if args.list_shared:
+            print("\nListing top-level shared items:")
+            print("-" * 50)
+            downloader.list_shared_roots()
+        elif args.list_only:
             print(f"\nListing contents of '{args.icloud_path}':")
             print("-" * 50)
             downloader.list_contents(args.icloud_path)
         else:
+            if not args.icloud_path:
+                raise ValueError("icloud_path is required unless using --list-shared")
             print(f"\nDownloading from '{args.icloud_path}' to '{args.local_path}'")
             print("This may take some time depending on the size of the content...")
             downloader.download(

@@ -13,13 +13,13 @@ from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
     PyiCloudNoStoredPasswordAvailableException
 )
-from ifetch.logger import setup_logging
-from ifetch.models import DownloadStatus
-from ifetch.chunker import FileChunker
-from ifetch.tracker import DownloadTracker
-from ifetch.utils import can_read_file
-from ifetch.plugin import PluginManager
-from ifetch.versioning import VersionManager
+from logger import setup_logging
+from models import DownloadStatus
+from chunker import FileChunker
+from tracker import DownloadTracker
+from utils import can_read_file
+from plugin import PluginManager
+from versioning import VersionManager
 
 
 class DownloadManager:
@@ -107,17 +107,40 @@ class DownloadManager:
         if not self.api or not self.api.drive:
             raise Exception("Not authenticated or Drive service not available")
 
-        item = self.api.drive
-        for part in path.strip('/').split('/'):
-            if not part:
-                continue
-            try:
+        # iCloud distinguishes between items you own (self.api.drive)
+        # and items shared *with* you (self.api.drive.shared).  We first walk
+        # through the owned drive; if the very first component is not found
+        # there, we fall back to the shared root and continue the traversal
+        # from that point.
+
+        owned_root = self.api.drive
+        shared_root = getattr(self.api.drive, "shared", None)
+
+        parts = [p for p in path.strip("/").split("/") if p]
+        if not parts:
+            return owned_root
+
+        # Try owned drive first
+        try:
+            item: Any = owned_root
+            for part in parts:
                 if item is None:
-                    raise Exception(f"Invalid path component: {part} in {path}")
+                    raise KeyError
                 item = item[part]
-            except (KeyError, AttributeError):
+            return item
+        except (KeyError, AttributeError):
+            # Fall back to shared items only when failing at the *first* segment
+            if shared_root is None:
                 raise Exception(f"Path not found: {path}")
-        return item
+
+        # Restart traversal from shared root
+        try:
+            item = shared_root
+            for part in parts:
+                item = item[part]
+            return item
+        except (KeyError, AttributeError):
+            raise Exception(f"Path not found: {path}")
 
     def calculate_checksum(self, file_path: Path) -> str:
         """Calculate SHA-256 checksum of a file."""
@@ -387,6 +410,35 @@ class DownloadManager:
                 self.logger.info(json.dumps({"event": "item_info", "path": path, "type": "file"}))
         except Exception as e:
             self.logger.error(json.dumps({"event": "listing_error", "path": path, "error": str(e)}))
+
+    # ------------------------------------------------------------------
+    # Shared-drive helpers
+    # ------------------------------------------------------------------
+    def list_shared_roots(self) -> None:
+        """List the top-level items that have been shared *with* the user."""
+        if not self.api:
+            self.authenticate()
+
+        shared_root = getattr(self.api.drive, "shared", None)
+        if not shared_root:
+            self.logger.info(json.dumps({"event": "no_shared_items"}))
+            return
+
+        try:
+            contents = shared_root.dir()
+            if not contents:
+                self.logger.info(json.dumps({"event": "no_shared_items"}))
+                return
+
+            self.logger.info(json.dumps({
+                "event": "listing_shared_roots",
+                "contents": [
+                    {"name": name, "type": "file" if can_read_file(shared_root[name]) else "folder"}
+                    for name in contents
+                ]
+            }))
+        except Exception as e:
+            self.logger.error(json.dumps({"event": "shared_listing_error", "error": str(e)}))
 
     def generate_summary_report(self) -> Dict[str, Any]:
         """Generate a summary report of the download operation."""
