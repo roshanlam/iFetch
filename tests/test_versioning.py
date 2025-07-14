@@ -38,12 +38,6 @@ def test_version_manager_backup_and_meta(tmp_path):
     meta2 = json.loads((root / vm.META_FILENAME).read_text())
     assert len(meta2[str(rel)]) == 2
 
-
-# ----------------------------------------------------------------------
-# Additional tests merged from test_versioning_extra.py
-# ----------------------------------------------------------------------
-
-
 def test_latest_checksum_empty(tmp_path):
     vm = VersionManager(tmp_path)
     assert vm.latest_checksum(Path("nonexistent.txt")) is None
