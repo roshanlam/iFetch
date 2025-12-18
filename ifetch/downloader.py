@@ -185,19 +185,29 @@ class DownloadManager:
             except Exception as e:
                 last_error = e
                 error_str = str(e).lower()
-                # Retry on connection errors, not on auth or other permanent errors
-                if any(x in error_str for x in ['connection', 'remote', 'timeout', 'reset']):
-                    if attempt < max_retries - 1:
-                        wait_time = 2 ** (attempt + 1)  # 2, 4, 8 seconds
-                        self.logger.warning(json.dumps({
-                            "event": "connection_retry",
-                            "file": getattr(item, 'name', 'unknown'),
-                            "attempt": attempt + 1,
-                            "wait_seconds": wait_time,
-                            "error": str(e)
-                        }))
-                        time.sleep(wait_time)
-                        continue
+                # Retry on connection errors and server errors, not on auth or other permanent errors
+                retryable = any(x in error_str for x in [
+                    'connection', 'remote', 'timeout', 'reset',
+                    '503', 'service unavailable', 'retry_needed', 'internal_failure'
+                ])
+                if retryable and attempt < max_retries - 1:
+                    # Check if server specified retryAfter
+                    wait_time = 2 ** (attempt + 1)  # Default: 2, 4, 8 seconds
+                    if 'retryafter' in error_str:
+                        # Try to extract retryAfter value, cap at 60s
+                        import re
+                        match = re.search(r'retryafter["\s:]+(\d+)', error_str)
+                        if match:
+                            wait_time = min(int(match.group(1)), 60)
+                    self.logger.warning(json.dumps({
+                        "event": "connection_retry",
+                        "file": getattr(item, 'name', 'unknown'),
+                        "attempt": attempt + 1,
+                        "wait_seconds": wait_time,
+                        "error": str(e)
+                    }))
+                    time.sleep(wait_time)
+                    continue
                 raise  # Non-retryable error
         raise last_error  # All retries exhausted
 
