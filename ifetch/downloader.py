@@ -176,6 +176,31 @@ class DownloadManager:
 
         raise Exception(f"Failed to download chunk {start}-{end} after {self.max_retries} retries: {last_error}")
 
+    def _open_with_retry(self, item: Any, max_retries: int = 3) -> Any:
+        """Open item with retry logic for transient connection errors."""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return item.open(stream=True)
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                # Retry on connection errors, not on auth or other permanent errors
+                if any(x in error_str for x in ['connection', 'remote', 'timeout', 'reset']):
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+                        self.logger.warning(json.dumps({
+                            "event": "connection_retry",
+                            "file": getattr(item, 'name', 'unknown'),
+                            "attempt": attempt + 1,
+                            "wait_seconds": wait_time,
+                            "error": str(e)
+                        }))
+                        time.sleep(wait_time)
+                        continue
+                raise  # Non-retryable error
+        raise last_error  # All retries exhausted
+
     def download_drive_item(self, item: Any, local_path: Path) -> bool:
         """Download file with differential updates support and checkpointing."""
         if not hasattr(item, 'name') or not hasattr(item, 'open'):
@@ -190,7 +215,7 @@ class DownloadManager:
         total_size = 0
 
         try:
-            with item.open(stream=True) as response:
+            with self._open_with_retry(item) as response:
                 total_size = int(response.headers.get('content-length', 0))
                 existing_chunks = self.chunker.get_file_chunks(local_path)
                 changed_ranges = self.chunker.find_changed_chunks(response, existing_chunks, local_path)
