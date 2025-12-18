@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import shutil
 import time
+import threading
+import copy
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
@@ -31,6 +33,7 @@ class VersionManager:
         self.versions_dir = self.root / self.VERSIONS_DIRNAME
         self.versions_dir.mkdir(parents=True, exist_ok=True)
         self._data: Dict[str, List[Dict[str, Any]]] = {}
+        self._lock = threading.Lock()
         self._load()
 
     # ------------------------------------------------------------------
@@ -45,9 +48,10 @@ class VersionManager:
         """Move *src_file* into versions dir and update metadata."""
         key = str(rel_path.as_posix())
 
-        # Peek at existing versions *without* mutating state yet
-        existing: List[Dict[str, Any]] | None = self._data.get(key)
-        version_nr = (existing[-1]["version"] + 1) if existing else 1
+        with self._lock:
+            # Peek at existing versions *without* mutating state yet
+            existing: List[Dict[str, Any]] | None = self._data.get(key)
+            version_nr = (existing[-1]["version"] + 1) if existing else 1
 
         ts = time.strftime("%Y%m%dT%H%M%S")
         dest = self.versions_dir / f"{rel_path.as_posix()}.v{version_nr}_{ts}"
@@ -58,17 +62,18 @@ class VersionManager:
             # Move failed => do *not* touch metadata
             return
 
-        # Ensure list exists now that move succeeded
-        versions = self._data.setdefault(key, [])
+        with self._lock:
+            # Ensure list exists now that move succeeded
+            versions = self._data.setdefault(key, [])
 
-        versions.append(
-            {
-                "version": version_nr,
-                "checksum": checksum,
-                "archived_path": str(dest),
-                "timestamp": ts,
-            }
-        )
+            versions.append(
+                {
+                    "version": version_nr,
+                    "checksum": checksum,
+                    "archived_path": str(dest),
+                    "timestamp": ts,
+                }
+            )
         self._save()
 
     # ------------------------------------------------------------------
@@ -83,7 +88,10 @@ class VersionManager:
 
     def _save(self):
         try:
+            with self._lock:
+                # Deep copy to avoid "dictionary changed size during iteration"
+                data_snapshot = copy.deepcopy(self._data)
             with self.meta_path.open("w") as fp:
-                json.dump(self._data, fp, indent=2)
-        except OSError:
-            pass 
+                json.dump(data_snapshot, fp, indent=2)
+        except (OSError, RuntimeError):
+            pass

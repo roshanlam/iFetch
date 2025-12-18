@@ -3,6 +3,7 @@ import time
 import shutil
 import json
 import threading
+import traceback
 from pathlib import Path
 from typing import Optional, List, Set, Dict, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -275,14 +276,15 @@ class DownloadManager:
                     new_checksum = temp_checksum
                     rel_path2 = local_path.relative_to(self.root_path) if self.root_path else local_path.name
                     # Only create baseline entry if none exists yet
-                    if str(rel_path2) not in self.version_manager._data:
-                        self.version_manager._data[str(rel_path2)] = [{
-                            "version": 0,
-                            "checksum": new_checksum,
-                            "archived_path": str(local_path),
-                            "timestamp": time.strftime("%Y%m%dT%H%M%S"),
-                        }]
-                        self.version_manager._save()
+                    with self.version_manager._lock:
+                        if str(rel_path2) not in self.version_manager._data:
+                            self.version_manager._data[str(rel_path2)] = [{
+                                "version": 0,
+                                "checksum": new_checksum,
+                                "archived_path": str(local_path),
+                                "timestamp": time.strftime("%Y%m%dT%H%M%S"),
+                            }]
+                    self.version_manager._save()
 
                 # Notify plugins about successful download
                 self.plugin_manager.dispatch(
@@ -297,7 +299,8 @@ class DownloadManager:
             self.logger.error(json.dumps({
                 "event": "download_failed",
                 "file": getattr(item, 'name', 'unknown'),
-                "error": str(e)
+                "error": str(e),
+                "traceback": traceback.format_exc()
             }))
             if temp_path and temp_path.exists():
                 try:
@@ -377,7 +380,8 @@ class DownloadManager:
                             except Exception as e:
                                 self.logger.error(json.dumps({
                                     "event": "future_exception",
-                                    "error": str(e)
+                                    "error": str(e),
+                                    "traceback": traceback.format_exc()
                                 }))
 
                         # after_download hook success/failure already inside download_drive_item,
@@ -393,7 +397,8 @@ class DownloadManager:
             self.logger.error(json.dumps({
                 "event": "processing_error",
                 "file": getattr(item, 'name', 'unknown'),
-                "error": str(e)
+                "error": str(e),
+                "traceback": traceback.format_exc()
             }))
 
     def list_contents(self, path: str) -> None:
