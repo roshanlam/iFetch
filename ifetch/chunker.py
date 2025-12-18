@@ -46,65 +46,39 @@ class FileChunker:
     def find_changed_chunks(
         self,
         response: Any,
-        existing_chunks: Dict[str, Tuple[int, int]]
+        existing_chunks: Dict[str, Tuple[int, int]],
+        local_path: Optional[Path] = None
     ) -> List[Tuple[int, int]]:
         """
-        Compare a remote file to local chunks and identify ranges that need downloading.
+        Compare a remote file to local file and identify ranges that need downloading.
+
+        Uses file size comparison since HTTP streams aren't seekable.
+        If sizes match, assumes file is unchanged. If sizes differ or file
+        doesn't exist, downloads the entire file.
 
         Args:
             response: The file download response
             existing_chunks: Dictionary of existing chunks from get_file_chunks
+            local_path: Path to local file for size comparison
 
         Returns:
             List of (start, end) byte ranges that need to be downloaded
         """
-        if not existing_chunks:
-            total_size = int(response.headers.get('content-length', 0))
-            if total_size > 0:
-                return [(0, total_size - 1)]
-            return []
-
         total_size = int(response.headers.get('content-length', 0))
 
-        # Save current position to return to it after analysis
-        current_pos = response.raw.tell()
+        if total_size == 0:
+            return []
 
-        # Create a list of all byte positions that need downloading
-        changed_ranges = []
-        position = 0
+        # If no local file exists, download everything
+        if not existing_chunks:
+            return [(0, total_size - 1)]
 
-        response.raw.seek(0)
-        while position < total_size:
-            chunk_data = response.raw.read(self.chunk_size)
-            if not chunk_data:
-                break
+        # Compare file sizes - if local file exists and matches remote size, skip
+        if local_path and local_path.exists():
+            local_size = local_path.stat().st_size
+            if local_size == total_size:
+                # File sizes match - assume unchanged
+                return []
 
-            chunk_hash = hashlib.md5(chunk_data).hexdigest()
-            chunk_size = len(chunk_data)
-
-            # If this chunk doesn't exist locally or is at a different position
-            if chunk_hash not in existing_chunks:
-                changed_ranges.append((position, position + chunk_size - 1))
-
-            position += chunk_size
-
-        # Restore the original position
-        response.raw.seek(current_pos)
-
-        # Optimize the ranges by merging adjacent or overlapping ranges
-        if changed_ranges:
-            changed_ranges.sort()
-            optimized = [changed_ranges[0]]
-
-            for current_start, current_end in changed_ranges[1:]:
-                prev_start, prev_end = optimized[-1]
-
-                # If ranges overlap or are adjacent, merge them
-                if current_start <= prev_end + 1:
-                    optimized[-1] = (prev_start, max(prev_end, current_end))
-                else:
-                    optimized.append((current_start, current_end))
-
-            return optimized
-
-        return []
+        # Sizes differ or can't compare - download everything
+        return [(0, total_size - 1)]
