@@ -192,7 +192,7 @@ class DownloadManager:
             with item.open(stream=True) as response:
                 total_size = int(response.headers.get('content-length', 0))
                 existing_chunks = self.chunker.get_file_chunks(local_path)
-                changed_ranges = self.chunker.find_changed_chunks(response, existing_chunks)
+                changed_ranges = self.chunker.find_changed_chunks(response, existing_chunks, local_path)
 
                 if not changed_ranges:
                     self.logger.info(json.dumps({
@@ -359,11 +359,16 @@ class DownloadManager:
             elif hasattr(item, 'dir'):
                 contents = item.dir()
                 if contents:
+                    # Pre-resolve all child items BEFORE parallel execution to avoid
+                    # "dictionary changed size during iteration" when pyicloud lazily
+                    # loads items and modifies its internal cache
+                    content_names = list(contents.keys()) if hasattr(contents, 'keys') else list(contents)
+                    child_items = [(item[name], local_path / name) for name in content_names]
                     local_path.mkdir(parents=True, exist_ok=True)
                     with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                         futures = [
-                            executor.submit(self.process_item_parallel, item[name], local_path / name)
-                            for name in contents
+                            executor.submit(self.process_item_parallel, child_item, child_path)
+                            for child_item, child_path in child_items
                         ]
                         for future in as_completed(futures):
                             # Retrieve result or exception
