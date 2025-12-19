@@ -192,7 +192,7 @@ class DownloadManager:
             with item.open(stream=True) as response:
                 total_size = int(response.headers.get('content-length', 0))
                 existing_chunks = self.chunker.get_file_chunks(local_path)
-                changed_ranges = self.chunker.find_changed_chunks(response, existing_chunks)
+                changed_ranges = self.chunker.find_changed_chunks(response, existing_chunks, local_path)
 
                 if not changed_ranges:
                     self.logger.info(json.dumps({
