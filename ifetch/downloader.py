@@ -3,6 +3,7 @@ import time
 import shutil
 import json
 import threading
+import traceback
 from pathlib import Path
 from typing import Optional, List, Set, Dict, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -175,6 +176,41 @@ class DownloadManager:
 
         raise Exception(f"Failed to download chunk {start}-{end} after {self.max_retries} retries: {last_error}")
 
+    def _open_with_retry(self, item: Any, max_retries: int = 3) -> Any:
+        """Open item with retry logic for transient connection errors."""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return item.open(stream=True)
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                # Retry on connection errors and server errors, not on auth or other permanent errors
+                retryable = any(x in error_str for x in [
+                    'connection', 'remote', 'timeout', 'reset',
+                    '503', 'service unavailable', 'retry_needed', 'internal_failure'
+                ])
+                if retryable and attempt < max_retries - 1:
+                    # Check if server specified retryAfter
+                    wait_time = 2 ** (attempt + 1)  # Default: 2, 4, 8 seconds
+                    if 'retryafter' in error_str:
+                        # Try to extract retryAfter value, cap at 60s
+                        import re
+                        match = re.search(r'retryafter["\s:]+(\d+)', error_str)
+                        if match:
+                            wait_time = min(int(match.group(1)), 60)
+                    self.logger.warning(json.dumps({
+                        "event": "connection_retry",
+                        "file": getattr(item, 'name', 'unknown'),
+                        "attempt": attempt + 1,
+                        "wait_seconds": wait_time,
+                        "error": str(e)
+                    }))
+                    time.sleep(wait_time)
+                    continue
+                raise  # Non-retryable error
+        raise last_error  # All retries exhausted
+
     def download_drive_item(self, item: Any, local_path: Path) -> bool:
         """Download file with differential updates support and checkpointing."""
         if not hasattr(item, 'name') or not hasattr(item, 'open'):
@@ -189,7 +225,7 @@ class DownloadManager:
         total_size = 0
 
         try:
-            with item.open(stream=True) as response:
+            with self._open_with_retry(item) as response:
                 total_size = int(response.headers.get('content-length', 0))
                 existing_chunks = self.chunker.get_file_chunks(local_path)
                 changed_ranges = self.chunker.find_changed_chunks(response, existing_chunks, local_path)
@@ -275,14 +311,15 @@ class DownloadManager:
                     new_checksum = temp_checksum
                     rel_path2 = local_path.relative_to(self.root_path) if self.root_path else local_path.name
                     # Only create baseline entry if none exists yet
-                    if str(rel_path2) not in self.version_manager._data:
-                        self.version_manager._data[str(rel_path2)] = [{
-                            "version": 0,
-                            "checksum": new_checksum,
-                            "archived_path": str(local_path),
-                            "timestamp": time.strftime("%Y%m%dT%H%M%S"),
-                        }]
-                        self.version_manager._save()
+                    with self.version_manager._lock:
+                        if str(rel_path2) not in self.version_manager._data:
+                            self.version_manager._data[str(rel_path2)] = [{
+                                "version": 0,
+                                "checksum": new_checksum,
+                                "archived_path": str(local_path),
+                                "timestamp": time.strftime("%Y%m%dT%H%M%S"),
+                            }]
+                    self.version_manager._save()
 
                 # Notify plugins about successful download
                 self.plugin_manager.dispatch(
@@ -297,7 +334,8 @@ class DownloadManager:
             self.logger.error(json.dumps({
                 "event": "download_failed",
                 "file": getattr(item, 'name', 'unknown'),
-                "error": str(e)
+                "error": str(e),
+                "traceback": traceback.format_exc()
             }))
             if temp_path and temp_path.exists():
                 try:
@@ -359,11 +397,16 @@ class DownloadManager:
             elif hasattr(item, 'dir'):
                 contents = item.dir()
                 if contents:
+                    # Pre-resolve all child items BEFORE parallel execution to avoid
+                    # "dictionary changed size during iteration" when pyicloud lazily
+                    # loads items and modifies its internal cache
+                    content_names = list(contents.keys()) if hasattr(contents, 'keys') else list(contents)
+                    child_items = [(item[name], local_path / name) for name in content_names]
                     local_path.mkdir(parents=True, exist_ok=True)
                     with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                         futures = [
-                            executor.submit(self.process_item_parallel, item[name], local_path / name)
-                            for name in contents
+                            executor.submit(self.process_item_parallel, child_item, child_path)
+                            for child_item, child_path in child_items
                         ]
                         for future in as_completed(futures):
                             # Retrieve result or exception
@@ -372,7 +415,8 @@ class DownloadManager:
                             except Exception as e:
                                 self.logger.error(json.dumps({
                                     "event": "future_exception",
-                                    "error": str(e)
+                                    "error": str(e),
+                                    "traceback": traceback.format_exc()
                                 }))
 
                         # after_download hook success/failure already inside download_drive_item,
@@ -388,7 +432,8 @@ class DownloadManager:
             self.logger.error(json.dumps({
                 "event": "processing_error",
                 "file": getattr(item, 'name', 'unknown'),
-                "error": str(e)
+                "error": str(e),
+                "traceback": traceback.format_exc()
             }))
 
     def list_contents(self, path: str) -> None:
