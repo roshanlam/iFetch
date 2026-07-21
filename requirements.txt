@@ -1,7 +1,7 @@
-# picklepete/pyicloud is abandoned (last release Feb 2022).
-# timlaing/pyicloud is the actively maintained fork with shared-drive support
-# (PR #152 — shareID propagation for folder traversal, v2.5.0 Apr 2026).
-git+https://github.com/timlaing/pyicloud.git
+# pyicloud on PyPI is now the actively maintained timlaing/pyicloud fork
+# (>=2.5.0 has shared-drive shareID propagation for folder traversal).
+pyicloud>=2.5.0
+requests
 tqdm
 keyring
 pytest
