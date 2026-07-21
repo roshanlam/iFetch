@@ -32,7 +32,7 @@ First release on PyPI: `pip install ifetch`.
 - Automated test suite (pytest + pytest-cov) with expanded coverage across
   downloader flows.
 - Buy Me a Coffee funding option; MIT license.
-- CI workflows (test matrix across Python 3.9–3.13 on Ubuntu/macOS, ruff
+- CI workflows (test matrix across Python 3.10–3.13 on Ubuntu/macOS, ruff
   lint), PyPI publish workflow, issue/PR templates, CONTRIBUTING guide, and
   this changelog.
 

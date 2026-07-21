@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/roshanlam/iFetch/actions/workflows/ci.yml/badge.svg)](https://github.com/roshanlam/iFetch/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
 Apple gives you two ways to get your data out of iCloud Drive: drag files around in Finder, or wait days for a privacy export. iFetch gives you a third: a scriptable CLI that downloads exactly what you want, only re-fetches what changed, survives interruptions, and keeps a local version history so an accidental overwrite in the cloud never costs you a file.
 
