@@ -6,16 +6,19 @@
 
 iFetch authenticates through [pyicloud](https://github.com/timlaing/pyicloud) using the password stored in your OS keyring — it never asks you to type your password into iFetch itself:
 
-1. Store the password once: `icloud --username you@example.com` (prompts for the password and saves it to the keyring).
+1. Store the password once: `icloud auth login --username you@example.com` (prompts for the password and saves it to the keyring). The `icloud` CLI ships with `pip install "ifetch[auth]"` (or `pip install "pyicloud[cli]"`). Note: pyicloud 2.x renamed this command — the old `icloud --username ...` syntax from pyicloud 1.x no longer exists.
 2. On the first `ifetch` run, Apple sends a verification code to your trusted devices. iFetch prompts: `Enter the verification code:`.
 3. After a valid code, iFetch asks Apple to **trust the session**, so subsequent runs skip 2FA until the session expires.
 
 Accounts still on legacy two-step authentication (2SA) get a device picker instead — choose a trusted device, receive the code, enter it.
 
+> **If `icloud auth login` fails at the 2FA step** (e.g. `Failed to request the 2FA SMS code`, websocket/SSL errors): the password is usually already saved in the keyring at that point, so just run any `ifetch` command (`ifetch Documents --list --email you@example.com`). iFetch uses a simpler 2FA path — Apple pushes the sign-in prompt to your trusted devices automatically and iFetch asks for the code directly.
+
 Common failures:
 
-- **`No stored password found`** — step 1 was skipped, or the password was stored under a different email than the one you passed via `--email`/`ICLOUD_EMAIL`. Re-run `icloud --username you@example.com`.
-- **`Invalid credentials`** — wrong password in the keyring (did you change your Apple ID password recently?). Re-run `icloud --username ...` to overwrite it.
+- **`No stored password found`** — step 1 was skipped, or the password was stored under a different email than the one you passed via `--email`/`ICLOUD_EMAIL`. Re-run `icloud auth login --username you@example.com`.
+- **`Invalid credentials`** — wrong password in the keyring (did you change your Apple ID password recently?). Re-run `icloud auth login ...` to overwrite it.
+- **`SSLCertVerificationError: certificate verify failed` (macOS)** — python.org-installed Pythons don't use the system certificate store. Run `"/Applications/Python 3.13/Install Certificates.command"` once (adjust for your version), or prefix the command with `SSL_CERT_FILE="$(python3 -c 'import certifi; print(certifi.where())')"`. This mostly affects the `icloud auth login` websocket bridge; `ifetch` itself is unaffected because `requests` bundles its own certificates.
 - **`Failed to verify 2FA code`** — codes are short-lived; request a fresh one and type it promptly.
 - **`Warning: Failed to trust session`** — authentication worked, but you will be re-prompted for 2FA on the next run. Usually transient; try again later.
 
@@ -78,11 +81,11 @@ There is no desktop session to provide a keyring, so either:
   default-keyring=keyrings.alt.file.PlaintextKeyring
   ```
 
-Then run `icloud --username you@example.com` again to store the password in the now-working backend.
+Then run `icloud auth login --username you@example.com` again to store the password in the now-working backend.
 
 ### Windows
 
-The backend is Windows Credential Locker and generally just works. If `icloud --username` succeeds but `ifetch` cannot find the password, check that both run under the same user account (and both inside/outside the same virtualenv is fine — the keyring is per-OS-user, not per-venv).
+The backend is Windows Credential Locker and generally just works. If `icloud auth login` succeeds but `ifetch` cannot find the password, check that both run under the same user account (and both inside/outside the same virtualenv is fine — the keyring is per-OS-user, not per-venv).
 
 ## Rate limiting and 503 errors
 

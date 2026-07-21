@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `auth` extra (`pip install "ifetch[auth]"`) that pulls in `pyicloud[cli]`,
+  providing the `icloud` command used to store your password in the keyring.
+- Benchmark suite (`benchmarks/benchmark.py`) measuring cold download,
+  delta-sync re-run, and kill-and-resume with integrity verification, plus a
+  chart generator (`benchmarks/visualize.py`).
+
+### Fixed
+
+- Auth instructions updated for pyicloud 2.x: the CLI is now
+  `icloud auth login --username ...` (the 1.x `icloud --username ...` syntax
+  no longer exists). Updated the README, docs, and iFetch's own
+  "No stored password found" error message; added troubleshooting entries
+  for the macOS `SSLCertVerificationError` and 2FA-request failures.
+
 ## [1.0.0] - 2026-07-20
 
 First release on PyPI: `pip install ifetch`.

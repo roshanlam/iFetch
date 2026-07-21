@@ -45,6 +45,10 @@ gdrive = [
     "google-auth-httplib2",
     "google-api-python-client",
 ]
+# The `icloud` CLI (used once to store your password in the OS keyring)
+auth = [
+    "pyicloud[cli]>=2.5.0",
+]
 dev = [
     "pytest",
     "pytest-cov",

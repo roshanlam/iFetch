@@ -108,7 +108,10 @@ class DownloadManager:
         except PyiCloudFailedLoginException:
             raise Exception("Invalid credentials")
         except PyiCloudNoStoredPasswordAvailableException:
-            raise Exception("No stored password found. Please run 'icloud --username=you@example.com'")
+            raise Exception(
+                "No stored password found. Run 'icloud auth login --username you@example.com' "
+                "(requires: pip install \"pyicloud[cli]\") to store it in the system keyring."
+            )
         except Exception as e:
             raise Exception(f"Authentication failed: {e}")
 

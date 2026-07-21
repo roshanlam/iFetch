@@ -42,7 +42,7 @@ Net effect: a `--watch` pass where nothing changed costs one iCloud listing and 
 
 ## Prerequisites
 
-1. **iCloud auth set up** — password in the keyring (`icloud --username you@example.com`) and one interactive run completed for 2FA. See [troubleshooting](troubleshooting.md#authentication-and-2fa).
+1. **iCloud auth set up** — password in the keyring (`icloud auth login --username you@example.com`) and one interactive run completed for 2FA. See [troubleshooting](troubleshooting.md#authentication-and-2fa).
 2. **Google OAuth credentials** — a `credentials.json` file, set up as follows.
 
 ## Google OAuth credential setup

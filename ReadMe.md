@@ -28,10 +28,10 @@ If you want your **photos**, use icloudpd — it is excellent at that. If you wa
 
 ```sh
 # 1. Install
-pip install "ifetch[gdrive]"   # core + Google Drive export (or: pip install ifetch)
+pip install "ifetch[gdrive,auth]"   # core + Google Drive export + auth CLI (or: pip install ifetch)
 
 # 2. Store your iCloud password in the system keyring (one time)
-icloud --username you@example.com
+icloud auth login --username you@example.com
 
 # 3. Download a folder (you'll be prompted for a 2FA code on first run)
 ifetch Documents ~/icloud-backup
@@ -239,7 +239,7 @@ Run iFetch on a schedule with launchd (macOS), cron (Linux/NAS), or systemd time
 
 Common issues — the 2FA flow, expired sessions, per-OS keyring problems, rate limiting/503s, the Advanced Data Protection caveat, and shared-folder quirks — are covered in [docs/troubleshooting.md](docs/troubleshooting.md). Quick hits:
 
-- **"No stored password found"** — run `icloud --username you@example.com` once to store your password in the keyring.
+- **"No stored password found"** — run `icloud auth login --username you@example.com` once to store your password in the keyring (the `icloud` CLI comes with `pip install "ifetch[auth]"`).
 - **Repeated 2FA prompts** — your session expired; run `ifetch` interactively once to re-trust the session.
 - **503 / rate limited** — iFetch backs off automatically; lower `--max-workers` if it persists.
 - **Advanced Data Protection** — with ADP enabled, Apple blocks web/API access to Drive data unless you enable "Access iCloud Data on the Web" in your ADP settings.
