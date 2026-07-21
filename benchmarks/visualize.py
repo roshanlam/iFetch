@@ -35,9 +35,11 @@ SAMPLE = {
         {"workers": 8, "seconds": 112.9, "files": 412,
          "bytes": 2_469_606_195, "MiB_per_s": 20.9},
     ],
-    "warm": {"seconds": 3.9, "speedup_vs_cold": 47.8},
+    "warm": {"seconds": 3.9, "speedup_vs_cold": 47.8,
+             "bytes_transferred": 0, "changed_chunks": 0},
     "resume": {"interrupted": True, "partial_bytes": 388_002_611,
-               "restart_seconds": 151.2, "matches_reference": True},
+               "restart_seconds": 151.2, "matches_reference": True,
+               "verification": "sha256"},
 }
 
 
@@ -58,8 +60,10 @@ def render(results, out_path, is_sample):
     rows = [(f"Full download · {c['workers']} workers", c["seconds"],
              f"{fmt_secs(c['seconds'])}  ·  {c['MiB_per_s']} MiB/s")
             for c in cold]
-    rows.append(("Re-run, nothing changed", warm["seconds"],
-                 f"{fmt_secs(warm['seconds'])}"))
+    warm_note = fmt_secs(warm["seconds"])
+    if warm.get("bytes_transferred") == 0:
+        warm_note += "  ·  0 bytes transferred"
+    rows.append(("Re-run, nothing changed", warm["seconds"], warm_note))
 
     fig = plt.figure(figsize=(12, 12), dpi=100)
     fig.patch.set_facecolor(SURFACE)
@@ -77,13 +81,21 @@ def render(results, out_path, is_sample):
              fontsize=14, color=INK_2)
 
     # --- hero stat ---------------------------------------------------------
-    fig.text(0.07, 0.80, f"{warm['speedup_vs_cold']:.0f}×",
-             fontsize=88, color=BLUE, fontweight="bold")
-    fig.text(0.30, 0.856, "faster when nothing changed", fontsize=19,
-             color=INK, fontweight="bold")
-    fig.text(0.30, 0.800,
-             "chunk-level delta sync re-checks the whole tree,\n"
-             "then transfers only what actually changed",
+    if warm.get("bytes_transferred") == 0:
+        hero, hero_label = "0 bytes", "re-downloaded when nothing changed"
+        hero_size = 64
+    else:
+        hero = f"{warm['speedup_vs_cold']:.0f}×"
+        hero_label = "faster when nothing changed"
+        hero_size = 88
+    fig.text(0.07, 0.80, hero, fontsize=hero_size, color=BLUE,
+             fontweight="bold")
+    fig.text(0.07, 0.756, hero_label, fontsize=19, color=INK,
+             fontweight="bold")
+    fig.text(0.07, 0.712,
+             f"a re-run over the same {fmt_gib(ref['bytes'])} verifies every "
+             f"file chunk-by-chunk in {fmt_secs(warm['seconds'])}\n"
+             "and transfers only what actually changed — here: nothing",
              fontsize=13.5, color=INK_2, linespacing=1.5)
 
     # --- bar chart ---------------------------------------------------------
@@ -119,15 +131,17 @@ def render(results, out_path, is_sample):
 
     # --- resume verification line ------------------------------------------
     if resume.get("interrupted"):
-        verdict = ("resumed and finished — final tree verified identical"
+        verified_how = ("SHA-256-identical to an uninterrupted download"
+                        if resume.get("verification") == "sha256"
+                        else "verified identical")
+        verdict = (f"resumed and finished — {verified_how}"
                    if resume.get("matches_reference")
                    else "resumed — VERIFICATION FAILED")
         color = GOOD if resume.get("matches_reference") else "#d03b3b"
         fig.text(0.07, 0.287, r"$\checkmark$", fontsize=20, color=color,
                  fontweight="bold")
         fig.text(0.10, 0.287,
-                 f"Killed mid-download at {fmt_gib(resume['partial_bytes'])}, "
-                 f"restarted: {verdict}",
+                 f"Killed mid-download, restarted: {verdict}",
                  fontsize=14.5, color=INK)
 
     # --- footer ------------------------------------------------------------

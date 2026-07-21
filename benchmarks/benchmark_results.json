@@ -1,0 +1,32 @@
+{
+  "icloud_path": "Documents/Music",
+  "cold": [
+    {
+      "workers": 4,
+      "seconds": 42.8,
+      "files": 414,
+      "bytes": 3045015682,
+      "MiB_per_s": 67.85
+    },
+    {
+      "workers": 8,
+      "seconds": 50.2,
+      "files": 414,
+      "bytes": 3045015682,
+      "MiB_per_s": 57.89
+    }
+  ],
+  "warm": {
+    "seconds": 16.2,
+    "speedup_vs_cold": 2.6,
+    "bytes_transferred": 0,
+    "changed_chunks": 0
+  },
+  "resume": {
+    "interrupted": true,
+    "partial_bytes": 3045015682,
+    "restart_seconds": 17.6,
+    "matches_reference": true,
+    "verification": "sha256"
+  }
+}

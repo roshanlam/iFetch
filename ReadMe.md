@@ -63,6 +63,27 @@ pip install -e ".[gdrive]"
 - **Structured JSON logging** and a per-run `download_report.json` summary
 - **Google Drive export** (`ifetch-export`) and an **iCloud → NAS → Google Drive mirror** (`ifetch-mirror`)
 
+## Benchmarks
+
+Measured against a real iCloud Drive folder (414 files, 2.8 GiB) on a residential connection, July 2026:
+
+| Scenario | Time | Result |
+|---|---|---|
+| Full download (4 workers) | 42.8s | 67.9 MiB/s |
+| Full download (8 workers) | 50.2s | 57.9 MiB/s |
+| Re-run, nothing changed (delta sync) | 16.2s | **0 bytes re-transferred** |
+| Killed mid-download, restarted | +17.6s to finish | final tree **SHA-256-identical** to an uninterrupted download |
+
+![iFetch benchmark chart](benchmarks/benchmark_chart.png)
+
+The delta-sync and resume rows are the point: re-runs verify everything and download nothing, and an interrupted download resumes to a byte-identical result. Throughput varies with your connection and Apple's rate limiting (note 8 workers was *slower* than 4 here — Apple throttles aggressive parallelism; 4 is a good default).
+
+Don't take these numbers on faith — the harness ships in the repo:
+
+```sh
+python benchmarks/benchmark.py "Documents/SomeFolder" --email you@example.com --workers 4 8
+```
+
 ## CLI reference
 
 iFetch installs three commands:

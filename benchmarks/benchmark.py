@@ -33,15 +33,44 @@ import time
 from pathlib import Path
 
 REPORT_NAME = "download_report.json"
+# iFetch bookkeeping that legitimately differs between runs — never compare it
+METADATA = {REPORT_NAME, ".ifetch_versions.json"}
+
+
+def _data_files(root: Path):
+    for p in root.rglob("*"):
+        if p.is_file() and p.name not in METADATA and ".versions" not in p.parts:
+            yield p
 
 
 def tree_stats(root: Path):
     """(file_count, total_bytes, {relpath: size}) for all files under root."""
-    files = {}
-    for p in root.rglob("*"):
-        if p.is_file() and p.name != REPORT_NAME and ".versions" not in p.parts:
-            files[str(p.relative_to(root))] = p.stat().st_size
+    files = {str(p.relative_to(root)): p.stat().st_size
+             for p in _data_files(root)}
     return len(files), sum(files.values()), files
+
+
+def tree_digests(root: Path):
+    """{relpath: sha256} for all data files under root."""
+    import hashlib
+    out = {}
+    for p in _data_files(root):
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        out[str(p.relative_to(root))] = h.hexdigest()
+    return out
+
+
+def report_stats(dest: Path):
+    """(bytes_transferred, changed_chunks) from iFetch's own run report."""
+    try:
+        summary = json.loads((dest / REPORT_NAME).read_text())["summary"]
+        return (summary.get("total_bytes_transferred", 0),
+                summary.get("total_changed_chunks", 0))
+    except (OSError, ValueError, KeyError):
+        return None, None
 
 
 def run_ifetch(ifetch, icloud_path, dest, email, workers, timeout=None):
@@ -107,10 +136,14 @@ def main():
                              args.email, w)
         cold_secs = results["cold"][0]["seconds"]
         speedup = cold_secs / elapsed if elapsed else float("inf")
+        warm_bytes, warm_chunks = report_stats(ref_dest)
         results["warm"] = {"seconds": round(elapsed, 1),
-                           "speedup_vs_cold": round(speedup, 1)}
+                           "speedup_vs_cold": round(speedup, 1),
+                           "bytes_transferred": warm_bytes,
+                           "changed_chunks": warm_chunks}
         print(f"       finished in {elapsed:.1f}s "
-              f"({speedup:.1f}x faster than the cold pull)")
+              f"({speedup:.1f}x faster than the cold pull); "
+              f"bytes re-transferred: {warm_bytes}")
 
         # --- resume: kill a cold pull partway, restart, verify -------------
         dest = base / "resume"
@@ -136,13 +169,14 @@ def main():
             print("       download finished before the kill window — "
                   "use a bigger folder or smaller --kill-after for a real "
                   "resume test")
-        count, total, files = tree_stats(dest)
-        complete = files == ref_files
+        print("       hashing both trees for content verification ...")
+        complete = tree_digests(dest) == tree_digests(ref_dest)
         results["resume"] = {"interrupted": interrupted,
                              "partial_bytes": partial_bytes,
                              "restart_seconds": round(elapsed, 1),
-                             "matches_reference": complete}
-        print(f"       final tree matches reference: {complete}")
+                             "matches_reference": complete,
+                             "verification": "sha256"}
+        print(f"       final tree SHA-256-identical to reference: {complete}")
 
         # --- report --------------------------------------------------------
         total = results["cold"][0]["bytes"]
@@ -156,13 +190,15 @@ def main():
             print(f"| Full download ({c['workers']} workers) | "
                   f"{c['seconds']}s | {c['MiB_per_s']} MiB/s |")
         warm = results["warm"]
+        transferred = (fmt_bytes(warm["bytes_transferred"])
+                       if warm["bytes_transferred"] is not None else "n/a")
         print(f"| Re-run, nothing changed (delta sync) | {warm['seconds']}s | "
-              f"{warm['speedup_vs_cold']}x faster |")
+              f"{transferred} re-transferred |")
         r = results["resume"]
         if r["interrupted"]:
             print(f"| Killed mid-download, restarted | "
-                  f"+{r['restart_seconds']}s to finish | resumed, tree "
-                  f"verified {'identical' if r['matches_reference'] else 'MISMATCH'} |")
+                  f"+{r['restart_seconds']}s to finish | tree SHA-256 "
+                  f"{'identical' if r['matches_reference'] else 'MISMATCH'} |")
 
         out = Path(__file__).with_name("benchmark_results.json")
         out.write_text(json.dumps(results, indent=2))
