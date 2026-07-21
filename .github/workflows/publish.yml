@@ -65,3 +65,7 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Don't fail if a version was already uploaded manually
+          # (e.g. 1.0.0 was first published with twine).
+          skip-existing: true
