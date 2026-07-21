@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from .exporters.googledrive import GoogleDriveExporter
+from .exporters.googledrive import DEFAULT_TOKEN_FILE, GoogleDriveExporter
 
 
 def get_default_folders() -> List[str]:
@@ -23,11 +23,18 @@ def get_default_folders() -> List[str]:
         home / 'Downloads',
         home / 'Desktop',
         home / 'Pictures',
-        home / 'LocalDoc',  # User-specific folder
     ]
 
     # Filter to only existing folders
     return [str(f) for f in folders if f.exists()]
+
+
+def _stdin_is_interactive() -> bool:
+    """Return True when stdin is attached to a TTY we can prompt on."""
+    try:
+        return bool(sys.stdin is not None and sys.stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
 
 
 def parse_args():
@@ -37,8 +44,11 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Export default folders (Documents, Downloads, Desktop, Pictures, LocalDoc)
+  # Export default folders (Documents, Downloads, Desktop, Pictures)
   python -m ifetch.export_cli
+
+  # Run unattended (cron/CI) without the confirmation prompt
+  python -m ifetch.export_cli --yes
 
   # Export specific folders
   python -m ifetch.export_cli --folders ~/Documents ~/Downloads
@@ -78,7 +88,7 @@ Examples:
     parser.add_argument(
         '--folders',
         nargs='+',
-        help='Folders to export (default: Documents, Downloads, Desktop, Pictures, LocalDoc)',
+        help='Folders to export (default: Documents, Downloads, Desktop, Pictures)',
         default=None
     )
 
@@ -96,8 +106,14 @@ Examples:
 
     parser.add_argument(
         '--token',
-        default='.gdrive_token.pickle',
-        help='Path to store Google Drive authentication token (default: .gdrive_token.pickle)'
+        default=DEFAULT_TOKEN_FILE,
+        help=f'Path to store Google Drive authentication token (default: {DEFAULT_TOKEN_FILE})'
+    )
+
+    parser.add_argument(
+        '--yes', '-y',
+        action='store_true',
+        help='Skip the confirmation prompt (required for non-interactive runs)'
     )
 
     parser.add_argument(
@@ -242,15 +258,30 @@ def main():
 
     print()
 
-    # Prompt for confirmation
-    try:
-        response = input("Continue with export? [y/N]: ").strip().lower()
-        if response not in ['y', 'yes']:
-            print("Export cancelled.")
+    # Prompt for confirmation (unless explicitly confirmed on the command line)
+    if not args.yes:
+        if not _stdin_is_interactive():
+            print(
+                "Error: cannot prompt for confirmation because stdin is not a terminal.\n"
+                "Re-run with --yes/-y to confirm non-interactively.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            response = input("Continue with export? [y/N]: ").strip().lower()
+            if response not in ['y', 'yes']:
+                print("Export cancelled.")
+                return 0
+        except KeyboardInterrupt:
+            print("\nExport cancelled.")
             return 0
-    except KeyboardInterrupt:
-        print("\nExport cancelled.")
-        return 0
+        except EOFError:
+            print(
+                "\nError: no input available to confirm the export. "
+                "Re-run with --yes/-y to confirm non-interactively.",
+                file=sys.stderr,
+            )
+            return 1
 
     # Initialize Google Drive exporter
     try:

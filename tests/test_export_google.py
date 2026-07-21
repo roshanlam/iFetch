@@ -1,6 +1,9 @@
 import importlib
 import io
+import json
+import os
 import pickle
+import stat
 import sys
 import types
 from pathlib import Path
@@ -15,15 +18,38 @@ def _load_google_modules(monkeypatch):
         pass
 
     class FakeCredentials:
-        def __init__(self, valid=True, expired=False, refresh_token=False):
+        def __init__(self, valid=True, expired=False, refresh_token=False, token="tok"):
             self.valid = valid
             self.expired = expired
             self.refresh_token = refresh_token
             self.refreshed = False
+            self.token = token
 
         def refresh(self, request):
             self.refreshed = True
             self.valid = True
+
+        def to_json(self):
+            return json.dumps({
+                "token": self.token,
+                "valid": self.valid,
+                "expired": self.expired,
+                "refresh_token": self.refresh_token,
+            })
+
+        @classmethod
+        def from_authorized_user_info(cls, info, scopes=None):
+            return cls(
+                valid=info.get("valid", True),
+                expired=info.get("expired", False),
+                refresh_token=info.get("refresh_token", False),
+                token=info.get("token"),
+            )
+
+        @classmethod
+        def from_authorized_user_file(cls, filename, scopes=None):
+            with open(filename, "r") as handle:
+                return cls.from_authorized_user_info(json.load(handle), scopes)
 
     class FakeFlow:
         creds = FakeCredentials(valid=True)
@@ -194,6 +220,7 @@ def test_export_cli_rebuild_and_list_defaults(monkeypatch, capsys, tmp_path):
 def test_export_cli_cancel_no_folders_and_success(monkeypatch, capsys, tmp_path):
     _, export_cli, *_ = _load_google_modules(monkeypatch)
 
+    monkeypatch.setattr(export_cli, "_stdin_is_interactive", lambda: True)
     monkeypatch.setattr(export_cli, "get_default_folders", lambda: [])
     monkeypatch.setattr(sys, "argv", ["export_cli.py"])
     assert export_cli.main() == 1
@@ -244,6 +271,7 @@ def test_export_cli_handles_export_errors(monkeypatch, capsys, tmp_path):
             raise RuntimeError("boom")
 
     monkeypatch.setattr(export_cli, "GoogleDriveExporter", FakeExporter)
+    monkeypatch.setattr(export_cli, "_stdin_is_interactive", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt="": "y")
     monkeypatch.setattr(sys, "argv", ["export_cli.py", "--folders", str(tmp_path)])
 
@@ -251,11 +279,138 @@ def test_export_cli_handles_export_errors(monkeypatch, capsys, tmp_path):
     assert "Unexpected error: boom" in capsys.readouterr().out
 
 
+def test_get_default_folders_has_no_personal_paths(monkeypatch, tmp_path):
+    _, export_cli, *_ = _load_google_modules(monkeypatch)
+
+    for name in ("Documents", "Downloads", "Desktop", "Pictures", "LocalDoc"):
+        (tmp_path / name).mkdir()
+
+    monkeypatch.setattr(export_cli.Path, "home", lambda: tmp_path)
+    defaults = export_cli.get_default_folders()
+
+    assert defaults == [
+        str(tmp_path / "Documents"),
+        str(tmp_path / "Downloads"),
+        str(tmp_path / "Desktop"),
+        str(tmp_path / "Pictures"),
+    ]
+    assert not any("LocalDoc" in folder for folder in defaults)
+
+
+def test_get_default_folders_filters_missing(monkeypatch, tmp_path):
+    _, export_cli, *_ = _load_google_modules(monkeypatch)
+
+    (tmp_path / "Documents").mkdir()
+    (tmp_path / "Desktop").mkdir()
+    monkeypatch.setattr(export_cli.Path, "home", lambda: tmp_path)
+
+    assert export_cli.get_default_folders() == [
+        str(tmp_path / "Documents"),
+        str(tmp_path / "Desktop"),
+    ]
+
+
+def test_export_cli_yes_flag_skips_prompt(monkeypatch, tmp_path):
+    _, export_cli, *_ = _load_google_modules(monkeypatch)
+
+    calls = {}
+
+    class FakeExporter:
+        def __init__(self, **kwargs):
+            calls["init"] = kwargs
+
+        def authenticate(self):
+            calls["auth"] = True
+
+        def export_local_folders(self, folders, force, include_patterns, exclude_patterns):
+            calls["export"] = folders
+            return {"total_files": 0, "uploaded": 0, "skipped": 0, "failed": 0, "ignored": 0, "total_bytes": 0}
+
+        def print_summary(self, stats):
+            calls["summary"] = stats
+
+    def _boom(prompt=""):
+        raise AssertionError("prompt must not be shown when --yes is passed")
+
+    monkeypatch.setattr(export_cli, "GoogleDriveExporter", FakeExporter)
+    monkeypatch.setattr(export_cli, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr("builtins.input", _boom)
+    monkeypatch.setattr(sys, "argv", ["export_cli.py", "--yes", "--folders", str(tmp_path)])
+
+    assert export_cli.main() == 0
+    assert calls["export"] == [str(tmp_path)]
+
+    # Short form behaves identically
+    calls.clear()
+    monkeypatch.setattr(sys, "argv", ["export_cli.py", "-y", "--folders", str(tmp_path)])
+    assert export_cli.main() == 0
+    assert calls["auth"] is True
+
+
+def test_export_cli_non_tty_without_yes_fails_cleanly(monkeypatch, capsys, tmp_path):
+    _, export_cli, *_ = _load_google_modules(monkeypatch)
+
+    class FakeExporter:
+        def __init__(self, **kwargs):
+            raise AssertionError("exporter must not run without confirmation")
+
+    def _boom(prompt=""):
+        raise AssertionError("must not block on input() without a TTY")
+
+    monkeypatch.setattr(export_cli, "GoogleDriveExporter", FakeExporter)
+    monkeypatch.setattr(export_cli, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr("builtins.input", _boom)
+    monkeypatch.setattr(sys, "argv", ["export_cli.py", "--folders", str(tmp_path)])
+
+    assert export_cli.main() == 1
+    assert "--yes" in capsys.readouterr().err
+
+
+def test_export_cli_eof_on_prompt_fails_cleanly(monkeypatch, capsys, tmp_path):
+    _, export_cli, *_ = _load_google_modules(monkeypatch)
+
+    def _eof(prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr(export_cli, "GoogleDriveExporter", lambda **kwargs: None)
+    monkeypatch.setattr(export_cli, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", _eof)
+    monkeypatch.setattr(sys, "argv", ["export_cli.py", "--folders", str(tmp_path)])
+
+    assert export_cli.main() == 1
+    assert "--yes" in capsys.readouterr().err
+
+
+def test_stdin_is_interactive_handles_broken_stdin(monkeypatch):
+    _, export_cli, *_ = _load_google_modules(monkeypatch)
+
+    monkeypatch.setattr(export_cli.sys, "stdin", None)
+    assert export_cli._stdin_is_interactive() is False
+
+    class ClosedStdin:
+        def isatty(self):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(export_cli.sys, "stdin", ClosedStdin())
+    assert export_cli._stdin_is_interactive() is False
+
+    monkeypatch.setattr(export_cli.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    assert export_cli._stdin_is_interactive() is True
+
+
+def test_export_cli_token_default_is_json(monkeypatch):
+    googledrive, export_cli, *_ = _load_google_modules(monkeypatch)
+
+    monkeypatch.setattr(sys, "argv", ["export_cli.py"])
+    args = export_cli.parse_args()
+    assert args.token == googledrive.DEFAULT_TOKEN_FILE
+    assert args.token.endswith(".json")
+
+
 def test_googledrive_authenticate_refresh_and_flow(monkeypatch, tmp_path):
     googledrive, _, FakeCredentials, FakeFlow, _, build_calls = _load_google_modules(monkeypatch)
-    creds = FakeCredentials(valid=False, expired=True, refresh_token=True)
-    token_file = tmp_path / "token.pickle"
-    token_file.write_bytes(b"token")
+    token_file = tmp_path / "token.json"
+    token_file.write_text(json.dumps({"token": "cached", "valid": False, "expired": True, "refresh_token": True}))
 
     exporter = googledrive.GoogleDriveExporter(
         credentials_file=str(tmp_path / "creds.json"),
@@ -264,20 +419,18 @@ def test_googledrive_authenticate_refresh_and_flow(monkeypatch, tmp_path):
         use_index=False,
     )
     service = _FakeService()
-    monkeypatch.setattr(googledrive.pickle, "load", lambda fh: creds)
-    monkeypatch.setattr(googledrive.pickle, "dump", lambda obj, fh: None)
     monkeypatch.setattr(googledrive, "build", lambda *args, **kwargs: service)
     monkeypatch.setattr(exporter, "_get_or_create_folder", lambda name, parent_id=None: "root-id")
 
     exporter.authenticate()
 
-    assert creds.refreshed is True
+    assert exporter._credentials.refreshed is True
     assert exporter.root_folder_id == "root-id"
 
     token_file.unlink()
     creds_file = tmp_path / "creds.json"
     creds_file.write_text("{}")
-    FakeFlow.creds = FakeCredentials(valid=True)
+    FakeFlow.creds = FakeCredentials(valid=True, token="fresh")
     exporter = googledrive.GoogleDriveExporter(
         credentials_file=str(creds_file),
         token_file=str(token_file),
@@ -291,6 +444,109 @@ def test_googledrive_authenticate_refresh_and_flow(monkeypatch, tmp_path):
 
     assert token_file.exists()
     assert FakeFlow.last_call[0] == str(creds_file)
+    assert json.loads(token_file.read_text())["token"] == "fresh"
+
+
+def test_googledrive_token_is_json_with_0600_permissions(monkeypatch, tmp_path):
+    googledrive, _, FakeCredentials, FakeFlow, *_ = _load_google_modules(monkeypatch)
+    token_file = tmp_path / "nested" / ".gdrive_token.json"
+    creds_file = tmp_path / "creds.json"
+    creds_file.write_text("{}")
+    FakeFlow.creds = FakeCredentials(valid=True, token="secret")
+
+    exporter = googledrive.GoogleDriveExporter(
+        credentials_file=str(creds_file),
+        token_file=str(token_file),
+        ignore_file=None,
+        use_index=False,
+    )
+    monkeypatch.setattr(googledrive, "build", lambda *args, **kwargs: _FakeService())
+    monkeypatch.setattr(exporter, "_get_or_create_folder", lambda name, parent_id=None: "root-id")
+
+    exporter.authenticate()
+
+    assert token_file.exists()
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    assert json.loads(token_file.read_text())["token"] == "secret"
+
+    # A pre-existing world-readable token gets tightened on the next write
+    token_file.chmod(0o644)
+    exporter._save_token(FakeCredentials(valid=True, token="rotated"))
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    assert json.loads(token_file.read_text())["token"] == "rotated"
+
+    # Round-trip through the loader
+    loaded = exporter._load_token()
+    assert loaded.token == "rotated"
+
+
+def test_googledrive_legacy_pickle_token_is_migrated(monkeypatch, tmp_path):
+    googledrive, _, FakeCredentials, *_ = _load_google_modules(monkeypatch)
+    legacy = tmp_path / ".gdrive_token.pickle"
+    legacy.write_bytes(b"legacy-token")
+
+    exporter = googledrive.GoogleDriveExporter(
+        token_file=str(tmp_path / ".gdrive_token.json"),
+        ignore_file=None,
+        use_index=False,
+    )
+    assert exporter.legacy_token_file == str(legacy)
+
+    creds = FakeCredentials(valid=True, token="from-pickle")
+    monkeypatch.setattr(googledrive.pickle, "load", lambda handle: creds)
+
+    loaded = exporter._load_token()
+
+    assert loaded is creds
+    migrated = tmp_path / ".gdrive_token.json"
+    assert json.loads(migrated.read_text())["token"] == "from-pickle"
+    assert stat.S_IMODE(migrated.stat().st_mode) == 0o600
+    # Legacy file is left in place for rollback
+    assert legacy.exists()
+
+    # Once migrated, the JSON token wins and the pickle is never read again
+    def _explode(handle):
+        raise AssertionError("pickle must not be read once a JSON token exists")
+
+    monkeypatch.setattr(googledrive.pickle, "load", _explode)
+    assert exporter._load_token().token == "from-pickle"
+
+
+def test_googledrive_explicit_pickle_token_path_is_honoured(monkeypatch, tmp_path):
+    googledrive, _, FakeCredentials, *_ = _load_google_modules(monkeypatch)
+    legacy = tmp_path / "custom.pickle"
+    legacy.write_bytes(b"legacy-token")
+
+    exporter = googledrive.GoogleDriveExporter(
+        token_file=str(legacy),
+        ignore_file=None,
+        use_index=False,
+    )
+    assert exporter.legacy_token_file == str(legacy)
+    assert exporter.json_token_file == str(tmp_path / "custom.json")
+
+    monkeypatch.setattr(
+        googledrive.pickle, "load", lambda handle: FakeCredentials(valid=True, token="legacy")
+    )
+    assert exporter._load_token().token == "legacy"
+    assert json.loads((tmp_path / "custom.json").read_text())["token"] == "legacy"
+
+
+def test_googledrive_corrupt_tokens_do_not_crash(monkeypatch, tmp_path, capsys):
+    googledrive, *_ = _load_google_modules(monkeypatch)
+    token_file = tmp_path / ".gdrive_token.json"
+    token_file.write_text("not json at all")
+    legacy = tmp_path / ".gdrive_token.pickle"
+    legacy.write_bytes(b"\x80\x04 not a pickle")
+
+    exporter = googledrive.GoogleDriveExporter(
+        token_file=str(token_file), ignore_file=None, use_index=False
+    )
+
+    assert exporter._load_token() is None
+    out = capsys.readouterr().out
+    assert "could not read token" in out
+    assert "could not read legacy token" in out
 
 
 def test_googledrive_thread_local_and_ignore_patterns(monkeypatch, tmp_path, capsys):
@@ -339,6 +595,42 @@ def test_googledrive_folder_and_file_lookup(monkeypatch):
     assert exporter._file_exists_in_drive("a.txt", "parent", "abc") is None
 
 
+def test_escape_query_value(monkeypatch):
+    googledrive, *_ = _load_google_modules(monkeypatch)
+    escape = googledrive.escape_query_value
+
+    assert escape("plain") == "plain"
+    assert escape("Roshan's Files") == "Roshan\\'s Files"
+    assert escape("back\\slash") == "back\\\\slash"
+    # Backslashes are escaped before quotes, so the quote escape survives
+    assert escape("a\\'b") == "a\\\\\\'b"
+
+
+def test_googledrive_queries_escape_quotes_and_backslashes(monkeypatch):
+    googledrive, *_ = _load_google_modules(monkeypatch)
+    exporter = googledrive.GoogleDriveExporter(ignore_file=None, use_index=False)
+    service = _FakeService()
+    exporter._thread_local.service = service
+
+    service._files.list_payload = {"files": [{"id": "folder-1"}]}
+    exporter._get_or_create_folder("Roshan's Files", "par'ent")
+    query = service._files.last_list_kwargs["q"]
+    assert "name='Roshan\\'s Files'" in query
+    assert "'par\\'ent' in parents" in query
+
+    exporter._folder_cache.clear()
+    exporter._get_or_create_folder("back\\slash")
+    query = service._files.last_list_kwargs["q"]
+    assert "name='back\\\\slash'" in query
+    assert "'root' in parents" in query
+
+    service._files.list_payload = {"files": []}
+    exporter._file_exists_in_drive("Roshan's note\\.txt", "par'ent", "abc")
+    query = service._files.last_list_kwargs["q"]
+    assert "name='Roshan\\'s note\\\\.txt'" in query
+    assert "'par\\'ent' in parents" in query
+
+
 def test_googledrive_upload_file_branches(monkeypatch, tmp_path, capsys):
     googledrive, *_ = _load_google_modules(monkeypatch)
     file_path = tmp_path / "file.txt"
@@ -377,10 +669,75 @@ def test_googledrive_upload_file_branches(monkeypatch, tmp_path, capsys):
 
     service._files.upload_request = BadRequest()
     assert exporter.upload_file(file_path, "parent", force=True, base_path=tmp_path) is None
+    assert exporter._upload_file_with_status(file_path, "parent", True, tmp_path) == (
+        googledrive.UPLOAD_FAILED,
+        None,
+    )
     out = capsys.readouterr().out
     assert "Skipping:" in out
     assert "Ignored:" in out
     assert "Uploaded:" in out or "✓ Uploaded:" in out
+
+
+def test_googledrive_upload_accounting_uses_reported_status(monkeypatch, tmp_path):
+    """Counters come from what the worker did - no re-hashing, no extra API calls."""
+    googledrive, *_ = _load_google_modules(monkeypatch)
+    base = tmp_path / "root"
+    base.mkdir()
+    for name in ("uploaded.txt", "skipped.txt", "failed.txt", "ignored.txt"):
+        (base / name).write_text(name)
+
+    exporter = googledrive.GoogleDriveExporter(ignore_file=None, use_index=False, upload_workers=2)
+    exporter.root_folder_id = "root-id"
+    monkeypatch.setattr(exporter, "_get_or_create_folder", lambda name, parent_id=None: f"id-{name}")
+    monkeypatch.setattr(exporter, "_should_ignore", lambda path, base_path=None: False)
+
+    statuses = {
+        "uploaded.txt": (googledrive.UPLOAD_UPLOADED, "id-1"),
+        "skipped.txt": (googledrive.UPLOAD_SKIPPED, "id-2"),
+        "failed.txt": (googledrive.UPLOAD_FAILED, None),
+        "ignored.txt": (googledrive.UPLOAD_IGNORED, None),
+    }
+
+    def fake_upload(file_path, parent_id, force=False, base_path=None):
+        return statuses[file_path.name]
+
+    monkeypatch.setattr(exporter, "_upload_file_with_status", fake_upload)
+
+    def _no_extra_calls(*args, **kwargs):
+        raise AssertionError("upload accounting must not issue extra Drive API calls")
+
+    monkeypatch.setattr(exporter, "_file_exists_in_drive", _no_extra_calls)
+    monkeypatch.setattr(exporter, "_calculate_md5", staticmethod(_no_extra_calls))
+
+    stats = exporter.upload_directory(base)
+
+    assert stats["total_files"] == 4
+    assert stats["uploaded"] == 1
+    assert stats["skipped"] == 1
+    assert stats["failed"] == 1
+    assert stats["ignored"] == 1
+
+
+def test_googledrive_upload_directory_counts_worker_exceptions(monkeypatch, tmp_path, capsys):
+    googledrive, *_ = _load_google_modules(monkeypatch)
+    base = tmp_path / "root"
+    base.mkdir()
+    (base / "boom.txt").write_text("x")
+
+    exporter = googledrive.GoogleDriveExporter(ignore_file=None, use_index=False, upload_workers=1)
+    exporter.root_folder_id = "root-id"
+    monkeypatch.setattr(exporter, "_get_or_create_folder", lambda name, parent_id=None: "id")
+    monkeypatch.setattr(exporter, "_should_ignore", lambda path, base_path=None: False)
+
+    def _raise(file_path, parent_id, force=False, base_path=None):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(exporter, "_upload_file_with_status", _raise)
+
+    stats = exporter.upload_directory(base)
+    assert stats["failed"] == 1
+    assert "kaboom" in capsys.readouterr().out
 
 
 def test_googledrive_upload_directory_export_and_summary(monkeypatch, tmp_path, capsys):
@@ -397,8 +754,15 @@ def test_googledrive_upload_directory_export_and_summary(monkeypatch, tmp_path, 
     exporter.root_folder_id = "root-id"
     monkeypatch.setattr(exporter, "_get_or_create_folder", lambda name, parent_id=None: f"id-{name}")
     monkeypatch.setattr(exporter, "_should_ignore", lambda path, base_path=None: path.name == "skip.tmp")
-    monkeypatch.setattr(exporter, "upload_file", lambda file_path, parent_id, force=False, base_path=None: None if file_path.name == "b.txt" else f"id-{file_path.name}")
-    monkeypatch.setattr(exporter, "_file_exists_in_drive", lambda name, parent_id, md5: "id-a.txt" if name == "a.txt" else None)
+    monkeypatch.setattr(
+        exporter,
+        "_upload_file_with_status",
+        lambda file_path, parent_id, force=False, base_path=None: (
+            (googledrive.UPLOAD_FAILED, None)
+            if file_path.name == "b.txt"
+            else (googledrive.UPLOAD_UPLOADED, f"id-{file_path.name}")
+        ),
+    )
     monkeypatch.setattr(exporter, "_get_file_info", lambda file_path: {"size": file_path.stat().st_size, "md5": "md5", "modified": "now"})
 
     stats = exporter.upload_directory(base, include_patterns=["*.txt"], exclude_patterns=["b*"])

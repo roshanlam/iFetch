@@ -34,7 +34,7 @@ from pathlib import Path
 
 REPORT_NAME = "download_report.json"
 # iFetch bookkeeping that legitimately differs between runs — never compare it
-METADATA = {REPORT_NAME, ".ifetch_versions.json"}
+METADATA = {REPORT_NAME, ".ifetch_versions.json", ".ifetch_state.json"}
 
 
 def _data_files(root: Path):

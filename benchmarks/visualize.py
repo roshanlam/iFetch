@@ -93,9 +93,9 @@ def render(results, out_path, is_sample):
     fig.text(0.07, 0.756, hero_label, fontsize=19, color=INK,
              fontweight="bold")
     fig.text(0.07, 0.712,
-             f"a re-run over the same {fmt_gib(ref['bytes'])} verifies every "
-             f"file chunk-by-chunk in {fmt_secs(warm['seconds'])}\n"
-             "and transfers only what actually changed — here: nothing",
+             f"a re-run over the same {fmt_gib(ref['bytes'])} checks every "
+             f"file in {fmt_secs(warm['seconds'])} and downloads\n"
+             "only what changed — here, nothing had",
              fontsize=13.5, color=INK_2, linespacing=1.5)
 
     # --- bar chart ---------------------------------------------------------

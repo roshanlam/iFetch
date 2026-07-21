@@ -13,13 +13,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Metadata fast path.** A sync-state file (`.ifetch_state.json`) is written in
+  the destination root recording, per file, the remote size and remote modified
+  timestamp plus the local size and mtime at completion. On later runs a file is
+  skipped with **zero network round-trips** when all of those still agree and no
+  `.temp`/`.download` artifact is present; any uncertainty falls back to the
+  full network check. Previously every file cost a full HTTPS open just to read
+  `content-length` (~39 ms/file, over an hour of pure round-trips on a 100k-file
+  drive).
+- `ifetch --no-fast-scan` to bypass the sync state and force a network check per
+  file, and `ifetch --force` to re-download everything regardless of local state.
+- **`ifetch-verify`** (`ifetch/verify.py`): read-only integrity checking of a
+  local mirror against iCloud Drive. Levels `size` (default, fast), `checksum`
+  (hashes local files) and `redownload` (streams remote files and hashes them in
+  memory to prove byte-for-byte equality). Flags: `--email`, `--level`,
+  `--max-workers`, `--report`, `--quiet`. Exit codes: 0 verified, 1 verification
+  failure, 2 operational error. Statuses: `verified`, `size_mismatch`,
+  `missing_local`, `extra_local`, `checksum_mismatch`, `checksum_unavailable`,
+  `error`. Verification never modifies the user's files.
+- Run reports and the CLI summary now include a `skipped` count; files proven
+  unchanged are recorded with `status="skipped"` and `downloaded: 0` instead of
+  being counted as downloads.
 - `auth` extra (`pip install "ifetch[auth]"`) that pulls in `pyicloud[cli]`,
   providing the `icloud` command used to store your password in the keyring.
 - Benchmark suite (`benchmarks/benchmark.py`) measuring cold download,
-  delta-sync re-run, and kill-and-resume with integrity verification, plus a
+  unchanged re-run, and kill-and-resume with integrity verification, plus a
   chart generator (`benchmarks/visualize.py`).
 
+### Changed
+
+- `FileChunker.find_changed_chunks` renamed to
+  `FileChunker.compute_download_ranges`, and documented for what it actually
+  does: size-based change detection plus prefix resume.
+- Documentation honesty pass on the sync engine. The README and docs previously
+  advertised "chunk-level delta sync — changed files only re-download the byte
+  ranges that differ". That was never implemented and has been removed
+  everywhere. The documented behavior is now the real behavior: equal remote and
+  local size means the file is skipped; a local file that is a shorter prefix of
+  the remote resumes from that offset; **any other difference re-downloads the
+  entire file**. The known blind spot — a modification that leaves the file size
+  unchanged is not detected by size comparison — is now stated explicitly, along
+  with a pointer to `ifetch-verify --level redownload`.
+- README documents that `ifetch-verify --level checksum` does **not** verify
+  against Apple: iCloud Drive item metadata exposes no content checksum
+  (verified against pyicloud 2.6.5; `etag` is a mutation counter, not a digest),
+  so those files report `checksum_unavailable` rather than `verified`.
+- Added a Roadmap: genuine content-based chunk diffing is scoped for 1.1, and
+  two-way sync is deliberately not implemented because safe bidirectional sync
+  requires conflict-resolution and delete-propagation semantics that risk
+  destroying the cloud copy if rushed.
+
 ### Fixed
+
+- Removed the false claim in `docs/mirror.md` that hop 1 skips unchanged files
+  "via stored checksums (`.ifetch_versions.json`)". That file is the version
+  history; skip decisions are made from the sync state and file sizes.
 
 - Auth instructions updated for pyicloud 2.x: the CLI is now
   `icloud auth login --username ...` (the 1.x `icloud --username ...` syntax
@@ -44,7 +92,10 @@ First release on PyPI: `pip install ifetch`.
   downloads.
 - Retry/backoff logic for transient connection errors, extended to cover 503
   and other server errors.
-- Parallel downloads, differential (chunk-based) updates, and JSON logging.
+- Parallel downloads, incremental updates (skip on size match, resume from a
+  partial prefix), and JSON logging. Note: contemporaneous docs described this
+  as "chunk-based differential" downloading; it never diffed content — see the
+  Unreleased "Changed" entry.
 - Automated test suite (pytest + pytest-cov) with expanded coverage across
   downloader flows.
 - Buy Me a Coffee funding option; MIT license.

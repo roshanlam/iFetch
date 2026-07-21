@@ -1,28 +1,38 @@
 # iFetch
 
-**Bulk-download your iCloud Drive from the command line — with delta sync, resume, version history, and a pipeline that mirrors iCloud to your NAS and Google Drive.**
+**Bulk-download your iCloud Drive from the command line — incremental re-runs, resumable transfers, integrity verification, version history, and a pipeline that mirrors iCloud to your NAS and Google Drive.**
 
 [![CI](https://github.com/roshanlam/iFetch/actions/workflows/ci.yml/badge.svg)](https://github.com/roshanlam/iFetch/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
-Apple gives you two ways to get your data out of iCloud Drive: drag files around in Finder, or wait days for a privacy export. iFetch gives you a third: a scriptable CLI that downloads exactly what you want, only re-fetches what changed, survives interruptions, and keeps a local version history so an accidental overwrite in the cloud never costs you a file.
+Apple gives you two ways to get your data out of iCloud Drive: drag files around in Finder, or wait days for a privacy export. iFetch gives you a third: a scriptable CLI that downloads exactly what you want, skips files that haven't changed since the last run, resumes interrupted transfers, and keeps a local version history so an accidental overwrite in the cloud never costs you a file.
 
-<!-- TODO: demo GIF here — record with vhs/asciinema: `ifetch Documents ~/icloud-backup` showing delta sync + summary report -->
+<!-- TODO: demo GIF here — record with vhs/asciinema: `ifetch Documents ~/icloud-backup` showing the skip-unchanged fast path + summary report -->
 
 ## Why iFetch?
 
-| | iFetch | [icloudpd](https://github.com/icloud-photos-downloader/icloud_photos_downloader) | [rclone](https://rclone.org/) | Apple privacy export |
-|---|---|---|---|---|
-| iCloud **Drive** files/folders | Yes | No — Photos only | No iCloud Drive backend | Yes |
-| Delta sync (only changed data) | Yes, chunk-level | — | — | No, full dump every time |
-| Resume interrupted transfers | Yes | — | — | No |
-| Scriptable / schedulable | Yes | Yes | Yes | No — manual web request, takes days |
-| Local version history | Yes | No | No | No |
-| Shared-with-you items | Yes | No | — | No |
-| Continue to Google Drive / NAS | Yes (`ifetch-mirror`) | No | Partially (no iCloud hop) | No |
+**[rclone](https://rclone.org/iclouddrive/) is the serious alternative, and for many people the better choice.** It gained an iCloud Drive backend in v1.69.0 (January 2025), it uploads as well as downloads, and it reaches 70+ other clouds. If you want one tool for everything, use rclone. iFetch is deliberately narrow — download-only, iCloud-first — which is what lets it do a few things rclone's iCloud backend doesn't.
 
-If you want your **photos**, use icloudpd — it is excellent at that. If you want your **iCloud Drive**, that is what iFetch is for.
+| | iFetch | [rclone](https://rclone.org/iclouddrive/) (iCloud backend) |
+|---|---|---|
+| Upload / delete / rename in iCloud | **No** — download-only by design | **Yes** |
+| Other cloud destinations | Google Drive only | **70+ backends** |
+| Bidirectional sync | No (deliberate — see [Roadmap](#roadmap)) | **Yes** (`bisync`) |
+| Mount / serve / crypt | No | **Yes** |
+| Maturity | Young, single-maintainer | Mature project, but this backend is [Tier 4 "Experimental"](https://rclone.org/tiers/) and excluded from rclone's CI |
+| Local version history + point-in-time restore | **Yes** (`ifetch-restore`) | No — deletes/overwrites go to iCloud Trash; no revision support |
+| Folders shared by another Apple ID | Best-effort (see caveats below) | Share root only; operations inside fail ([#9477](https://github.com/rclone/rclone/issues/9477), fix unmerged) |
+| Content hashes from Apple | None available (Apple exposes none) | None — so `--checksum` silently degrades to size-only |
+| Advanced Data Protection | **Untested, no ADP-specific code** | **Yes**, since v1.74.3 (June 2026) |
+| iCloud → NAS → Google Drive in one command | Yes (`ifetch-mirror --watch`) | Composable, but not a single command |
+
+Two honest caveats about the columns above:
+
+- **ADP: rclone is ahead of iFetch here.** rclone implements Apple's PCS-cookie flow so ADP-enabled accounts work with "Access iCloud Data on the Web" turned on. iFetch has *no ADP-specific code* — it may work under the same web-access setting via pyicloud, but that is unverified and untested. Do not pick iFetch for an ADP account on the strength of this README.
+- **Shared folders**: iFetch attempts cross-account shared files via `shareID` fallbacks, but that path is validated only against mocks, not a real cross-account share. Treat it as best-effort.
+
+For **photos**, use [icloudpd](https://github.com/icloud-photos-downloader/icloud_photos_downloader) — it is far more mature than iFetch's own brand-new `ifetch-photos`, which has not yet been validated against a live account.
 
 ## 60-second quickstart
 
@@ -37,7 +47,7 @@ icloud auth login --username you@example.com
 ifetch Documents ~/icloud-backup
 ```
 
-That's it. Run the same command tomorrow and iFetch only fetches the chunks that changed.
+That's it. Run the same command tomorrow and iFetch skips every file that hasn't changed — on an untouched folder that means zero bytes transferred and, thanks to the metadata fast path, zero network round-trips per file.
 
 To work from source instead:
 
@@ -52,7 +62,9 @@ pip install -e ".[gdrive]"
 ## Features
 
 - **Secure authentication** — password lives in your OS keyring (via pyicloud), full 2FA/2SA support, trusted sessions so you are not re-prompted every run
-- **Chunk-level delta sync** — unchanged files are skipped; changed files only re-download the byte ranges that differ
+- **Incremental sync** — unchanged files are skipped entirely and interrupted downloads resume from where they stopped (see [How re-runs decide what to download](#how-re-runs-decide-what-to-download) for exactly what "unchanged" means)
+- **Metadata fast path** — a re-run skips known-unchanged files with **zero network round-trips**, using the `.ifetch_state.json` sync-state file in the destination
+- **Integrity verification** — `ifetch-verify` re-checks a local mirror against iCloud without modifying a single file
 - **Resume-capable** — checkpointed downloads pick up where they left off after an interruption
 - **Parallel downloads** — configurable worker pool (`--max-workers`)
 - **Retries with exponential backoff** — transient 5xx/timeout errors are retried, `Retry-After` headers respected
@@ -63,20 +75,70 @@ pip install -e ".[gdrive]"
 - **Structured JSON logging** and a per-run `download_report.json` summary
 - **Google Drive export** (`ifetch-export`) and an **iCloud → NAS → Google Drive mirror** (`ifetch-mirror`)
 
+## How re-runs decide what to download
+
+This is the part people most often get wrong about backup tools, so here is exactly what iFetch does — no more, no less.
+
+### Step 1: the metadata fast path (no network)
+
+At the start of a run, iFetch reads `.ifetch_state.json` from the destination root. That file was written by previous runs and records, per file, the remote size and remote modified timestamp Apple reported, plus the local size and mtime at the moment the download completed.
+
+A file is skipped **without touching the network at all** only when *every* one of these agrees:
+
+- the remote node exposes both a size and a modified timestamp;
+- both match what was recorded for that path;
+- the recorded local size matches the remote size;
+- the local file still exists with exactly that size;
+- no leftover `.temp` / `.download` artifact is sitting next to it.
+
+Any doubt at all — missing metadata, no recorded entry, a size that moved, a partial-download artifact — and iFetch falls through to the full network check. The fast path can only ever *skip* work; it can never cause a file to be skipped that a network check would have downloaded.
+
+Why it matters: previously every file cost a full HTTPS open just to read its `content-length`, even when nothing had changed — roughly 39 ms per file, which is over an hour of pure round-trips on a 100k-file drive.
+
+Turn it off with `--no-fast-scan` (forces a network check per file) or bypass all skip logic with `--force` (re-downloads everything).
+
+Honest caveats:
+
+- It trusts Apple to update `dateModified` when a file changes. If Apple doesn't, iFetch won't notice — though note the size comparison in step 2 would not have noticed a same-size edit either.
+- **Local** corruption at the same file size is not detected. That is what [`ifetch-verify`](#ifetch-verify--read-only-integrity-checking) is for.
+- Two concurrent `ifetch` runs against the same destination can clobber each other's state file. The consequence is extra network checks on the next run — never a false skip.
+
+### Step 2: the network check (size comparison + prefix resume)
+
+When a file does not qualify for the fast path, iFetch opens the remote file and compares `content-length` against the local file:
+
+| Situation | What happens |
+|---|---|
+| Remote size == local size | **Skipped.** Assumed unchanged; zero bytes transferred. |
+| Local file is a shorter prefix (an interrupted download) | **Resumed** from that offset — only the missing tail is fetched. |
+| Local file is absent, empty, or any other size | **The entire file is re-downloaded.** |
+
+### What iFetch does *not* do
+
+iFetch does **not** perform content-based chunk diffing. There is no rolling hash, and no per-chunk digests are compared against iCloud — Apple exposes none, and the download stream is not seekable. Two consequences you should know about before trusting it with your data:
+
+- **Editing one byte in the middle of a 2 GB file re-downloads all 2 GB.** The size changed (or didn't), so the whole file is re-fetched; there is no byte-range delta.
+- **A modification that leaves the file size unchanged is not detected.** Size comparison cannot see it, and the fast path only catches it if Apple bumped the modified timestamp. If you need certainty, run [`ifetch-verify`](#ifetch-verify--read-only-integrity-checking) at `--level redownload`.
+
+Genuine content-based chunk diffing is a [roadmap](#roadmap) item for 1.1.
+
 ## Benchmarks
 
 Measured against a real iCloud Drive folder (414 files, 2.8 GiB) on a residential connection, July 2026:
 
 | Scenario | Time | Result |
 |---|---|---|
-| Full download (4 workers) | 42.8s | 67.9 MiB/s |
-| Full download (8 workers) | 50.2s | 57.9 MiB/s |
-| Re-run, nothing changed (delta sync) | 16.2s | **0 bytes re-transferred** |
-| Killed mid-download, restarted | +17.6s to finish | final tree **SHA-256-identical** to an uninterrupted download |
+| Full download (4 workers) | 38.9s | 74.7 MiB/s |
+| Re-run, nothing changed | **4.4s** | **0 bytes re-transferred** |
+| Killed mid-download, restarted | +4.5s to finish | final tree **SHA-256-identical** to an uninterrupted download |
 
 ![iFetch benchmark chart](benchmarks/benchmark_chart.png)
 
-The delta-sync and resume rows are the point: re-runs verify everything and download nothing, and an interrupted download resumes to a byte-identical result. Throughput varies with your connection and Apple's rate limiting (note 8 workers was *slower* than 4 here — Apple throttles aggressive parallelism; 4 is a good default).
+The re-run row is the one that matters: 2.8 GiB checked in 4.4 seconds with nothing transferred. Before the metadata fast path the same re-run took 16.2s, because every file cost an HTTPS round-trip just to read its `content-length`.
+
+The resume row is a correctness result, not a speed one — the harness kills a download mid-flight, restarts it, and SHA-256-compares every file against an uninterrupted run.
+
+Throughput varies with your connection and with Apple's rate limiting; more workers is not reliably faster (8 workers measured both faster *and* slower than 4 across runs). 4 is a sensible default.
 
 Don't take these numbers on faith — the harness ships in the repo:
 
@@ -86,12 +148,13 @@ python benchmarks/benchmark.py "Documents/SomeFolder" --email you@example.com --
 
 ## CLI reference
 
-iFetch installs three commands:
+iFetch ships four commands:
 
 | Command | Purpose |
 |---|---|
 | `ifetch` | Download/list iCloud Drive content locally |
-| `ifetch-export` | Upload local folders to Google Drive (delta-aware) |
+| `ifetch-verify` | Read-only integrity check of a local mirror against iCloud |
+| `ifetch-export` | Upload local folders to Google Drive (skips unchanged files) |
 | `ifetch-mirror` | One-way pipeline: iCloud → local folder/NAS → Google Drive |
 
 ### `ifetch` — iCloud Drive downloader
@@ -107,7 +170,9 @@ ifetch <icloud_path> [local_path] [options]
 | `--email` | iCloud account email (or set `ICLOUD_EMAIL`) | env var / error |
 | `--max-workers N` | Concurrent download threads | `4` |
 | `--max-retries N` | Retry attempts for failed chunks (exponential backoff) | `3` |
-| `--chunk-size BYTES` | Chunk size for differential downloads | `1048576` (1 MiB) |
+| `--chunk-size BYTES` | Size of the byte ranges requests are split into | `1048576` (1 MiB) |
+| `--no-fast-scan` | Bypass `.ifetch_state.json`; open every file over the network to check its size | fast path on |
+| `--force` | Re-download every file regardless of local state or size match | off |
 | `--log-file PATH` | Write structured JSON logs to a file | console only |
 | `--list` | List directory contents instead of downloading | off |
 | `--list-shared` | List top-level items shared *with* you (no path needed) | off |
@@ -126,7 +191,58 @@ ifetch Documents/Programming ~/Work/Code \
   --email you@example.com --max-workers 8 --max-retries 5 --log-file download.log
 ```
 
-After each download run, a summary is printed and a detailed `download_report.json` is written into the destination directory.
+After each download run, a summary is printed and a detailed `download_report.json` is written into the destination directory. The summary includes a `skipped` count (files proven unchanged, by either the metadata fast path or the size comparison); those files appear in the report details with `status="skipped"` and `downloaded: 0`.
+
+iFetch also writes `.ifetch_state.json` into the destination root — the sync state that makes the next run cheap. Deleting it is safe: the next run just falls back to a network check per file. Two concurrent `ifetch` runs against the same destination can overwrite each other's state file; the effect is extra network checks on the following run, never a false skip.
+
+### `ifetch-verify` — read-only integrity checking
+
+```sh
+ifetch-verify <icloud_path> [local_path] [options]
+```
+
+Walks the remote tree, compares it against your local copy, and reports per file. **It never modifies your files** — local files are opened read-only, and in `redownload` mode remote bytes are hashed in memory and never written to disk. The only thing it can write is the JSON report, at the path you pass to `--report`.
+
+| Argument / flag | Description | Default |
+|---|---|---|
+| `icloud_path` | Remote iCloud Drive path to verify | — (required) |
+| `local_path` | Local directory holding the mirror | current directory |
+| `--email` | iCloud account email (or set `ICLOUD_EMAIL`) | env var |
+| `--level size\|checksum\|redownload` | Verification depth — see below | `size` |
+| `--max-workers N` | Files verified concurrently | `4` |
+| `--report PATH` | Write a JSON verification report | none |
+| `--quiet` | Suppress per-file progress output | off |
+
+Exit codes: `0` everything verified, `1` at least one file failed verification, `2` operational error (auth failure, bad path, unwritable report, cancelled).
+
+#### Which level actually proves what
+
+| Level | What it does | What it proves | Cost |
+|---|---|---|---|
+| `size` (default) | Compares the remote size attribute with the local file size | Files are present and the right length. **Cannot detect corruption that preserves the file size.** | No content read, no bytes transferred |
+| `checksum` | Everything `size` does, plus SHA-256 of your local files | Nothing extra *against iCloud* — see below | Reads every local byte |
+| `redownload` | Streams every remote file and compares its SHA-256 against the local file's | **Byte-for-byte equality with iCloud.** This is the only level that actually proves your local copy matches. | Re-downloads the entire dataset |
+
+**Be clear about `--level checksum`:** Apple exposes **no content checksum** for iCloud Drive items. Verified against pyicloud 2.6.5 — the drive node metadata carries `size`, `etag`, `dateModified`/`dateChanged` and identifiers, but no digest, and `etag` is a mutation counter (e.g. `"3::5"`), not a content hash. So `checksum` hashes your local file, finds nothing to compare it to, and honestly reports `checksum_unavailable` rather than claiming a match it cannot prove. That is **not** a failure and does not affect the exit code. The level is still useful for building a local manifest and catching local bit-rot between runs — but it does not verify anything against Apple. If you want that assurance, you have to pay for `redownload`.
+
+#### Report statuses
+
+| Status | Meaning | Counts as failure? |
+|---|---|---|
+| `verified` | Passed at the requested level | No |
+| `size_mismatch` | Local and remote sizes differ | Yes |
+| `missing_local` | In iCloud, not on disk | Yes |
+| `checksum_mismatch` | Digests differ (`redownload`, or `checksum` if Apple ever publishes one) | Yes |
+| `error` | The file could not be checked | Yes |
+| `checksum_unavailable` | Local digest recorded; iCloud publishes no digest to compare against | No |
+| `extra_local` | On disk, not in iCloud — reported for information (iFetch's own artifacts and `.versions/` are excluded) | No |
+
+```sh
+ifetch-verify Documents ~/icloud-backup --email you@example.com
+ifetch-verify Documents ~/icloud-backup --level redownload --report verify.json --quiet
+```
+
+The same CLI is reachable as `python -m ifetch.verify ...` if the `ifetch-verify` entry point is not on your `PATH`.
 
 ### `ifetch-export` — local folders → Google Drive
 
@@ -134,14 +250,14 @@ After each download run, a summary is printed and a detailed `download_report.js
 ifetch-export [options]
 ```
 
-Uploads local folders (by default `~/Documents`, `~/Downloads`, `~/Desktop`, `~/Pictures`, `~/LocalDoc` — whichever exist) to a folder in your Google Drive, skipping anything that hasn't changed since the last run (MD5 + a local upload index). Asks for confirmation before uploading. Requires Google OAuth credentials — see [docs/mirror.md](docs/mirror.md) for the setup walkthrough.
+Uploads local folders (by default `~/Documents`, `~/Downloads`, `~/Desktop`, `~/Pictures` — whichever exist) to a folder in your Google Drive, skipping anything that hasn't changed since the last run (MD5 + a local upload index). Asks for confirmation before uploading. Requires Google OAuth credentials — see [docs/mirror.md](docs/mirror.md) for the setup walkthrough.
 
 | Flag | Description | Default |
 |---|---|---|
-| `--folders PATH...` | Folders to export | Documents, Downloads, Desktop, Pictures, LocalDoc |
+| `--folders PATH...` | Folders to export | Documents, Downloads, Desktop, Pictures |
 | `--gdrive-folder NAME` | Destination folder name in Google Drive | `MacOS Data` |
 | `--credentials PATH` | Google OAuth2 client credentials JSON | `credentials.json` |
-| `--token PATH` | Where the OAuth token is cached | `.gdrive_token.pickle` |
+| `--token PATH` | Where the OAuth token is cached (JSON, mode 0600) | `.gdrive_token.json` |
 | `--force` | Re-upload everything, even unchanged files | off |
 | `--include PAT...` | Only upload files matching patterns (e.g. `*.pdf *.docx`) | all |
 | `--exclude PAT...` | Skip files matching patterns (e.g. `*.tmp`) | none |
@@ -174,7 +290,7 @@ See the [Mirror section](#mirror-icloud--nas--google-drive) below and the full g
 
 ## Mirror: iCloud → NAS → Google Drive
 
-A frequently requested workflow: keep a copy of your iCloud Drive on a NAS **and** in Google Drive, without ever re-transferring unchanged data. `ifetch-mirror` chains both hops into one command, delta-aware at each stage:
+A frequently requested workflow: keep a copy of your iCloud Drive on a NAS **and** in Google Drive, without re-transferring files that haven't changed. `ifetch-mirror` chains both hops into one command, skipping unchanged files at each stage:
 
 ```sh
 # One shot: pull iCloud Documents to the NAS, then push to Google Drive
@@ -189,11 +305,11 @@ ifetch-mirror Documents /Volumes/nas/icloud-mirror \
   --gdrive-folder "iCloud Mirror" --dry-run
 ```
 
-- Hop 1 (iCloud → local) uses iFetch's chunk-level delta sync — only changed byte ranges cross the wire.
+- Hop 1 (iCloud → local) uses the `ifetch` download engine: unchanged files are skipped outright, interrupted transfers resume, and any file that did change is re-downloaded in full ([details](#how-re-runs-decide-what-to-download)).
 - Hop 2 (local → Google Drive) uses the export engine's MD5 + upload index — only changed files are re-uploaded.
 - `--watch` makes it a lightweight always-on daemon; alternatively schedule single runs with launchd/cron/systemd ([docs/scheduling.md](docs/scheduling.md)).
 
-The pipeline is **one-way** (iCloud is the source of truth). Two-way sync is on the roadmap.
+The pipeline is **one-way** (iCloud is the source of truth). Two-way sync is deliberately not implemented — see the [Roadmap](#roadmap).
 
 ## Profiles
 
@@ -264,6 +380,12 @@ Common issues — the 2FA flow, expired sessions, per-OS keyring problems, rate 
 - **Repeated 2FA prompts** — your session expired; run `ifetch` interactively once to re-trust the session.
 - **503 / rate limited** — iFetch backs off automatically; lower `--max-workers` if it persists.
 - **Advanced Data Protection** — with ADP enabled, Apple blocks web/API access to Drive data unless you enable "Access iCloud Data on the Web" in your ADP settings.
+
+## Roadmap
+
+**1.1 — content-based chunk diffing.** Today a changed file is re-downloaded in full, and a same-size edit is not detected at all (see [How re-runs decide what to download](#how-re-runs-decide-what-to-download)). Real content diffing — rolling-hash chunk boundaries, per-chunk digests, fetching only the ranges that actually differ — is the planned fix. It is genuinely hard here: Apple publishes no per-chunk digests and the download stream is not seekable, so iFetch has to derive and store its own chunk index locally. That work is scoped for 1.1 rather than claimed today.
+
+**Two-way sync — deliberately not implemented.** Safe bidirectional sync needs conflict-resolution and delete-propagation semantics: what happens when both copies changed, and how do you distinguish "the user deleted this" from "this file failed to list this run"? Getting that wrong destroys the cloud copy, which is the one thing a backup tool must never do. iFetch stays one-way (iCloud → local) until those semantics can be designed and tested properly. If you need two-way sync today, use a tool built for it.
 
 ## Contributing
 

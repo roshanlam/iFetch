@@ -152,7 +152,7 @@ ifetch-mirror Documents /mnt/nas/icloud-mirror \
   --watch 900        # repeat every 15 minutes
 ```
 
-This keeps a single process running that repeats the full iCloud → local → Google Drive pipeline on the given interval. Both hops are delta-aware, so an interval pass where nothing changed transfers (almost) nothing. Pair it with a process supervisor for resilience — e.g. a systemd service with `Restart=on-failure` (no timer needed):
+This keeps a single process running that repeats the full iCloud → local → Google Drive pipeline on the given interval. Both hops skip files that haven't changed, so an interval pass where nothing changed transfers (almost) nothing. Pair it with a process supervisor for resilience — e.g. a systemd service with `Restart=on-failure` (no timer needed):
 
 ```ini
 [Service]

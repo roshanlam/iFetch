@@ -74,6 +74,24 @@ def main():
     )
 
     parser.add_argument(
+        '--no-fast-scan',
+        dest='fast_scan',
+        action='store_false',
+        default=True,
+        help=(
+            'Disable the metadata fast path. Every file is opened over the network '
+            'to check its size, even when local sync state says it is unchanged.'
+        )
+    )
+
+    parser.add_argument(
+        '--force',
+        dest='force',
+        action='store_true',
+        help='Re-download every file regardless of local state or size match'
+    )
+
+    parser.add_argument(
         '--profile',
         help='Profile name from ~/.ifetch_profiles.json to use for include/exclude patterns'
     )
@@ -113,7 +131,9 @@ def main():
             max_retries=args.max_retries,
             chunk_size=args.chunk_size,
             include_patterns=include_pats,
-            exclude_patterns=exclude_pats
+            exclude_patterns=exclude_pats,
+            fast_scan=getattr(args, 'fast_scan', True),
+            force=getattr(args, 'force', False)
         )
 
         # Authenticate (will prompt for password if needed)
@@ -147,6 +167,7 @@ def main():
             print(f"- Total files: {summary['total_files']}")
             print(f"- Successfully downloaded: {summary['successful']}")
             print(f"- Failed: {summary['failed']}")
+            print(f"- Skipped (unchanged): {summary.get('skipped', 0)}")
             print(f"- Total data transferred: {summary['total_bytes_transferred'] / (1024*1024):.2f} MB")
             print(f"- Changed chunks: {summary['total_changed_chunks']}")
             print(f"\nDetailed report saved to '{args.local_path}/download_report.json'")

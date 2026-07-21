@@ -3,29 +3,22 @@
   "cold": [
     {
       "workers": 4,
-      "seconds": 42.8,
+      "seconds": 38.9,
       "files": 414,
       "bytes": 3045015682,
-      "MiB_per_s": 67.85
-    },
-    {
-      "workers": 8,
-      "seconds": 50.2,
-      "files": 414,
-      "bytes": 3045015682,
-      "MiB_per_s": 57.89
+      "MiB_per_s": 74.67
     }
   ],
   "warm": {
-    "seconds": 16.2,
-    "speedup_vs_cold": 2.6,
+    "seconds": 4.4,
+    "speedup_vs_cold": 8.8,
     "bytes_transferred": 0,
     "changed_chunks": 0
   },
   "resume": {
     "interrupted": true,
     "partial_bytes": 3045015682,
-    "restart_seconds": 17.6,
+    "restart_seconds": 4.5,
     "matches_reference": true,
     "verification": "sha256"
   }

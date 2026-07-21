@@ -101,13 +101,58 @@ If you still see persistent 503s or `Too Many Requests`:
 3. Space out scheduled runs — hourly is usually fine, every minute is asking for throttling.
 4. Wait. Throttling windows typically clear within minutes to an hour.
 
-Failures are recorded per-file in `download_report.json` and in the `--log-file` JSON log, so a partially throttled run can simply be re-run — delta sync skips everything that already succeeded.
+Failures are recorded per-file in `download_report.json` and in the `--log-file` JSON log, so a partially throttled run can simply be re-run — files that already completed are skipped, and files that were cut off mid-transfer resume from where they stopped.
+
+## "iFetch skipped a file I know changed"
+
+Re-runs skip files using two mechanisms, in order:
+
+1. **The metadata fast path** — `.ifetch_state.json` in the destination root records the remote size and remote modified timestamp from the last successful download. If both still match, the recorded local size matches, the local file is present at exactly that size, and there is no `.temp`/`.download` artifact next to it, the file is skipped with no network call at all.
+2. **The size comparison** — otherwise iFetch opens the remote file and compares `content-length` with the local size. Equal sizes are assumed unchanged.
+
+Known limits, stated plainly:
+
+- **A change that leaves the file size identical is invisible to the size comparison.** The fast path catches it only if Apple bumped `dateModified` — the fast path trusts Apple to do that.
+- **Local corruption at the same size is not detected** by either mechanism. Use `ifetch-verify` (`--level redownload` for real proof) to catch it.
+- **Two `ifetch` runs against the same destination at the same time** can clobber each other's state file. This is harmless: the worst outcome is extra network checks on the next run, never a false skip.
+
+Fixes:
+
+```sh
+ifetch Documents ~/icloud-backup --no-fast-scan   # ignore the state file, check every file over the network
+ifetch Documents ~/icloud-backup --force          # re-download everything unconditionally
+rm ~/icloud-backup/.ifetch_state.json             # also safe: next run just falls back to network checks
+```
+
+## "How do I know my backup is actually intact?"
+
+Run `ifetch-verify` — it is strictly read-only and never modifies your files.
+
+```sh
+ifetch-verify Documents ~/icloud-backup --email you@example.com                    # sizes only (fast)
+ifetch-verify Documents ~/icloud-backup --level redownload --report verify.json    # proves byte equality
+```
+
+Only `--level redownload` proves your local copy matches iCloud, because it re-streams and hashes the remote bytes. `--level size` cannot see same-size corruption, and `--level checksum` hashes your local files but has nothing to compare them to — Apple publishes no content checksum for iCloud Drive items, so those files are reported as `checksum_unavailable` (not a failure, and not a verification). Exit code is `0` when everything verified, `1` on a verification failure, `2` on an operational error. Full status table in the [README](../ReadMe.md#ifetch-verify--read-only-integrity-checking).
 
 ## Advanced Data Protection (ADP) caveat
 
 If your Apple ID has **Advanced Data Protection** enabled, iCloud Drive data is end-to-end encrypted and Apple's web/API endpoints — which pyicloud (and therefore iFetch) uses — cannot read it by default. Symptoms: authentication succeeds but Drive listings come back empty or fail with access errors.
 
 Workaround: on an Apple device go to **Settings → [your name] → iCloud** and enable **"Access iCloud Data on the Web"**. This allows web/API access to your (still encrypted at rest) data and lets iFetch work. If you are not willing to enable that, iFetch cannot download ADP-protected Drive content — that is an Apple platform restriction, not an iFetch bug.
+
+## macOS package bundles (`.app`, `.logicx`, `.pages`, …)
+
+macOS "packages" are directories that Finder presents as a single file. iCloud stores them that way too, and Apple serves them over the download endpoint **as a ZIP archive with no `content-length` header**.
+
+Two consequences:
+
+- **The file you get is a ZIP**, even though it keeps its original name (`setup.app` on disk is a zip archive containing `setup.app/…`). To use it as an application again, unzip it: `unzip -q setup.app -d restored/`. This is how Apple serves it; iFetch writes exactly what it receives.
+- **The downloaded size will not match the size shown in listings.** The listing reports the *uncompressed* bundle size; you receive the compressed archive. A 24 MB bundle can arrive as an 8.8 MB zip.
+
+Because the sizes legitimately differ, these files cannot be recorded in the sync state as "definitely unchanged", so **package bundles are re-downloaded on every run**. That is deliberate: the alternative is trusting a size comparison that cannot be made to line up, and silently skipping a file is worse than re-fetching it. iFetch logs `unknown_length_size_differs_from_listing` when this happens.
+
+> Historical note: before v1.0.1, files served without a `content-length` header were silently treated as "unchanged" and never written to disk at all — they were missing from the backup while the run reported success. If you ran an earlier version, re-run it and check that your package bundles are present.
 
 ## Shared-folder quirks
 

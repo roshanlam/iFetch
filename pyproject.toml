@@ -63,6 +63,9 @@ Repository = "https://github.com/roshanlam/iFetch"
 ifetch = "ifetch.cli:main"
 ifetch-export = "ifetch.export_cli:main"
 ifetch-mirror = "ifetch.mirror_cli:main"
+ifetch-verify = "ifetch.verify:main"
+ifetch-restore = "ifetch.restore:main"
+ifetch-photos = "ifetch.photos_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["ifetch", "ifetch.exporters"]

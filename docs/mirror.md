@@ -3,10 +3,10 @@
 `ifetch-mirror` chains iFetch's two engines into a single one-way pipeline:
 
 ```
-iCloud Drive  ──(delta download)──▶  local folder / NAS mount  ──(delta upload)──▶  Google Drive
+iCloud Drive  ──(skip-unchanged download)──▶  local folder / NAS mount  ──(skip-unchanged upload)──▶  Google Drive
 ```
 
-Typical use case: your source of truth is iCloud, you want a durable copy on your NAS, and a second off-site copy in Google Drive — without ever re-transferring unchanged data at either hop.
+Typical use case: your source of truth is iCloud, you want a durable copy on your NAS, and a second off-site copy in Google Drive — without re-transferring files that haven't changed at either hop.
 
 ```sh
 ifetch-mirror <icloud_path> <local_path> --gdrive-folder NAME [--watch SECONDS] [--dry-run] [--email EMAIL]
@@ -21,15 +21,15 @@ ifetch-mirror <icloud_path> <local_path> --gdrive-folder NAME [--watch SECONDS] 
 | `--dry-run` | Report what would be transferred at each hop without transferring |
 | `--email` | iCloud account email (or set `ICLOUD_EMAIL`) |
 
-The pipeline is **one-way**: changes flow iCloud → local → Google Drive. Deleting or editing files on the NAS or in Google Drive does not propagate back to iCloud. Two-way sync is on the roadmap.
+The pipeline is **one-way**: changes flow iCloud → local → Google Drive. Deleting or editing files on the NAS or in Google Drive does not propagate back to iCloud. Two-way sync is deliberately not implemented — see the [Roadmap](../ReadMe.md#roadmap).
 
-## How each hop stays "delta"
+## How each hop avoids re-transferring data
 
 **Hop 1 — iCloud → local** uses the `ifetch` download engine:
 
-- unchanged files are skipped via stored checksums (`.ifetch_versions.json`);
-- changed files re-download only the differing byte ranges (chunk-level diff);
-- interrupted transfers resume from their checkpoint;
+- unchanged files are skipped: first via the `.ifetch_state.json` sync state (remote size + remote modified timestamp + recorded local size all matching, which costs **zero network round-trips**), otherwise by comparing the remote `content-length` with the local file size;
+- a file that did change is re-downloaded **in full** — iFetch does not do content-based chunk diffing, so a one-byte edit in a 2 GB file costs 2 GB. A modification that leaves the size unchanged is not detected by the size comparison at all. See [How re-runs decide what to download](../ReadMe.md#how-re-runs-decide-what-to-download);
+- interrupted transfers resume from their checkpoint — a local file that is a shorter prefix of the remote fetches only the missing tail;
 - when a file changed in iCloud, your previous local copy is archived under `.versions/` before being replaced — the NAS mirror doubles as a version history.
 
 **Hop 2 — local → Google Drive** uses the export engine (`ifetch-export` under the hood):
@@ -38,7 +38,7 @@ The pipeline is **one-way**: changes flow iCloud → local → Google Drive. Del
 - files missing from the index are compared against Drive by MD5 before uploading;
 - uploads are resumable and chunked, several files in parallel.
 
-Net effect: a `--watch` pass where nothing changed costs one iCloud listing and zero uploads.
+Net effect: a `--watch` pass where nothing changed costs one iCloud listing, zero downloads and zero uploads.
 
 ## Prerequisites
 
@@ -61,15 +61,15 @@ One-time setup (about 5 minutes):
 
 When the exporter authenticates it:
 
-1. Looks for a cached token at `.gdrive_token.pickle` (configurable with `--token`). If present and valid, no interaction is needed; if expired, it is refreshed silently using the refresh token.
+1. Looks for a cached token at `.gdrive_token.json` (configurable with `--token`). If present and valid, no interaction is needed; if expired, it is refreshed silently using the refresh token.
 2. Otherwise it starts a **local-server OAuth flow**: your browser opens to Google's consent page, you sign in and approve, and Google redirects back to a temporary local port to hand iFetch the token.
-3. The token is pickled to `.gdrive_token.pickle` for future runs.
+3. The token is written as JSON to `.gdrive_token.json` (mode 0600) for future runs. A legacy `.gdrive_token.json` from older iFetch versions is read once and migrated automatically.
 
-The requested scope is **`drive.file`** — iFetch can only see and manage files/folders **it created itself**. It cannot read the rest of your Google Drive. If you ever change scopes, delete `.gdrive_token.pickle` to force a fresh consent.
+The requested scope is **`drive.file`** — iFetch can only see and manage files/folders **it created itself**. It cannot read the rest of your Google Drive. If you ever change scopes, delete `.gdrive_token.json` to force a fresh consent.
 
-**Headless machines** (NAS without a browser): run the first authentication on a desktop machine, then copy `.gdrive_token.pickle` (and `credentials.json`) to the headless box. Refreshes after that are non-interactive.
+**Headless machines** (NAS without a browser): run the first authentication on a desktop machine, then copy `.gdrive_token.json` (and `credentials.json`) to the headless box. Refreshes after that are non-interactive.
 
-**Token errors** ("invalid_grant", repeated re-consent): delete `.gdrive_token.pickle` and authenticate again. Test-mode OAuth apps can have refresh tokens expire after 7 days — publish the consent screen to "In production" (no verification needed for your own use with the `drive.file` scope) to get long-lived refresh tokens.
+**Token errors** ("invalid_grant", repeated re-consent): delete `.gdrive_token.json` and authenticate again. Test-mode OAuth apps can have refresh tokens expire after 7 days — publish the consent screen to "In production" (no verification needed for your own use with the `drive.file` scope) to get long-lived refresh tokens.
 
 ## Recipes
 
@@ -97,7 +97,7 @@ Run it under a supervisor for resilience — a systemd unit with `Restart=on-fai
 
 - **Mount first.** If the NAS mount is down, the local path looks like an empty directory. Guard scheduled runs with a mount check, e.g. `mountpoint -q /mnt/nas && ifetch-mirror ...` on Linux.
 - **SMB/NFS metadata**: hop 2's change detection uses size + mtime (falling back to MD5), so filesystems with coarse mtime resolution are fine — worst case a file is re-hashed, not re-uploaded.
-- **Keep the housekeeping files** (`.ifetch_versions.json`, `.versions/`, `.gdrive_upload_index.json`, `.gdrive_token.pickle`) with the mirror. Deleting the upload index does not cause duplicates — files are re-verified against Drive by MD5 — but it makes the next pass much slower.
+- **Keep the housekeeping files** (`.ifetch_versions.json`, `.versions/`, `.gdrive_upload_index.json`, `.gdrive_token.json`) with the mirror. Deleting the upload index does not cause duplicates — files are re-verified against Drive by MD5 — but it makes the next pass much slower.
 - **Snapshots**: if your NAS does snapshots (btrfs/ZFS/Synology), snapshotting the mirror directory gives you an extra safety net on top of iFetch's `.versions/` history.
 
 ## Roadmap
