@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ifetch"
+version = "1.0.0"
+description = "Bulk download, back up, and mirror your iCloud Drive from the command line"
+readme = "ReadMe.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Roshan Lamichhane" },
+]
+keywords = ["icloud", "backup", "download", "sync", "google-drive"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: Utilities",
+]
+# pyicloud on PyPI is now maintained by timlaing (github.com/timlaing/pyicloud);
+# >=2.5.0 is required for shared-drive (shareID) folder traversal.
+dependencies = [
+    "pyicloud>=2.5.0",
+    "requests",
+    "tqdm",
+    "keyring",
+    "orjson",
+]
+
+[project.optional-dependencies]
+gdrive = [
+    "google-auth",
+    "google-auth-oauthlib",
+    "google-auth-httplib2",
+    "google-api-python-client",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[project.urls]
+Homepage = "https://github.com/roshanlam/iFetch"
+Repository = "https://github.com/roshanlam/iFetch"
+"Issue Tracker" = "https://github.com/roshanlam/iFetch/issues"
+
+[project.scripts]
+ifetch = "ifetch.cli:main"
+ifetch-export = "ifetch.export_cli:main"
+ifetch-mirror = "ifetch.mirror_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ifetch", "ifetch.exporters"]
+exclude = ["tests*", "plugins*"]

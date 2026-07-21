@@ -1,0 +1,83 @@
+name: Bug report
+description: Report a problem with iFetch
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug!
+
+        **Security note:** NEVER paste your Apple ID password, session tokens,
+        cookies, or 2FA codes into an issue. Please sanitize logs before
+        attaching them (remove email addresses, tokens, and file names you do
+        not want public).
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected to happen instead.
+      placeholder: When I run `ifetch ...`, it ...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact command(s) you ran and any relevant setup.
+      placeholder: |
+        1. Run `ifetch Documents/ ./backup`
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: OS name and version.
+      placeholder: macOS 15.4 / Ubuntu 24.04 / Windows 11
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output of `python --version`.
+      placeholder: "3.12.4"
+    validations:
+      required: true
+  - type: input
+    id: ifetch-version
+    attributes:
+      label: ifetch version
+      description: The version or git commit of iFetch you are running.
+      placeholder: "e.g. 1.0.0 or commit ae21f58"
+    validations:
+      required: true
+  - type: dropdown
+    id: two-factor
+    attributes:
+      label: Is two-factor authentication (2FA) enabled on your Apple ID?
+      options:
+        - "Yes"
+        - "No"
+        - "Not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs / output
+      description: |
+        Relevant console output or log excerpts. REMOVE credentials, session
+        tokens, cookies, and any personal data before pasting.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: sanitized
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have removed all credentials, session tokens, and personal data from this report.
+          required: true

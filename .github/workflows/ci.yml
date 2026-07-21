@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Prefer an editable install with dev/gdrive extras (pyproject.toml);
+          # fall back to requirements.txt if the project metadata is unavailable.
+          pip install -e ".[dev,gdrive]" || pip install -r requirements.txt
+          # Ensure test tooling is present regardless of which path succeeded.
+          pip install pytest pytest-cov
+
+      - name: Run tests with coverage
+        run: pytest --cov=ifetch
+
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      # --exit-zero keeps lint advisory for now: the codebase predates ruff and
+      # has not been fully linted yet. Remove --exit-zero once existing findings
+      # are cleaned up so lint failures block CI.
+      - name: Run ruff
+        run: ruff check ifetch/ --exit-zero

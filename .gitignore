@@ -3,6 +3,9 @@ venv/
 .env
 .ropeproject
 __pycache__
+dist/
+build/
+*.egg-info/
 .idea/
 .vscode/
 .coverage
