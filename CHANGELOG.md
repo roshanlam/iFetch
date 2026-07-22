@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Persistent SQLite index** (`.ifetch_index.db`, `ifetch/index.py`). The flat
+  JSON files answered "is this one file unchanged?" but cannot support the
+  workflows built on top of them: totalling a tree before downloading, set
+  differences between remote and local, dated snapshots, digest lookups for
+  rename/move detection, or per-file transfer rows that survive a crash. All of
+  those are now single queries against one store, using only the standard
+  library. Existing `.ifetch_state.json` and `.ifetch_manifest.json` are
+  imported automatically on first open, exactly once, and are left byte-for-byte
+  untouched so an older iFetch keeps working. The manifest continues to be
+  written as the human-readable, signable integrity export.
 - **`--password-command`** (and `$IFETCH_PASSWORD_COMMAND`), sourcing the Apple
   ID password from `pass`, `1password-cli`, a mounted secret or any command that
   prints it. A system keyring is precisely what Docker, systemd and NAS boxes
