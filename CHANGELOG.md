@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ifetch snapshot`** (`create`, `list`, `diff`, `restore`, `delete`) - dated
+  states of a mirror. A snapshot is metadata, not a copy, so taking one is
+  instant and costs kilobytes no matter how large the mirror is; that is what
+  makes taking one before every risky sync practical. `diff` compares two
+  points in time **by digest**, so a file whose size did not change is still
+  reported. `restore` is a dry run by default and prints where each file's
+  bytes would come from: `.versions` (the exact recorded bytes, preferred),
+  iCloud (the current remote copy, which may differ from the snapshot), or
+  nowhere - and files in the last category are **named rather than omitted**,
+  because quietly dropping them would imply a complete restore is possible.
+  Applying a restore archives what it replaces, so the restore is itself
+  reversible.
 - **`ifetch recover placeholders`** - find local files whose contents are not
   actually on this disk. A file evicted to iCloud still appears in Finder with
   a size, but holds nothing; copying it to a backup drive copies nothing, and
