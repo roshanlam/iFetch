@@ -35,6 +35,11 @@ from .auth import (
     resolve_region,
 )
 from .manifest import Manifest
+from .naming import (
+    NORMALIZE_PRESERVE,
+    DirectorySanitizer,
+    find_match,
+)
 from .packages import (
     PackageExpansionError,
     expand_package,
@@ -369,6 +374,9 @@ class DownloadManager:
         expand_packages: bool = True,
         manifest_key: Optional[bytes] = None,
         warn_days: int = DEFAULT_WARN_DAYS,
+        portable_names: bool = False,
+        normalize_names: str = NORMALIZE_PRESERVE,
+        password: Optional[str] = None,
     ):
         self.email = email or os.environ.get('ICLOUD_EMAIL')
         if not self.email:
@@ -417,6 +425,16 @@ class DownloadManager:
         self.manifest_key = manifest_key
         self.warn_days = warn_days
 
+        # Name handling. Defaults are deliberately conservative: changing a
+        # local filename moves the file, which orphans what an earlier run
+        # wrote and forces a full re-download.
+        self.portable_names = portable_names
+        self.normalize_names = normalize_names
+
+        # An explicit password, usually produced by --password-command. When
+        # None, pyicloud falls back to the system keyring as before.
+        self._password = password
+
         # Will be set when download() is invoked
         self.root_path: Optional[Path] = None
         self.version_manager: Optional[VersionManager] = None
@@ -463,7 +481,10 @@ class DownloadManager:
             print(warning)
 
         try:
-            params: Dict[str, Any] = {"apple_id": self.email.strip(), "password": None}
+            params: Dict[str, Any] = {
+                "apple_id": self.email.strip(),
+                "password": self._password,
+            }
             params.update(region_service_kwargs(self.region))
 
             self.api = PyiCloudService(**params)
@@ -619,7 +640,14 @@ class DownloadManager:
         return item
 
     def _resolve_child(self, item: Any, name: str) -> Any:
-        """Resolve a child by exact or case-insensitive name."""
+        """Resolve a child by name, ignoring case *and* Unicode normalisation.
+
+        Apple returns filenames in NFD; users type NFC. Those are different
+        strings that look identical, so an exact lookup - and even a
+        case-folded one - fails on any name with an accent in it. Comparing
+        through :func:`naming.fold` normalises both sides first, which is what
+        stops ``Café`` reporting "Path not found".
+        """
         try:
             return item[name]
         except (KeyError, TypeError, AttributeError):
@@ -627,10 +655,9 @@ class DownloadManager:
             if not child_names:
                 raise KeyError(name)
 
-            normalized = name.casefold()
-            for child_name in child_names:
-                if child_name.casefold() == normalized:
-                    return item[child_name]
+            match = find_match(name, child_names)
+            if match is not None:
+                return item[match]
 
             raise KeyError(name)
 
@@ -1624,9 +1651,30 @@ class DownloadManager:
                     # loads items and modifies its internal cache
                     content_names = list(contents.keys()) if hasattr(contents, 'keys') else list(contents)
                     child_items = []
+                    # Apple names are not always legal filenames here. Sanitising
+                    # per directory (rather than globally) is what lets two
+                    # different remote names that map to the same local name be
+                    # detected and separated instead of overwriting each other.
+                    sanitizer = DirectorySanitizer(
+                        portable=self.portable_names, normalize=self.normalize_names
+                    )
                     for name in content_names:
+                        local_name, changed = sanitizer.assign(name)
+                        if changed:
+                            self.logger.warning(json.dumps({
+                                "event": "name_sanitized",
+                                "remote": name,
+                                "local": local_name,
+                                "parent": str(local_path),
+                            }))
                         child_remote_path = name if not remote_path else f"{remote_path.rstrip('/')}/{name}"
-                        child_items.append((item[name], local_path / name, child_remote_path))
+                        child_items.append((item[name], local_path / local_name, child_remote_path))
+                    for collision in sanitizer.collisions:
+                        self.logger.warning(json.dumps({
+                            "event": "name_collision",
+                            "parent": str(local_path),
+                            **collision,
+                        }))
                     local_path.mkdir(parents=True, exist_ok=True)
                     with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                         futures = [

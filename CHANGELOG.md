@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--password-command`** (and `$IFETCH_PASSWORD_COMMAND`), sourcing the Apple
+  ID password from `pass`, `1password-cli`, a mounted secret or any command that
+  prints it. A system keyring is precisely what Docker, systemd and NAS boxes
+  lack, which previously left the password as the one part of authentication
+  that still required a human. The command is split with `shlex` and run
+  **without a shell**, so quoted paths containing spaces work and the option is
+  not an injection vector.
+- **`--portable-names`**, sanitizing filenames for the strictest common
+  filesystem rather than only the current one — for destinations that are exFAT,
+  a NAS share, or will later be read from Windows.
+- **`--normalize-names {preserve,nfc}`** (default `preserve`). `nfc` writes
+  composed Unicode locally, which is more natural to type on Linux, at the cost
+  of renaming anything already mirrored under the decomposed spelling.
 - **`ifetch auth` command tree** (`doctor`, `renew`, `status`), also installed as
   `ifetch-auth`. `doctor` reports which authentication precondition failed and
   what to do about it — Apple's `HTTP 423 Missing PCS cookies`, `400 Invalid
@@ -119,6 +132,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Folders with accents in their names no longer report "Path not found".**
+  Apple returns filenames in Unicode NFD while users and shells produce NFC;
+  these are different strings that render identically, and the previous
+  `casefold()` comparison did not normalize, so `Café`, `Résumé`, `Übungen` and
+  most non-English paths failed to resolve. Lookup now normalizes both sides.
+- Remote names that are not legal filenames on the target filesystem are now
+  sanitized instead of failing or escaping the destination directory, and two
+  remote names that sanitize to the same local name are given deterministic
+  distinct names rather than silently overwriting one another. Only names the
+  current platform genuinely cannot represent are changed, so existing mirrors
+  are not moved.
+- `ifetch-verify` derives local names through the same sanitizer as the
+  downloader, so sanitized or de-collided files are no longer reported missing.
 - ZIP members carrying permission bits but no file-type bits (as written by
   Python's own `zipfile.writestr`) are no longer misclassified as non-regular
   entries and skipped during package expansion.

@@ -110,6 +110,103 @@ def region_service_kwargs(region: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Password sourcing
+# ---------------------------------------------------------------------------
+
+class PasswordCommandError(Exception):
+    """The configured password command could not produce a password."""
+
+
+def resolve_password(
+    command: Optional[str] = None,
+    env_var: str = "IFETCH_PASSWORD_COMMAND",
+    env: Optional[Dict[str, str]] = None,
+    timeout: float = 60.0,
+    runner: Optional[Callable[[List[str]], str]] = None,
+) -> Optional[str]:
+    """Obtain the Apple ID password by running a command, or return ``None``.
+
+    ``None`` means "not configured", and the caller should fall back to
+    pyicloud's system keyring - which stays the recommended path on a desktop.
+    But a keyring is exactly what a Docker container, a systemd unit or a
+    headless NAS does not have, which otherwise leaves the password as the one
+    part of authentication that still needs a human. This closes that gap by
+    letting the password come from `pass`, `1password-cli`, `age`, a mounted
+    secret, or anything else that prints it.
+
+    The command is split with :mod:`shlex` and executed **without a shell**.
+    That is deliberate on two counts: it avoids handing an injection vector to
+    anything that can influence the string, and it means a quoted path
+    containing spaces works correctly - the failure mode reported against other
+    tools that split on whitespace.
+
+    Only the first line of stdout is used, so a helper that prints diagnostics
+    afterwards still works. The password is never logged or included in an
+    exception message.
+    """
+    import shlex
+    import subprocess
+
+    environ = os.environ if env is None else env
+    spec = command or environ.get(env_var)
+    if not spec or not spec.strip():
+        return None
+
+    try:
+        argv = shlex.split(spec)
+    except ValueError as exc:
+        raise PasswordCommandError(
+            f"could not parse --password-command ({exc}). Quote paths that "
+            'contain spaces, e.g. --password-command \'"/opt/my dir/get.sh" arg\''
+        ) from exc
+
+    if not argv:
+        raise PasswordCommandError("--password-command is empty")
+
+    if runner is not None:
+        output = runner(argv)
+    else:
+        try:
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise PasswordCommandError(
+                f"password command not found: {argv[0]!r}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise PasswordCommandError(
+                f"password command timed out after {timeout:.0f}s. A command that "
+                "prompts for input cannot work here; it must print the password "
+                "and exit."
+            ) from exc
+        except OSError as exc:
+            raise PasswordCommandError(f"could not run password command: {exc}") from exc
+
+        if completed.returncode != 0:
+            # stderr may carry a useful reason ("locked", "not found"); stdout
+            # may carry the secret, so it is never echoed.
+            detail = (completed.stderr or "").strip().splitlines()
+            hint = f": {detail[0]}" if detail else ""
+            raise PasswordCommandError(
+                f"password command exited {completed.returncode}{hint}"
+            )
+        output = completed.stdout
+
+    password = (output or "").splitlines()[0].strip() if (output or "").strip() else ""
+    if not password:
+        raise PasswordCommandError(
+            "password command produced no output. It must print the password on "
+            "stdout."
+        )
+    return password
+
+
+# ---------------------------------------------------------------------------
 # Failure classification
 # ---------------------------------------------------------------------------
 
@@ -771,6 +868,7 @@ class AuthDoctor:
         service_factory: Optional[Callable[..., Any]] = None,
         drive_probe: Optional[Callable[[Any], Any]] = None,
         now: Optional[float] = None,
+        password: Optional[str] = None,
     ):
         self.account = account
         self.region = region
@@ -780,6 +878,7 @@ class AuthDoctor:
         self.service_factory = service_factory
         self.drive_probe = drive_probe
         self.now = now
+        self.password = password
 
     # -- local checks ---------------------------------------------------
     def run(self) -> Diagnosis:
@@ -889,7 +988,7 @@ class AuthDoctor:
         try:
             service = factory(
                 apple_id=self.account,
-                password=None,
+                password=self.password,
                 **region_service_kwargs(self.region),
             )
         except Exception as exc:

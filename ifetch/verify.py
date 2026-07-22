@@ -55,10 +55,12 @@ if __package__ in (None, ""):  # pragma: no cover - standalone script support
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from ifetch.downloader import DownloadManager  # type: ignore
     from ifetch.logger import setup_logging  # type: ignore
+    from ifetch.naming import NORMALIZE_PRESERVE, DirectorySanitizer  # type: ignore
     from ifetch.utils import can_read_file  # type: ignore
 else:
     from .downloader import DownloadManager
     from .logger import setup_logging
+    from .naming import NORMALIZE_PRESERVE, DirectorySanitizer
     from .utils import can_read_file
 
 
@@ -272,6 +274,8 @@ class Verifier:
         exclude_patterns: Optional[List[str]] = None,
         chunk_size: int = _READ_CHUNK,
         logger: Optional[Any] = None,
+        portable_names: Optional[bool] = None,
+        normalize_names: Optional[str] = None,
     ):
         if level not in LEVELS:
             raise ValueError(
@@ -290,6 +294,21 @@ class Verifier:
         if downloader is None:
             downloader = DownloadManager(email=email, max_workers=self.max_workers)
         self.downloader = downloader
+
+        # Default to whatever the downloader is configured with, so verifying a
+        # mirror never disagrees with the run that produced it about what a
+        # given file is called. Explicit arguments still win, which is what lets
+        # a mirror written with different settings be checked.
+        self.portable_names = (
+            getattr(downloader, "portable_names", False)
+            if portable_names is None
+            else portable_names
+        )
+        self.normalize_names = (
+            getattr(downloader, "normalize_names", NORMALIZE_PRESERVE)
+            if normalize_names is None
+            else normalize_names
+        )
 
         self._lock = threading.Lock()
         self._completed = 0
@@ -340,8 +359,14 @@ class Verifier:
             return found
 
         names = list(contents.keys()) if hasattr(contents, "keys") else list(contents)
+        # The verifier must derive local names exactly as the downloader did,
+        # or every sanitised or de-collided name looks like a missing file.
+        sanitizer = DirectorySanitizer(
+            portable=self.portable_names, normalize=self.normalize_names
+        )
         for name in names:
-            child_rel = f"{prefix}/{name}" if prefix else name
+            local_name, _ = sanitizer.assign(name)
+            child_rel = f"{prefix}/{local_name}" if prefix else local_name
             try:
                 child = node[name]
             except Exception as exc:

@@ -34,6 +34,7 @@ from .auth import (
     TwoFactorUnavailable,
     classify_auth_error,
     evaluate_expiry,
+    resolve_password,
     read_session_snapshot,
     region_service_kwargs,
     render_diagnosis,
@@ -63,6 +64,14 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--cookie-directory",
         help="Directory holding the stored pyicloud session (defaults to pyicloud's)",
+    )
+    parser.add_argument(
+        "--password-command",
+        dest="password_command",
+        help=(
+            "Command printing the Apple ID password on stdout, for machines with "
+            "no system keyring (or set $IFETCH_PASSWORD_COMMAND)"
+        ),
     )
     parser.add_argument(
         "--json",
@@ -191,6 +200,7 @@ def cmd_doctor(args: argparse.Namespace, stdout: Any) -> int:
         cookie_directory=_cookie_directory(args),
         warn_days=args.warn_days,
         online=args.online,
+        password=resolve_password(getattr(args, "password_command", None)),
     )
     diagnosis = doctor.run()
     _emit(diagnosis.to_dict(), render_diagnosis(diagnosis), args.as_json, stdout)
@@ -278,7 +288,7 @@ def cmd_renew(
     try:
         service = factory(
             apple_id=email,
-            password=None,
+            password=resolve_password(getattr(args, "password_command", None)),
             **region_service_kwargs(region),
         )
         _complete_two_factor(service, resolver, args, stdout)

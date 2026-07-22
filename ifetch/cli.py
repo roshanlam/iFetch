@@ -176,6 +176,44 @@ def main(argv=None):
     )
 
     parser.add_argument(
+        '--password-command',
+        dest='password_command',
+        help=(
+            'Shell-free command that prints the Apple ID password on stdout, for '
+            'machines with no system keyring (Docker, systemd, NAS). Quote paths '
+            'containing spaces. Or set $IFETCH_PASSWORD_COMMAND.'
+        )
+    )
+
+    naming_group = parser.add_argument_group(
+        'filename handling',
+        'Apple returns names in Unicode NFD and permits characters some '
+        'filesystems cannot store.'
+    )
+    naming_group.add_argument(
+        '--portable-names',
+        dest='portable_names',
+        action='store_true',
+        help=(
+            'Sanitize names for the strictest common filesystem rather than just '
+            'the current one. Use when the destination is exFAT, a NAS share, or '
+            'will be read from Windows.'
+        )
+    )
+    naming_group.add_argument(
+        '--normalize-names',
+        dest='normalize_names',
+        choices=['preserve', 'nfc'],
+        default='preserve',
+        help=(
+            'Local filename spelling. "preserve" (default) keeps Apple\'s exact '
+            'bytes. "nfc" writes composed Unicode, which is more natural to type '
+            'on Linux -- but it renames existing files, forcing a re-download of '
+            'anything already mirrored under the decomposed spelling.'
+        )
+    )
+
+    parser.add_argument(
         '--warn-days',
         type=int,
         default=7,
@@ -208,11 +246,13 @@ def main(argv=None):
         include_pats, exclude_pats = pm.get_patterns() if pm else ([], [])
 
         if __package__ in (None, ""):
-            from ifetch.auth import TwoFactorResolver  # type: ignore
+            from ifetch.auth import TwoFactorResolver, resolve_password  # type: ignore
             from ifetch.manifest import load_signing_key  # type: ignore
         else:
-            from .auth import TwoFactorResolver  # type: ignore
+            from .auth import TwoFactorResolver, resolve_password  # type: ignore
             from .manifest import load_signing_key  # type: ignore
+
+        password = resolve_password(args.password_command)
 
         manifest_key = load_signing_key(
             key=args.sign_key,
@@ -233,6 +273,9 @@ def main(argv=None):
             expand_packages=args.expand_packages,
             manifest_key=manifest_key,
             warn_days=args.warn_days,
+            portable_names=args.portable_names,
+            normalize_names=args.normalize_names,
+            password=password,
         )
 
         two_factor = TwoFactorResolver(
