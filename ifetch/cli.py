@@ -30,6 +30,13 @@ def main(argv=None):
             from .auth_cli import main as auth_main  # type: ignore
         return sys.exit(auth_main(argv[1:]))
 
+    if argv and argv[0] == 'recover':
+        if __package__ in (None, ""):
+            from ifetch.recover_cli import main as recover_main  # type: ignore
+        else:
+            from .recover_cli import main as recover_main  # type: ignore
+        return sys.exit(recover_main(argv[1:]))
+
     if argv and argv[0] in ('plan', 'audit'):
         if __package__ in (None, ""):
             from ifetch import plan_cli  # type: ignore

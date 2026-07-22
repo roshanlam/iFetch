@@ -13,6 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ifetch recover placeholders`** - find local files whose contents are not
+  actually on this disk. A file evicted to iCloud still appears in Finder with
+  a size, but holds nothing; copying it to a backup drive copies nothing, and
+  every byte total and checksum over such a tree is wrong. Two signals are used
+  and each is reported with its evidence: a `.name.ext.icloud` stub (certain,
+  and detectable on any OS because the stub is a real file - which matters when
+  reading a drive pulled out of a Mac), and zero-block-but-nonzero-size
+  (likely, macOS/APFS only). **Signals that cannot be evaluated on the current
+  platform are named explicitly rather than silently skipped**, so the report
+  never says "none found" when it means "I could not look".
+- **`ifetch recover missing`** - what iCloud has that this disk does not really
+  have, separated into three kinds because they call for different actions:
+  never downloaded, disappeared (recorded by an earlier run and now gone -
+  local data loss), and placeholder-only. A file absent from disk *and* from
+  the latest iCloud scan is called out with a pointer to `.versions`.
+- **`ifetch recover inventory`** - where the space went, aggregated by folder,
+  by file type and by largest item, with optional Apple quota figures. CSV
+  export throughout, because "which folders should I stop paying for?" is a
+  sorting question.
 - **`ifetch plan`** - a dry run that reports exactly what a download would do
   before it does any of it: how many files would be fetched and overwritten,
   the byte total, whether the destination has enough free space (with

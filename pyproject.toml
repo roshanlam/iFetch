@@ -69,6 +69,7 @@ ifetch-photos = "ifetch.photos_cli:main"
 ifetch-auth = "ifetch.auth_cli:main"
 ifetch-plan = "ifetch.plan_cli:main"
 ifetch-audit = "ifetch.plan_cli:audit_main"
+ifetch-recover = "ifetch.recover_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["ifetch", "ifetch.exporters"]
