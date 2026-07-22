@@ -13,6 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ifetch plan`** - a dry run that reports exactly what a download would do
+  before it does any of it: how many files would be fetched and overwritten,
+  the byte total, whether the destination has enough free space (with
+  headroom), what is being skipped and why, which local files are not in iCloud
+  (never deleted, only reported), and an estimated duration. Transfers nothing.
+  The time estimate is produced **only** from throughput measured on previous
+  runs or supplied via `--throughput`; with neither, it is reported as unknown
+  rather than guessed.
+- **`ifetch audit`** - the same reconciliation presented as "what exists
+  remotely versus locally", exiting non-zero when the two sides disagree so it
+  is usable from a monitoring job.
+- **Metadata-only scanning** (`ifetch/scanner.py`). Traversal and transfer used
+  to be a single pass, which made it impossible to say anything about a job
+  before running it. `RemoteScanner` walks a drive tree reading only the
+  metadata Apple already returns in folder listings - one request per directory,
+  no file content - and `LocalScanner` indexes the destination, reusing recorded
+  digests where size and mtime still agree so a rescan does not re-hash a
+  terabyte. A folder that cannot be listed is recorded as an error and the scan
+  continues, rather than costing the inventory of everything else.
 - **Persistent SQLite index** (`.ifetch_index.db`, `ifetch/index.py`). The flat
   JSON files answered "is this one file unchanged?" but cannot support the
   workflows built on top of them: totalling a tree before downloading, set

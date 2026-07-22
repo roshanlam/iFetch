@@ -30,6 +30,14 @@ def main(argv=None):
             from .auth_cli import main as auth_main  # type: ignore
         return sys.exit(auth_main(argv[1:]))
 
+    if argv and argv[0] in ('plan', 'audit'):
+        if __package__ in (None, ""):
+            from ifetch import plan_cli  # type: ignore
+        else:
+            from . import plan_cli  # type: ignore
+        entry = plan_cli.main if argv[0] == 'plan' else plan_cli.audit_main
+        return sys.exit(entry(argv[1:]))
+
     parser = argparse.ArgumentParser(
         description=(
             'Sync files/folders from iCloud Drive locally with resume, diff, '
