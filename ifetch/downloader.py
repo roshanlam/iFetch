@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import shutil
 import json
@@ -22,6 +23,24 @@ from .tracker import DownloadTracker
 from .utils import can_read_file
 from .plugin import PluginManager
 from .versioning import VersionManager
+from .auth import (
+    DEFAULT_WARN_DAYS,
+    TwoFactorResolver,
+    TwoFactorUnavailable,
+    classify_auth_error,
+    evaluate_expiry,
+    read_session_snapshot,
+    region_service_kwargs,
+    render_expiry_warning,
+    resolve_region,
+)
+from .manifest import Manifest
+from .packages import (
+    PackageExpansionError,
+    expand_package,
+    is_package_name,
+    should_expand,
+)
 
 
 def remote_metadata(item: Any) -> Tuple[Optional[int], Optional[str]]:
@@ -91,6 +110,12 @@ class SyncState:
 
     STATE_FILENAME = ".ifetch_state.json"
     FLUSH_INTERVAL = 200
+
+    #: Status recorded for an expanded Apple package bundle.  It is a separate
+    #: value from ``"completed"`` because the evidence that proves a package is
+    #: unchanged is different in kind: there is no single local file whose size
+    #: can be compared against the remote size.
+    STATUS_PACKAGE = "completed_package"
 
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
@@ -183,7 +208,13 @@ class SyncState:
             entry = self._data.get(self.key_for(local_path))
             entry = dict(entry) if isinstance(entry, dict) else None
 
-        if not entry or entry.get("status") != "completed":
+        if not entry:
+            return False
+
+        if entry.get("status") == self.STATUS_PACKAGE:
+            return self._package_unchanged(entry, local_path, remote_size, remote_token)
+
+        if entry.get("status") != "completed":
             return False
         if entry.get("remote_size") != remote_size:
             return False
@@ -241,6 +272,78 @@ class SyncState:
             self._dirty += 1
         self._maybe_flush()
 
+    def _package_unchanged(
+        self,
+        entry: Dict[str, Any],
+        local_path: Path,
+        remote_size: Optional[int],
+        remote_token: Optional[str],
+    ) -> bool:
+        """Decide whether an expanded package bundle can be skipped.
+
+        A package cannot be checked the way a file is: Apple reports a logical
+        size that never equals what lands on disk, so ``remote_size == local
+        size`` is meaningless here.  Instead we require that Apple's own
+        metadata is byte-identical to what it was when we expanded the bundle
+        *and* that the local directory still has exactly the file count and
+        total byte count we recorded at that moment.  A bundle that lost or
+        gained a member, or had one truncated, fails and is re-downloaded.
+        """
+        if entry.get("remote_size") != remote_size:
+            return False
+        if entry.get("remote_modified") != remote_token:
+            return False
+
+        recorded_count = entry.get("local_file_count")
+        recorded_bytes = entry.get("local_total_bytes")
+        if not isinstance(recorded_count, int) or not isinstance(recorded_bytes, int):
+            return False
+
+        if not local_path.is_dir():
+            return False
+
+        from .packages import directory_fingerprint
+
+        try:
+            count, total = directory_fingerprint(local_path)
+        except OSError:
+            return False
+        return count == recorded_count and total == recorded_bytes
+
+    def record_completed_package(
+        self,
+        local_path: Path,
+        remote_size: Optional[int],
+        remote_token: Optional[str],
+    ) -> None:
+        """Record an expanded package directory so the next run can skip it."""
+        if remote_size is None or not remote_token:
+            self.invalidate(local_path)
+            return
+        if not local_path.is_dir():
+            self.invalidate(local_path)
+            return
+
+        from .packages import directory_fingerprint
+
+        try:
+            count, total = directory_fingerprint(local_path)
+        except OSError:
+            self.invalidate(local_path)
+            return
+
+        with self._lock:
+            self._data[self.key_for(local_path)] = {
+                "remote_size": remote_size,
+                "remote_modified": remote_token,
+                "local_file_count": count,
+                "local_total_bytes": total,
+                "status": self.STATUS_PACKAGE,
+                "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            self._dirty += 1
+        self._maybe_flush()
+
     def invalidate(self, local_path: Path) -> None:
         """Forget any entry for this path (failed/partial/unknown download)."""
         key = self.key_for(local_path)
@@ -262,6 +365,10 @@ class DownloadManager:
         exclude_patterns: Optional[List[str]] = None,
         fast_scan: bool = True,
         force: bool = False,
+        region: Optional[str] = None,
+        expand_packages: bool = True,
+        manifest_key: Optional[bytes] = None,
+        warn_days: int = DEFAULT_WARN_DAYS,
     ):
         self.email = email or os.environ.get('ICLOUD_EMAIL')
         if not self.email:
@@ -297,25 +404,73 @@ class DownloadManager:
         # Load plugins once during instantiation
         self.plugin_manager = PluginManager()
 
+        # Region decides whether every Apple endpoint is icloud.com or
+        # icloud.com.cn.  Resolved once here so a bad value fails at
+        # construction rather than mid-download.
+        self.region = resolve_region(region)
+
+        # Apple serves package bundles (.key/.pages/.numbers/...) as ZIP
+        # archives of a directory.  Expanding them is the default because the
+        # alternative is writing a ZIP to a path that claims to be a document.
+        self.expand_packages = expand_packages
+
+        self.manifest_key = manifest_key
+        self.warn_days = warn_days
+
         # Will be set when download() is invoked
         self.root_path: Optional[Path] = None
         self.version_manager: Optional[VersionManager] = None
+        self.manifest: Optional[Manifest] = None
 
-    def authenticate(self) -> None:
-        """Handle iCloud authentication including 2FA/2SA if needed."""
+    def check_session_expiry(self) -> Optional[str]:
+        """Warn about an imminent trust-token expiry *before* running.
+
+        Apple's trust token lasts about 30 days.  Discovering that at the moment
+        a scheduled backup fails is too late; reading the stored cookie's real
+        expiry off disk costs nothing and lets the run say so while there is
+        still time to renew.  Returns the warning text (also logged), or
+        ``None`` when the session is healthy.
+        """
+        try:
+            snapshot = read_session_snapshot(self.email or "")
+            verdict = evaluate_expiry(snapshot, warn_days=self.warn_days)
+        except Exception:
+            return None  # Diagnostics must never block a download.
+
+        warning = render_expiry_warning(verdict, self.email or "")
+        if warning:
+            self.logger.warning(json.dumps({
+                "event": "session_expiry_warning",
+                "account": self.email,
+                **verdict.to_dict(),
+            }))
+        return warning
+
+    def authenticate(self, two_factor: Optional[TwoFactorResolver] = None) -> None:
+        """Authenticate, answering 2FA non-interactively when possible.
+
+        ``two_factor`` supplies a code from an argument, environment variable,
+        watched file or webhook so this works with no terminal attached.  When
+        it is absent, or yields nothing, we fall back to prompting - but only if
+        stdin is actually a TTY, because prompting a daemon just hangs it
+        forever instead of failing.
+        """
         if not self.email:
             raise ValueError("Email is required for authentication")
 
+        warning = self.check_session_expiry()
+        if warning:
+            print(warning)
+
         try:
             params: Dict[str, Any] = {"apple_id": self.email.strip(), "password": None}
-            if os.environ.get('ICLOUD_CHINA', '').lower() == 'true':
-                params["china_mainland"] = True
+            params.update(region_service_kwargs(self.region))
 
             self.api = PyiCloudService(**params)
 
             if self.api.requires_2fa:
                 print("\nTwo-factor authentication required.")
-                code = input("Enter the verification code: ")
+                code = self._obtain_2fa_code(two_factor)
                 if not self.api.validate_2fa_code(code):
                     raise Exception("Failed to verify 2FA code")
                 if not self.api.is_trusted_session:
@@ -332,26 +487,87 @@ class DownloadManager:
                     name = device.get('deviceName') or 'SMS to ' + device.get('phoneNumber', 'unknown')
                     print(f"{i}: {name}")
 
-                idx = int(input("\nChoose a device: "))
+                # Device choice is only asked interactively; headless runs take
+                # the first trusted device rather than blocking on a prompt.
+                if self._can_prompt():
+                    idx = int(input("\nChoose a device: "))
+                else:
+                    idx = 0
+                    print("No terminal attached; using the first trusted device.")
                 device = devices[idx]
                 if not self.api.send_verification_code(device):
                     raise Exception("Failed to send verification code")
-                code = input("Enter the verification code: ")
+                code = self._obtain_2fa_code(two_factor)
                 if not self.api.validate_verification_code(device, code):
                     raise Exception("Failed to verify code")
 
-        except PyiCloudFailedLoginException:
-            raise Exception("Invalid credentials")
-        except PyiCloudNoStoredPasswordAvailableException:
+        except PyiCloudFailedLoginException as e:
+            raise Exception(self._explain(e, "Invalid credentials")) from e
+        except PyiCloudNoStoredPasswordAvailableException as e:
             raise Exception(
                 "No stored password found. Run 'icloud auth login --username you@example.com' "
-                "(requires: pip install \"pyicloud[cli]\") to store it in the system keyring."
-            )
+                "(requires: pip install \"ifetch[auth]\") to store it in the system keyring."
+            ) from e
+        except TwoFactorUnavailable:
+            raise
         except Exception as e:
-            raise Exception(f"Authentication failed: {e}")
+            raise Exception(self._explain(e, f"Authentication failed: {e}")) from e
 
         # Notify plugins that authentication completed successfully
         self.plugin_manager.dispatch("on_authenticated", downloader=self)
+
+    @staticmethod
+    def _can_prompt() -> bool:
+        """True only when there is a real terminal to prompt on.
+
+        Under cron, Docker without ``-it``, or systemd, ``input()`` does not
+        prompt - it blocks or raises EOF. Checking first turns an indefinite
+        hang into an actionable error.
+        """
+        try:
+            return bool(sys.stdin) and sys.stdin.isatty()
+        except (AttributeError, ValueError, OSError):
+            return False
+
+    def _obtain_2fa_code(self, resolver: Optional[TwoFactorResolver]) -> str:
+        """Get a 2FA code from the configured sources, else prompt, else fail."""
+        if resolver is not None:
+            try:
+                code = resolver.resolve()
+                self.logger.info(json.dumps({
+                    "event": "two_factor_code_resolved",
+                    "sources": resolver.describe_sources(),
+                }))
+                return code
+            except TwoFactorUnavailable:
+                # Fall through to a prompt only if a human could answer it.
+                if not self._can_prompt():
+                    raise
+
+        if not self._can_prompt():
+            raise TwoFactorUnavailable(
+                "Apple requires a two-factor code but there is no terminal to "
+                "prompt on. Supply one with --2fa-code, $IFETCH_2FA_CODE, "
+                "--2fa-file or --2fa-webhook."
+            )
+        return input("Enter the verification code: ").strip()
+
+    def _explain(self, error: Exception, fallback: str) -> str:
+        """Attach a named cause and a remedy to an Apple authentication error.
+
+        Apple's own text ("HTTP 423 Missing PCS cookies from the request") names
+        no cause and suggests no action; this is where it becomes a sentence
+        someone can act on.
+        """
+        failure = classify_auth_error(error)
+        if failure.code == "unknown":
+            return fallback
+        self.logger.error(json.dumps({
+            "event": "authentication_failed",
+            "account": self.email,
+            **failure.to_dict(),
+        }))
+        return f"{failure.summary}\n  -> {failure.remedy}"
 
     def get_drive_item(self, path: str) -> Any:
         """Navigate to a specific path in iCloud Drive."""
@@ -707,20 +923,131 @@ class DownloadManager:
 
         return self.sync_state.is_unchanged(local_path, remote_size, remote_token)
 
-    def _record_sync_state(self, item: Any, local_path: Path) -> None:
-        """Persist the metadata that lets the next run fast-skip this file."""
+    def _record_sync_state(
+        self, item: Any, local_path: Path, expanded: bool = False
+    ) -> None:
+        """Persist the metadata that lets the next run fast-skip this item."""
         if self.sync_state is None:
             return
         remote_size, remote_token = remote_metadata(item)
         try:
-            self.sync_state.record_completed(local_path, remote_size, remote_token)
+            if expanded:
+                self.sync_state.record_completed_package(
+                    local_path, remote_size, remote_token
+                )
+            else:
+                self.sync_state.record_completed(local_path, remote_size, remote_token)
         except Exception:
             # State bookkeeping must never break a successful download.
             pass
 
     # ------------------------------------------------------------------
+    # Package bundles
+    # ------------------------------------------------------------------
+    def _finalize_payload(
+        self, item: Any, local_path: Path, temp_path: Path
+    ) -> Tuple[str, bool]:
+        """Move a completed temp file into place, expanding packages en route.
+
+        Returns ``(checksum, expanded)``.  When the payload is an Apple package
+        archive and expansion is enabled, ``local_path`` becomes a real
+        directory and the checksum covers the whole tree; otherwise the file is
+        renamed into place exactly as before.
+
+        An expansion failure is never allowed to lose the download: the raw
+        archive is written to ``local_path`` instead and the reason is logged,
+        so the user ends up with the same (imperfect) result other tools give
+        rather than nothing at all.
+        """
+        name = local_path.name
+
+        if not (self.expand_packages and should_expand(name, temp_path)):
+            checksum = self.calculate_checksum(temp_path)
+            temp_path.replace(local_path)
+            return checksum, False
+
+        try:
+            result = expand_package(temp_path, local_path)
+        except PackageExpansionError as exc:
+            self.logger.warning(json.dumps({
+                "event": "package_expansion_failed",
+                "file": name,
+                "path": str(local_path),
+                "error": str(exc),
+                "action": "stored_archive_verbatim",
+            }))
+            checksum = self.calculate_checksum(temp_path)
+            temp_path.replace(local_path)
+            return checksum, False
+
+        self._discard_temp(temp_path)
+        self.logger.info(json.dumps({
+            "event": "package_expanded",
+            "file": name,
+            **result.to_dict(),
+        }))
+        if result.skipped:
+            self.logger.warning(json.dumps({
+                "event": "package_entries_skipped",
+                "file": name,
+                "skipped": result.skipped,
+            }))
+
+        from .manifest import sha256_directory
+
+        return sha256_directory(local_path), True
+
+    def _record_manifest(
+        self,
+        item: Any,
+        local_path: Path,
+        checksum: str,
+        expanded: bool,
+    ) -> None:
+        """Record this download's digest in the signed manifest, if enabled."""
+        if self.manifest is None:
+            return
+        remote_size, remote_token = remote_metadata(item)
+        try:
+            if expanded:
+                self.manifest.record_package(
+                    local_path,
+                    remote_size=remote_size,
+                    remote_modified=remote_token,
+                )
+            else:
+                self.manifest.record_file(
+                    local_path,
+                    sha256=checksum or None,
+                    remote_size=remote_size,
+                    remote_modified=remote_token,
+                )
+        except Exception:
+            # The manifest is evidence, not a prerequisite; never fail a
+            # download because bookkeeping failed.
+            pass
+
+    # ------------------------------------------------------------------
     # Local-file invariant helpers
     # ------------------------------------------------------------------
+    def _local_target_exists(self, local_path: Path) -> bool:
+        """True when the thing a previous run wrote is still there.
+
+        For an ordinary file that means a regular file.  For an expanded package
+        it means a directory, and only when the sync state actually recorded it
+        as a package - otherwise a stray directory sitting where a file belongs
+        would be mistaken for a completed download.
+        """
+        if self._local_file_exists(local_path):
+            return True
+
+        if not (self.expand_packages and local_path.is_dir()):
+            return False
+        if self.sync_state is None:
+            return False
+        entry = self.sync_state._data.get(self.sync_state.key_for(local_path))
+        return isinstance(entry, dict) and entry.get("status") == SyncState.STATUS_PACKAGE
+
     @staticmethod
     def _local_file_exists(local_path: Path) -> bool:
         """True only when a *regular file* is really present at ``local_path``.
@@ -955,8 +1282,7 @@ class DownloadManager:
             except Exception:
                 pass  # Non-fatal; continue with the download
 
-        checksum = self.calculate_checksum(temp_path)
-        temp_path.replace(local_path)
+        checksum, expanded = self._finalize_payload(item, local_path, temp_path)
         tracker.cleanup()
 
         self.download_results.append(DownloadStatus(
@@ -967,7 +1293,8 @@ class DownloadManager:
             status="completed",
             changes=1,
         ))
-        self._record_sync_state(item, local_path)
+        self._record_sync_state(item, local_path, expanded=expanded)
+        self._record_manifest(item, local_path, checksum, expanded)
 
         if self.version_manager:
             rel_path2 = (
@@ -1007,7 +1334,7 @@ class DownloadManager:
         # The invariant guard is redundant with SyncState.is_unchanged (which
         # already stats the file) but stated explicitly here: a fast skip is
         # only ever allowed when the file demonstrably exists on disk.
-        if self._can_fast_skip(item, local_path) and self._local_file_exists(local_path):
+        if self._can_fast_skip(item, local_path) and self._local_target_exists(local_path):
             remote_size, _ = remote_metadata(item)
             self.logger.info(json.dumps({
                 "event": "file_skipped_fast_path",
@@ -1035,8 +1362,16 @@ class DownloadManager:
                 remote_length = self.chunker.remote_content_length(response)
                 total_size = remote_length if remote_length is not None else 0
                 temp_path = local_path.with_suffix(local_path.suffix + '.temp')
+
+                # A directory sitting at local_path is a previously expanded
+                # package that the fast path has already judged stale.  It
+                # cannot be diffed against or copied into a temp file, so this
+                # download is unconditionally a full one; the finished payload
+                # replaces the directory atomically in _finalize_payload.
+                stale_package_dir = local_path.is_dir()
+
                 changed_ranges = self.chunker.compute_download_ranges(
-                    response, local_path, force=self.force
+                    response, local_path, force=self.force or stale_package_dir
                 )
 
                 if changed_ranges is None:
@@ -1117,7 +1452,7 @@ class DownloadManager:
 
                 if temp_path.exists():
                     pass  # Reuse existing temp file for resumed download
-                elif local_path.exists():
+                elif local_path.exists() and not stale_package_dir:
                     shutil.copy2(local_path, temp_path)
                 else:
                     # Initialize the temp file with zeros
@@ -1153,8 +1488,9 @@ class DownloadManager:
 
                 # Only calculate checksum if temp_path exists and has content
                 if temp_path.exists() and temp_path.stat().st_size > 0:
-                    temp_checksum = self.calculate_checksum(temp_path)
-                    temp_path.replace(local_path)
+                    temp_checksum, expanded = self._finalize_payload(
+                        item, local_path, temp_path
+                    )
                 else:
                     self.logger.error(json.dumps({
                         "event": "invalid_temp_file",
@@ -1174,7 +1510,8 @@ class DownloadManager:
                     changes=len(changed_ranges)
                 ))
                 tracker.cleanup()
-                self._record_sync_state(item, local_path)
+                self._record_sync_state(item, local_path, expanded=expanded)
+                self._record_manifest(item, local_path, temp_checksum, expanded)
                 # Update version metadata with new checksum
                 if self.version_manager:
                     new_checksum = temp_checksum
@@ -1432,6 +1769,10 @@ class DownloadManager:
         # Sync state lives in the destination root; a missing or corrupt file
         # simply yields an empty state, i.e. first-run behaviour.
         self.sync_state = SyncState(local_path_obj)
+        # The manifest is loaded (not created fresh) so digests recorded by
+        # earlier runs survive a partial sync; entries are only ever replaced by
+        # a newer download of the same path.
+        self.manifest = Manifest.load(local_path_obj, key=self.manifest_key)
 
         item = self.get_drive_item(icloud_path)
 
@@ -1442,7 +1783,10 @@ class DownloadManager:
             "max_workers": self.max_workers,
             "chunk_size": self.chunker.chunk_size,
             "fast_scan": self.fast_scan,
-            "force": self.force
+            "force": self.force,
+            "region": self.region,
+            "expand_packages": self.expand_packages,
+            "manifest_signed": bool(self.manifest_key),
         }))
 
         remote_path = icloud_path.strip("/") or None
@@ -1451,6 +1795,13 @@ class DownloadManager:
         finally:
             # Persist whatever we learned even if the run was interrupted.
             self.sync_state.save()
+            try:
+                self.manifest.save()
+            except OSError as exc:
+                self.logger.warning(json.dumps({
+                    "event": "manifest_save_failed",
+                    "error": str(exc),
+                }))
 
         report = self.generate_summary_report()
         self.logger.info(json.dumps({"event": "download_completed", "summary": report}))

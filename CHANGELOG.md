@@ -13,6 +13,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ifetch auth` command tree** (`doctor`, `renew`, `status`), also installed as
+  `ifetch-auth`. `doctor` reports which authentication precondition failed and
+  what to do about it — Apple's `HTTP 423 Missing PCS cookies`, `400 Invalid
+  Session Token`, the `409`-on-a-valid-code case and the China redirect are each
+  translated into a named cause with a remedy. Exit codes are `0` healthy,
+  `1` needs attention soon, `2` broken now, so a scheduled job can distinguish
+  "renew eventually" from "act now".
+- **Non-interactive two-factor authentication.** A code can come from
+  `--2fa-code`, `$IFETCH_2FA_CODE`, a polled file (`--2fa-file`), a polled HTTP
+  endpoint (`--2fa-webhook`) or piped stdin. The file and webhook sources are
+  retried until `--2fa-timeout`. iFetch never reads a TTY when stdin is a
+  terminal it cannot prompt on, so a daemon fails with an actionable message
+  instead of hanging forever.
+- **Proactive session-expiry warnings.** The real expiry is read from the stored
+  web-auth cookie (falling back to the session file's mtime plus 30 days, always
+  labelled as an estimate). Every download run warns if the session expires
+  within `--warn-days` (default 7); `ifetch auth status` exposes the same as a
+  one-line, script-friendly report, and `ifetch auth renew --if-expiring-within
+  N` is a no-op on a healthy session.
+- **Apple package bundle expansion**, on by default. `.key`, `.pages`,
+  `.numbers`, `.band`, `.xcodeproj` and other Apple packages are directories that
+  Apple serves as ZIP archives whose byte count never matches the size reported
+  in the folder listing. iFetch now expands them into real directories,
+  preserving per-member modification times, and records them in the sync state
+  by file count and total size so re-runs still skip unchanged bundles.
+  `--no-expand-packages` restores the previous raw-archive behaviour. Expansion
+  requires *both* a known package extension and a payload that really is a ZIP,
+  so an ordinary `Archive.zip` is untouched.
+- **Signed integrity manifest** (`.ifetch_manifest.json`). Apple exposes no
+  content hashes, so iFetch records its own SHA-256 for every file at download
+  time. `ifetch-verify --offline` re-hashes a mirror and reports drift with no
+  credentials and no network, detecting corruption that preserves both size and
+  mtime. `--sign-key`/`--sign-key-file`/`$IFETCH_MANIFEST_KEY` add an
+  HMAC-SHA256 over the manifest's canonical form; `--require-signature` makes a
+  valid signature mandatory. Expanded bundles are verified as single units.
+- **`--region china`** (and `$ICLOUD_REGION`) for Apple IDs registered in China
+  Mainland, which are served by `iCloud.com.cn`. The legacy `ICLOUD_CHINA=true`
+  environment variable continues to work.
+- **Contract-test harness for cross-account shared folders**
+  (`tests/test_shared_folder_contract.py`), replaying recorded Apple responses
+  including the nested-subdirectory `HTTP 400`, plus
+  `docs/shared-folder-validation.md` — the manual procedure for validating the
+  path against a real share between two Apple IDs.
+
+
 - **Metadata fast path.** A sync-state file (`.ifetch_state.json`) is written in
   the destination root recording, per file, the remote size and remote modified
   timestamp plus the local size and mtime at completion. On later runs a file is
@@ -42,6 +87,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `DownloadManager.authenticate()` accepts an optional `two_factor` resolver.
+  The keyword is optional and the CLI falls back to the no-argument form, so
+  existing subclasses and plugins that override `authenticate()` keep working.
+- `ifetch-verify` no longer requires a remote path when `--offline` is given;
+  a single positional argument is then read as the local mirror directory.
+- Package downloads whose streamed byte count differs from the listed size are
+  reported as expanded bundles rather than as a size anomaly.
+
+
 - `FileChunker.find_changed_chunks` renamed to
   `FileChunker.compute_download_ranges`, and documented for what it actually
   does: size-based change detection plus prefix resume.
@@ -65,6 +119,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- ZIP members carrying permission bits but no file-type bits (as written by
+  Python's own `zipfile.writestr`) are no longer misclassified as non-regular
+  entries and skipped during package expansion.
+- An unrecognised failure during `ifetch auth renew` now shows the underlying
+  error text instead of being replaced by a generic "not recognised" message.
+
+
 - Removed the false claim in `docs/mirror.md` that hop 1 skips unchanged files
   "via stored checksums (`.ifetch_versions.json`)". That file is the version
   history; skip decisions are made from the sync state and file sizes.
@@ -74,6 +135,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer exists). Updated the README, docs, and iFetch's own
   "No stored password found" error message; added troubleshooting entries
   for the macOS `SSLCertVerificationError` and 2FA-request failures.
+
+### Security
+
+- Package archives are treated as untrusted input: member paths that are
+  absolute, contain `..` (in either separator style), or resolve outside the
+  destination are refused, as are symlink and device entries. Extraction is
+  bounded by entry-count and total-size limits, and the expanded directory is
+  swapped into place atomically so a failure leaves the previous bundle intact.
 
 ## [1.0.0] - 2026-07-20
 

@@ -624,7 +624,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "icloud_path",
-        help='Remote iCloud Drive path to verify (e.g., "Documents/MyFolder")',
+        nargs="?",
+        help=(
+            'Remote iCloud Drive path to verify (e.g., "Documents/MyFolder"). '
+            "Not needed with --offline."
+        ),
     )
     parser.add_argument(
         "local_path",
@@ -662,7 +666,124 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress progress output; only errors and the exit code are reported",
     )
+
+    offline = parser.add_argument_group(
+        "offline integrity audit",
+        "Re-hash the mirror against the digests iFetch recorded at download "
+        "time. Needs no credentials, no network and no iCloud account, which is "
+        "what makes it usable years later to prove a backup has not rotted.",
+    )
+    offline.add_argument(
+        "--offline",
+        action="store_true",
+        help="Audit against .ifetch_manifest.json instead of contacting Apple",
+    )
+    offline.add_argument(
+        "--sign-key",
+        dest="sign_key",
+        help="HMAC key the manifest was signed with (or set $IFETCH_MANIFEST_KEY)",
+    )
+    offline.add_argument(
+        "--sign-key-file",
+        dest="sign_key_file",
+        help="Read the manifest signing key from this file",
+    )
+    offline.add_argument(
+        "--require-signature",
+        action="store_true",
+        help=(
+            "Fail unless the manifest carries a signature that validates. Use "
+            "this when the manifest is meant to be evidence, not just a record."
+        ),
+    )
+    offline.add_argument(
+        "--show-ok",
+        action="store_true",
+        help="List every verified entry, not just the problems",
+    )
     return parser
+
+
+def run_offline_audit(args: argparse.Namespace) -> int:
+    """Audit a mirror against its recorded manifest. No network, no Apple.
+
+    Exit codes match the online verifier: 0 intact, 1 drift detected, 2
+    operational error.
+    """
+    from .manifest import (
+        Manifest,
+        ManifestKeyError,
+        MANIFEST_FILENAME,
+        load_signing_key,
+        render_audit,
+    )
+
+    # Offline mode has no remote side, so the natural invocation is
+    # `ifetch-verify --offline /path/to/mirror` - one positional, meaning the
+    # local directory. Argparse binds that to `icloud_path` because it comes
+    # first, so re-interpret it here rather than making users pass a remote path
+    # that would be ignored anyway.
+    local = args.local_path
+    if args.icloud_path and local == ".":
+        local = args.icloud_path
+
+    root = Path(local).expanduser().resolve()
+    if not (root / MANIFEST_FILENAME).exists():
+        print(
+            f"Error: no {MANIFEST_FILENAME} in {root}. An offline audit can only "
+            "check a mirror iFetch downloaded (the manifest is written during "
+            "download).",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        key = load_signing_key(
+            key=args.sign_key,
+            key_file=Path(args.sign_key_file).expanduser() if args.sign_key_file else None,
+        )
+    except ManifestKeyError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    manifest = Manifest.load(root, key=key)
+
+    quiet = bool(args.quiet)
+    if not quiet:
+        print("=" * 70)
+        print("iFetch Offline Integrity Audit (read-only, no network)")
+        print(f"Local Path: {root}")
+        print(f"Entries: {len(manifest)}")
+        print("=" * 70)
+
+    def progress(done: int, total: int, result: Any) -> None:
+        if not quiet:
+            print(f"[{done}/{total}] {result.status:<14} {result.path}")
+
+    audit = manifest.verify(progress=progress)
+
+    if args.report:
+        report_path = Path(args.report).expanduser()
+        if report_path.parent and str(report_path.parent):
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("w") as handle:
+            json.dump(audit.to_dict(), handle, indent=2)
+        if not quiet:
+            print(f"\nReport written to '{report_path}'")
+
+    if not quiet:
+        print()
+        print(render_audit(audit, show_ok=args.show_ok))
+
+    if args.require_signature and audit.signature_status != "valid":
+        print(
+            f"\nFAIL: --require-signature was given but the signature is "
+            f"'{audit.signature_status}'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0 if audit.ok else 1
 
 
 def _print_summary(summary: VerificationSummary) -> None:
@@ -691,6 +812,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.offline:
+        try:
+            return run_offline_audit(args)
+        except KeyboardInterrupt:
+            print("\nAudit cancelled by user.", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+
+    if not args.icloud_path:
+        parser.error("icloud_path is required unless --offline is given")
 
     quiet = bool(args.quiet)
 

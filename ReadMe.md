@@ -22,6 +22,12 @@ Apple gives you two ways to get your data out of iCloud Drive: drag files around
 | Mount / serve / crypt | No | **Yes** |
 | Maturity | Young, single-maintainer | Mature project, but this backend is [Tier 4 "Experimental"](https://rclone.org/tiers/) and excluded from rclone's CI |
 | Local version history + point-in-time restore | **Yes** (`ifetch-restore`) | No — deletes/overwrites go to iCloud Trash; no revision support |
+| Apple package bundles (`.key`, `.pages`, `.numbers`, `.xcodeproj`) | **Restored as usable directories** (`--expand-packages`, on by default) | Transfer fails as "corrupted — sizes differ" and the file is deleted; `--ignore-size` leaves a ZIP named `Deck.key` ([#8404](https://github.com/rclone/rclone/issues/8404), [#8176](https://github.com/rclone/rclone/issues/8176), open since early 2025) |
+| Offline integrity proof | **Yes** — signed `.ifetch_manifest.json` of SHA-256 digests; `ifetch-verify --offline` detects bit-rot years later with no credentials | No — Apple exposes no hashes, so verification is size-only |
+| Headless / cron / Docker 2FA | **Yes** — `--2fa-code`, `$IFETCH_2FA_CODE`, watched file, or webhook | Interactive config only ([#9120](https://github.com/rclone/rclone/issues/9120)) |
+| Proactive session-expiry warning | **Yes** — `ifetch auth status` exits non-zero *before* the ~30-day token dies | No — you find out when a run fails |
+| Authentication diagnostics | **Yes** — `ifetch auth doctor` names the cause and the fix | Raw Apple errors (`HTTP 423 Missing PCS cookies`) |
+| China Mainland (GCBD) accounts | **Yes** — `--region china` | Not supported; [#8257](https://github.com/rclone/rclone/issues/8257) open since Dec 2024 with two unmerged PRs |
 | Folders shared by another Apple ID | Best-effort (see caveats below) | Share root only; operations inside fail ([#9477](https://github.com/rclone/rclone/issues/9477), fix unmerged) |
 | Content hashes from Apple | None available (Apple exposes none) | None — so `--checksum` silently degrades to size-only |
 | Advanced Data Protection | **Untested, no ADP-specific code** | **Yes**, since v1.74.3 (June 2026) |
@@ -30,7 +36,7 @@ Apple gives you two ways to get your data out of iCloud Drive: drag files around
 Two honest caveats about the columns above:
 
 - **ADP: rclone is ahead of iFetch here.** rclone implements Apple's PCS-cookie flow so ADP-enabled accounts work with "Access iCloud Data on the Web" turned on. iFetch has *no ADP-specific code* — it may work under the same web-access setting via pyicloud, but that is unverified and untested. Do not pick iFetch for an ADP account on the strength of this README.
-- **Shared folders**: iFetch attempts cross-account shared files via `shareID` fallbacks, but that path is validated only against mocks, not a real cross-account share. Treat it as best-effort.
+- **Shared folders**: iFetch attempts cross-account shared files via `shareID` fallbacks. That path is now pinned by a [contract-test harness](tests/test_shared_folder_contract.py) replaying Apple's recorded responses — including the nested-subdirectory HTTP 400 that breaks other clients — but recorded responses only prove iFetch branches correctly on the payloads we believe Apple sends. It has still not been run against a real cross-account share. [`docs/shared-folder-validation.md`](docs/shared-folder-validation.md) is the 15-minute procedure to close that gap; until someone runs it, treat this as best-effort.
 
 For **photos**, use [icloudpd](https://github.com/icloud-photos-downloader/icloud_photos_downloader) — it is far more mature than iFetch's own brand-new `ifetch-photos`, which has not yet been validated against a live account.
 
@@ -62,6 +68,12 @@ pip install -e ".[gdrive]"
 ## Features
 
 - **Secure authentication** — password lives in your OS keyring (via pyicloud), full 2FA/2SA support, trusted sessions so you are not re-prompted every run
+- **Headless-friendly 2FA** — supply the code with `--2fa-code`, `$IFETCH_2FA_CODE`, a watched file or a webhook, so cron/Docker/NAS runs never hang on a prompt ([details](#authentication-that-survives-a-headless-box))
+- **Authentication diagnostics** — `ifetch auth doctor` says *which precondition failed* and how to fix it, instead of relaying `HTTP 423 Missing PCS cookies`
+- **Proactive expiry warnings** — Apple's trust token lasts ~30 days; `ifetch auth status` exits non-zero days *before* it dies rather than after a backup fails
+- **Apple package bundles restored** — `.key`/`.pages`/`.numbers`/`.xcodeproj` come back as usable directories instead of ZIP blobs ([details](#apple-package-bundles))
+- **Offline integrity proof** — a signed `.ifetch_manifest.json` of SHA-256 digests lets `ifetch-verify --offline` detect bit-rot years later with no credentials ([details](#proving-a-backup-is-still-intact))
+- **China Mainland support** — `--region china` for Apple IDs served by iCloud.com.cn
 - **Incremental sync** — unchanged files are skipped entirely and interrupted downloads resume from where they stopped (see [How re-runs decide what to download](#how-re-runs-decide-what-to-download) for exactly what "unchanged" means)
 - **Metadata fast path** — a re-run skips known-unchanged files with **zero network round-trips**, using the `.ifetch_state.json` sync-state file in the destination
 - **Integrity verification** — `ifetch-verify` re-checks a local mirror against iCloud without modifying a single file
@@ -178,8 +190,16 @@ ifetch <icloud_path> [local_path] [options]
 | `--list-shared` | List top-level items shared *with* you (no path needed) | off |
 | `--profile NAME` | Apply include/exclude patterns from a profile | no filter |
 | `--profile-file PATH` | Custom profile JSON path | `~/.ifetch_profiles.json` |
+| `--region {global,china}` | Which Apple endpoints to use; `china` switches everything to iCloud.com.cn | `$ICLOUD_REGION`, else `global` |
+| `--no-expand-packages` | Write Apple package bundles as the raw ZIP Apple serves instead of expanding them | expansion on |
+| `--sign-key KEY` / `--sign-key-file PATH` | HMAC key used to sign `.ifetch_manifest.json` | `$IFETCH_MANIFEST_KEY`, else unsigned |
+| `--2fa-code CODE` | Six-digit 2FA code, for headless runs | prompt if a TTY |
+| `--2fa-file PATH` | Poll a file until it contains a code | — |
+| `--2fa-webhook URL` | Poll a URL (GET) until the response contains a code | — |
+| `--2fa-timeout SECONDS` | How long to wait for a polled code | `300` |
+| `--warn-days N` | Warn before starting if the session expires within N days | `7` |
 
-Environment variables: `ICLOUD_EMAIL` (account email), `ICLOUD_CHINA=true` (use iCloud China mainland endpoints), `IFETCH_PLUGIN_PATH` (extra plugin directory).
+Environment variables: `ICLOUD_EMAIL` (account email), `ICLOUD_REGION=china` (or the legacy `ICLOUD_CHINA=true`), `IFETCH_2FA_CODE` (two-factor code), `IFETCH_MANIFEST_KEY` (manifest signing key), `IFETCH_PLUGIN_PATH` (extra plugin directory).
 
 Examples:
 
@@ -310,6 +330,190 @@ ifetch-mirror Documents /Volumes/nas/icloud-mirror \
 - `--watch` makes it a lightweight always-on daemon; alternatively schedule single runs with launchd/cron/systemd ([docs/scheduling.md](docs/scheduling.md)).
 
 The pipeline is **one-way** (iCloud is the source of truth). Two-way sync is deliberately not implemented — see the [Roadmap](#roadmap).
+
+## Authentication that survives a headless box
+
+Authentication is the single biggest source of pain with iCloud tooling, and
+almost all of it is one of three problems: an error that names no cause, a 2FA
+prompt with no terminal to answer it, or a token that expired without warning.
+
+### `ifetch auth doctor` — which precondition actually failed
+
+```sh
+ifetch auth doctor --email you@example.com            # local checks only
+ifetch auth doctor --email you@example.com --online   # also probe Apple
+ifetch auth doctor --email you@example.com --json     # machine-readable
+```
+
+It reports the region in use, whether a stored session exists and carries a
+trust token, exactly how many days remain before it expires, and — with
+`--online` — whether Apple accepts the session and whether iCloud Drive actually
+responds. Apple errors are translated rather than relayed:
+
+```
+[FAIL] drive_access
+       Apple refused the request for lack of PCS cookies. This account has
+       Advanced Data Protection enabled, or 'Access iCloud Data on the Web' is
+       turned off.
+       -> On an Apple device: Settings > [your name] > iCloud > 'Access iCloud
+          Data on the Web' must be ON. ...
+```
+
+Exit codes: `0` healthy, `1` needs attention soon, `2` broken now.
+
+### Two-factor codes without a terminal
+
+Under cron, Docker without `-it`, or systemd, `input()` does not prompt — it
+hangs. iFetch takes a code from whichever of these is configured, in order:
+
+```sh
+ifetch Documents ~/backup --2fa-code 123456              # explicit
+IFETCH_2FA_CODE=123456 ifetch Documents ~/backup         # environment
+ifetch Documents ~/backup --2fa-file /run/icloud-code    # a watched file
+ifetch Documents ~/backup --2fa-webhook https://…/code   # polled over HTTP
+echo 123456 | ifetch Documents ~/backup                  # piped stdin
+```
+
+The file and webhook sources are *polled* (`--2fa-timeout`, default 300s), so a
+code that arrives seconds after the run starts is still picked up — which is
+what makes a phone shortcut dropping a file onto a NAS share work. Any text
+containing exactly one six-digit run is accepted, so a whole SMS or a JSON body
+is fine. Two *different* candidate codes are refused rather than guessed,
+because a wrong guess burns a rate-limited attempt.
+
+If no code can be obtained and there is no TTY to ask, the run fails with a
+message naming the options — it never blocks forever.
+
+### Renew before it breaks, not after
+
+Apple's trust token lasts about 30 days. iFetch reads the real expiry from the
+stored cookie, so it can warn while there is still time:
+
+```sh
+ifetch auth status --email you@example.com
+# you@example.com [global]: Session expires in 4.0 days (read from the stored
+# session cookie). Renew it now so the next scheduled run does not fail.
+```
+
+`status` exits `0`/`1`/`2` for ok/expiring/expired, which makes the cron shape
+straightforward:
+
+```sh
+# Renew only when actually needed; a healthy session is left alone.
+ifetch auth renew --email you@example.com --if-expiring-within 7 \
+    --2fa-file /run/icloud-code
+```
+
+After `Invalid Session Token`, discard the stale state and sign in cleanly:
+
+```sh
+ifetch auth renew --email you@example.com --reset
+```
+
+Every download run also performs this check before starting and prints a warning
+if the session is within `--warn-days` (default 7) of expiry.
+
+## Apple package bundles
+
+On iCloud Drive, `Report.pages`, `Deck.key`, `Budget.numbers`, `Track.band` and
+`App.xcodeproj` are **directories**, not files. Apple reports their logical size
+in the folder listing but serves their contents as a ZIP through a separate
+package token, and the two numbers never agree.
+
+Tools that trust the listed size conclude the transfer was corrupted and delete
+the file. Tools that disable the size check write the ZIP verbatim to
+`Deck.key` — a path that looks right and opens wrong.
+
+iFetch expands the archive into a real directory, preserving each member's
+modification time:
+
+```
+Deck.key/
+├── Index.zip
+├── Data/image-1.jpg
+└── Metadata/Properties.plist
+```
+
+On macOS that is a working Keynote file again; elsewhere it is an ordinary
+directory you can inspect. Re-runs still skip it: the sync state records the
+bundle's file count and total size, so an unchanged bundle costs no network, and
+a bundle that lost or gained a member is re-downloaded.
+
+This is on by default. `--no-expand-packages` restores the raw-archive
+behaviour. Expansion only happens when the name is a known Apple package
+extension **and** the payload really is a ZIP, so your own `Archive.zip` stays a
+file. Archives are treated as hostile input: path traversal, absolute paths and
+symlink entries are refused, and the destination is swapped in atomically, so a
+failure leaves the previous bundle intact rather than a half-written one.
+
+If an archive cannot be expanded, iFetch stores it verbatim and logs why — the
+download is never lost.
+
+## Proving a backup is still intact
+
+Apple exposes **no content hashes** for iCloud Drive. No MD5, no SHA-1, no ETag
+that digests the bytes. Every iCloud sync tool is therefore comparing sizes and
+timestamps and calling it verification — which cannot answer the question that
+matters to someone keeping a backup for years:
+
+> Are the bytes on my disk today still the bytes I downloaded?
+
+Silent corruption, a failing drive, a bad cable, a botched rsync to a NAS: all
+preserve size, and most preserve mtime.
+
+So iFetch records its own. Every download writes `.ifetch_manifest.json` in the
+destination root holding the SHA-256 each file had at the moment it was written.
+Re-hashing the tree later and comparing detects drift **offline** — no
+credentials, no network, no Apple:
+
+```sh
+ifetch-verify --offline ~/icloud-backup
+```
+
+```
+[modified] Deck.key
+    bundle contents changed since download
+    expected 0791e7171dc7bbd67aa0a596be6470692601ccba44cfbbb7d97a97a1ab7528b1
+    actual   0de06ce8dbd74df267735b86cbde89ff80e828b95a203f8c75d8c54a3958d7bb
+```
+
+That example is a single flipped byte with size **and** mtime preserved — the
+case no size-based check can see.
+
+### Signing
+
+A record is only evidence if it could not have been quietly edited alongside the
+data it describes. Supply a key and the manifest carries an HMAC-SHA256 over its
+canonical contents:
+
+```sh
+ifetch Documents ~/backup --sign-key-file ~/.ifetch-key
+ifetch-verify --offline ~/backup --sign-key-file ~/.ifetch-key --require-signature
+```
+
+A manifest rewritten to match tampered data fails signature validation even
+though every file matches it. Signing is optional — an unsigned manifest still
+detects bit-rot, it just cannot vouch for itself — and `--require-signature` is
+what turns "should be signed" into a hard requirement.
+
+Expanded package bundles are verified as single units: one digest covers the
+whole tree, and a change to any member fails it.
+
+## China Mainland accounts
+
+Apple IDs registered in China Mainland are served by entirely different
+endpoints (`iCloud.com.cn`). Requests to the global endpoints return a 302 with
+`{"domainToUse":"iCloud.com.cn"}` and authentication never completes.
+
+```sh
+ifetch Documents ~/backup --region china
+# or: export ICLOUD_REGION=china
+```
+
+This switches `idmsa`, `www` and `setup` together. The legacy `ICLOUD_CHINA=true`
+environment variable still works. `ifetch auth doctor` reports which region is
+in use, and a 302 redirect to the `.cn` domain is diagnosed as a region problem
+with the flag to fix it.
 
 ## Profiles
 

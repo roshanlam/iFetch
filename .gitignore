@@ -9,3 +9,5 @@ build/
 .idea/
 .vscode/
 .coverage
+# Vendored upstream checkout used for research only
+/learn/

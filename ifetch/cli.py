@@ -17,9 +17,25 @@ else:
     from .downloader import DownloadManager  # type: ignore
 
 
-def main():
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # `ifetch auth ...` is a distinct command tree rather than a flag soup on
+    # the download parser.  Dispatching before argparse runs keeps the two from
+    # having to share options that mean different things.
+    if argv and argv[0] == 'auth':
+        if __package__ in (None, ""):
+            from ifetch.auth_cli import main as auth_main  # type: ignore
+        else:
+            from .auth_cli import main as auth_main  # type: ignore
+        return sys.exit(auth_main(argv[1:]))
+
     parser = argparse.ArgumentParser(
-        description='Sync files/folders from iCloud Drive locally with resume, diff, and parallel downloads.'
+        description=(
+            'Sync files/folders from iCloud Drive locally with resume, diff, '
+            'and parallel downloads. Run "ifetch auth doctor" to diagnose '
+            'authentication problems.'
+        )
     )
     parser.add_argument(
         'icloud_path',
@@ -102,7 +118,74 @@ def main():
         help='Custom path to a profile JSON file (overrides default ~/.ifetch_profiles.json)'
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        '--region',
+        choices=['global', 'china'],
+        default=None,
+        help=(
+            'iCloud region. "china" switches every Apple endpoint to '
+            'iCloud.com.cn, which China Mainland Apple IDs require. Defaults to '
+            '$ICLOUD_REGION, then the legacy ICLOUD_CHINA=true, then "global".'
+        )
+    )
+
+    parser.add_argument(
+        '--no-expand-packages',
+        dest='expand_packages',
+        action='store_false',
+        default=True,
+        help=(
+            'Write Apple package bundles (.key/.pages/.numbers/.xcodeproj/...) '
+            'as the raw ZIP archive Apple serves, instead of expanding them '
+            'back into usable directories.'
+        )
+    )
+
+    manifest_group = parser.add_argument_group(
+        'integrity manifest',
+        'Apple publishes no content hashes, so iFetch records its own at '
+        'download time. ifetch-verify --offline replays them to detect bit-rot.'
+    )
+    manifest_group.add_argument(
+        '--sign-key',
+        dest='sign_key',
+        help='HMAC key used to sign the manifest (or set $IFETCH_MANIFEST_KEY)'
+    )
+    manifest_group.add_argument(
+        '--sign-key-file',
+        dest='sign_key_file',
+        help='Read the manifest signing key from this file'
+    )
+
+    twofa_group = parser.add_argument_group(
+        'non-interactive two-factor',
+        'Answer Apple\'s 2FA challenge without a terminal, for cron/Docker/NAS.'
+    )
+    twofa_group.add_argument('--2fa-code', dest='twofa_code', help='The six-digit code')
+    twofa_group.add_argument(
+        '--2fa-file', dest='twofa_file',
+        help='Poll this file until it contains a six-digit code'
+    )
+    twofa_group.add_argument(
+        '--2fa-webhook', dest='twofa_webhook',
+        help='Poll this URL (GET) until the response contains a six-digit code'
+    )
+    twofa_group.add_argument(
+        '--2fa-timeout', dest='twofa_timeout', type=float, default=300.0,
+        help='Seconds to wait for a polled code (default: 300)'
+    )
+
+    parser.add_argument(
+        '--warn-days',
+        type=int,
+        default=7,
+        help=(
+            'Warn before starting if the iCloud session expires within this '
+            'many days (default: 7). Apple trust tokens last about 30.'
+        )
+    )
+
+    args = parser.parse_args(argv)
 
     try:
         # Create a progress banner
@@ -124,6 +207,18 @@ def main():
             pm = ProfileManager(args.profile, config_path=cfg_path)  # type: ignore[arg-type]
         include_pats, exclude_pats = pm.get_patterns() if pm else ([], [])
 
+        if __package__ in (None, ""):
+            from ifetch.auth import TwoFactorResolver  # type: ignore
+            from ifetch.manifest import load_signing_key  # type: ignore
+        else:
+            from .auth import TwoFactorResolver  # type: ignore
+            from .manifest import load_signing_key  # type: ignore
+
+        manifest_key = load_signing_key(
+            key=args.sign_key,
+            key_file=Path(args.sign_key_file).expanduser() if args.sign_key_file else None,
+        )
+
         # Initialize the downloader
         downloader = DownloadManager(
             email=args.email,
@@ -133,12 +228,32 @@ def main():
             include_patterns=include_pats,
             exclude_patterns=exclude_pats,
             fast_scan=getattr(args, 'fast_scan', True),
-            force=getattr(args, 'force', False)
+            force=getattr(args, 'force', False),
+            region=args.region,
+            expand_packages=args.expand_packages,
+            manifest_key=manifest_key,
+            warn_days=args.warn_days,
         )
 
-        # Authenticate (will prompt for password if needed)
+        two_factor = TwoFactorResolver(
+            code=args.twofa_code,
+            file=Path(args.twofa_file).expanduser() if args.twofa_file else None,
+            webhook=args.twofa_webhook,
+            timeout=args.twofa_timeout,
+        )
+
+        # Authenticate (will prompt for password if needed).
+        # `authenticate` is a documented extension point that subclasses and
+        # plugins override, and `two_factor` is a newer keyword. Fall back to
+        # the no-argument form so an override written against the older
+        # signature keeps working instead of dying on an unexpected kwarg.
         print("Authenticating with iCloud...")
-        downloader.authenticate()
+        try:
+            downloader.authenticate(two_factor=two_factor)
+        except TypeError as exc:
+            if 'two_factor' not in str(exc):
+                raise
+            downloader.authenticate()
         print("Authentication successful!")
 
         # Perform the requested operation
