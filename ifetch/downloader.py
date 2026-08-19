@@ -35,6 +35,9 @@ from .auth import (
     resolve_region,
 )
 from .manifest import Manifest
+from . import sharing
+from .ratelimit import BandwidthLimiter, create_limiter
+from .transfers import TransferJournal
 from .naming import (
     NORMALIZE_PRESERVE,
     DirectorySanitizer,
@@ -377,6 +380,7 @@ class DownloadManager:
         portable_names: bool = False,
         normalize_names: str = NORMALIZE_PRESERVE,
         password: Optional[str] = None,
+        bwlimit: Optional[Union[str, BandwidthLimiter]] = None,
     ):
         self.email = email or os.environ.get('ICLOUD_EMAIL')
         if not self.email:
@@ -435,10 +439,24 @@ class DownloadManager:
         # None, pyicloud falls back to the system keyring as before.
         self._password = password
 
+        # Bandwidth ceiling for the whole worker pool. Parsed here so a bad
+        # --bwlimit fails at startup rather than at 3am, three hours in. The
+        # default allocates nothing at all: with no limit there is no limiter,
+        # no lock and no clock read on the byte path.
+        self.bwlimit = bwlimit if isinstance(bwlimit, str) else None
+        self.limiter: Optional[BandwidthLimiter] = create_limiter(bwlimit)
+        if self.limiter is not None and self.bwlimit is None:
+            self.bwlimit = self.limiter.schedule.source
+
         # Will be set when download() is invoked
         self.root_path: Optional[Path] = None
         self.version_manager: Optional[VersionManager] = None
         self.manifest: Optional[Manifest] = None
+        self.index: Optional[Any] = None
+        # A disabled journal until download() opens an index. Every call on it
+        # is a no-op, so download_drive_item needs no conditionals and a
+        # downloader driven directly (tests, plugins) behaves exactly as before.
+        self.journal = TransferJournal(None)
 
     def check_session_expiry(self) -> Optional[str]:
         """Warn about an imminent trust-token expiry *before* running.
@@ -647,7 +665,21 @@ class DownloadManager:
         case-folded one - fails on any name with an accent in it. Comparing
         through :func:`naming.fold` normalises both sides first, which is what
         stops ``Café`` reporting "Path not found".
+
+        Every resolved child also inherits its parent's share context here. This
+        is the single choke point every traversal passes through, which is why
+        it is the right place: Apple omits ``shareID`` from the items it returns
+        for a folder someone else shared with you, so without this step the
+        identifier is lost one level below the share root and every request
+        underneath goes out unscoped - a 400 on the next listing, a 404 on the
+        download. See :mod:`ifetch.sharing`.
         """
+        child = self._lookup_child(item, name)
+        sharing.inherit(item, child)
+        return child
+
+    def _lookup_child(self, item: Any, name: str) -> Any:
+        """Name resolution proper, with no share-context concerns."""
         try:
             return item[name]
         except (KeyError, TypeError, AttributeError):
@@ -718,7 +750,14 @@ class DownloadManager:
                 resp = self.http.get(url, headers=headers, stream=True, timeout=30)
                 resp.raise_for_status()  # Raise error for non-200/206 status codes
                 if resp.status_code in (200, 206):
-                    return resp.content
+                    payload = resp.content
+                    # Charged on what actually arrived, not on what was asked
+                    # for, and after the read rather than before it: a range is
+                    # fetched in one call, so the throttle can only put the
+                    # pause between chunks. That is the granularity of the
+                    # guarantee - an average across chunks, not within one.
+                    self._throttle(len(payload))
+                    return payload
             except requests.HTTPError as e:
                 last_error = e
                 status = e.response.status_code if e.response is not None else None
@@ -769,19 +808,72 @@ class DownloadManager:
         docwsid = data.get('docwsid')
         drivewsid = data.get('drivewsid')
         zone = data.get('zone', 'com.apple.CloudDocs')
-        share_id = data.get('shareID')
+
+        # Read the identifier through ifetch.sharing rather than off this node's
+        # own payload. Apple puts shareID on the share root and omits it from
+        # every descendant, so `data.get('shareID')` is None for exactly the
+        # files this fallback exists to rescue; traversal seeds the inherited
+        # value so it is present here. See ifetch/sharing.py.
+        share_context = sharing.carried_context(item)
+        share_id = share_context.share_id if share_context else None
+
+        attempts: List[Dict[str, Any]] = []
+
+        def note(strategy: str, outcome: str, detail: str = "") -> None:
+            """Record what a strategy did.
+
+            Every strategy below used to fail into ``except Exception: pass``,
+            which meant a user reporting "still 404" gave us nothing to work
+            with: no way to know which strategies ran, which were skipped for
+            want of a precondition, or how each one failed. The same silence
+            also violates this codebase's rule that anything which could not be
+            examined is named rather than dropped.
+            """
+            entry = {"strategy": strategy, "outcome": outcome}
+            if detail:
+                entry["detail"] = detail
+            attempts.append(entry)
+
+        def give_up() -> None:
+            payload: Dict[str, Any] = {
+                "event": "shared_open_exhausted",
+                "docwsid": docwsid,
+                "zone": zone,
+                "share_id_present": share_id is not None,
+                "attempts": attempts,
+            }
+            if share_context is not None:
+                payload["share_evidence"] = share_context.describe()
+            if share_id is None:
+                payload["likely_cause"] = (
+                    "No shareID reached this item. If it lives inside a folder "
+                    "shared by another Apple ID, the identifier should have been "
+                    "inherited during traversal; that it was not means either the "
+                    "share root was never walked or Apple returned no shareID on it."
+                )
+            self.logger.warning(json.dumps(payload))
 
         if not self.api or not hasattr(self.api, 'drive'):
+            note("preconditions", "skipped", "no authenticated drive service")
+            give_up()
             return None
 
         drive = self.api.drive
 
         # Strategy 1: replay the download/by_id request with shareID in params.
         # This is the missing piece in pyicloud v2.5 — get_file() never sends it.
-        if (share_id and docwsid
-                and hasattr(drive, 'params')
-                and hasattr(drive, '_document_root')
-                and hasattr(drive, 'session')):
+        missing = [
+            label for label, present in (
+                ("shareID", bool(share_id)),
+                ("docwsid", bool(docwsid)),
+                ("drive.params", hasattr(drive, 'params')),
+                ("drive._document_root", hasattr(drive, '_document_root')),
+                ("drive.session", hasattr(drive, 'session')),
+            ) if not present
+        ]
+        if missing:
+            note("by_id_with_share", "skipped", f"missing: {', '.join(missing)}")
+        else:
             try:
                 file_params: Dict[str, Any] = dict(drive.params)
                 file_params.update({"document_id": docwsid, "shareID": share_id})
@@ -789,31 +881,39 @@ class DownloadManager:
                     drive._document_root + f"/ws/{zone}/download/by_id",
                     params=file_params,
                 )
-                if resp.ok:
+                if not getattr(resp, "ok", False):
+                    note("by_id_with_share", "rejected",
+                         f"HTTP {getattr(resp, 'status_code', 'unknown')}")
+                else:
                     resp_json = resp.json()
                     data_token = resp_json.get("data_token")
                     package_token = resp_json.get("package_token")
-                    if data_token and data_token.get("url"):
+                    token = data_token or package_token
+                    if token and token.get("url"):
                         return drive.session.get(
-                            data_token["url"], params=drive.params, stream=True
+                            token["url"], params=drive.params, stream=True
                         )
-                    if package_token and package_token.get("url"):
-                        return drive.session.get(
-                            package_token["url"], params=drive.params, stream=True
-                        )
-            except Exception:
-                pass
+                    note("by_id_with_share", "no_url",
+                         "response carried neither data_token.url nor package_token.url")
+            except Exception as exc:
+                note("by_id_with_share", "error", self._brief(exc))
 
         # Strategy 2: try drivewsid as document_id
-        if drivewsid and drivewsid != docwsid and hasattr(drive, 'get_file'):
+        if not (drivewsid and drivewsid != docwsid and hasattr(drive, 'get_file')):
+            note("drivewsid_as_document_id", "skipped",
+                 "no distinct drivewsid, or drive.get_file unavailable")
+        else:
             try:
                 return drive.get_file(drivewsid, zone=zone, stream=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                note("drivewsid_as_document_id", "error", self._brief(exc))
 
         # Strategy 3: refresh node metadata (passing shareID if available);
         # Apple may embed a direct download URL in the response.
-        if drivewsid and hasattr(drive, 'get_node_data'):
+        if not (drivewsid and hasattr(drive, 'get_node_data')):
+            note("refresh_node_metadata", "skipped",
+                 "no drivewsid, or drive.get_node_data unavailable")
+        else:
             try:
                 import inspect
                 gnd_sig = inspect.signature(drive.get_node_data)
@@ -825,10 +925,23 @@ class DownloadManager:
                     url = fresh.get(key)
                     if url:
                         return self.http.get(url, stream=True, timeout=30)
-            except Exception:
-                pass
+                note("refresh_node_metadata", "no_url",
+                     "response carried no downloadURL/url/contentURL")
+            except Exception as exc:
+                note("refresh_node_metadata", "error", self._brief(exc))
 
+        give_up()
         return None
+
+    @staticmethod
+    def _brief(exc: Exception) -> str:
+        """A one-line rendering of an exception for a diagnostic record.
+
+        Truncated because Apple's error bodies are multi-line JSON and the point
+        of the record is that a whole run's worth of them stays readable.
+        """
+        text = f"{type(exc).__name__}: {exc}".replace("\n", " ")
+        return text[:200]
 
     def _open_with_retry(
         self,
@@ -949,6 +1062,55 @@ class DownloadManager:
             return False
 
         return self.sync_state.is_unchanged(local_path, remote_size, remote_token)
+
+    # ------------------------------------------------------------------
+    # Transfer journal
+    # ------------------------------------------------------------------
+    def _open_journal(self, root: Path) -> None:
+        """Attach a durable transfer journal for this destination.
+
+        Failing to open the index is logged and otherwise ignored. The journal
+        buys resumability; it is not a precondition for downloading, and a
+        read-only or full destination should still be able to try.
+        """
+        try:
+            from .index import open_index
+
+            self.index = open_index(root)
+            self.journal = TransferJournal(self.index, root)
+        except Exception as exc:
+            self.index = None
+            self.journal = TransferJournal(None)
+            self.logger.warning(json.dumps({
+                "event": "transfer_journal_unavailable",
+                "path": str(root),
+                "error": str(exc),
+                "consequence": "this run will not be resumable without a rescan",
+            }))
+
+    def _close_journal(self) -> None:
+        """Drop finished rows and close the index."""
+        try:
+            pruned = self.journal.prune_completed()
+            outstanding = len(self.journal.incomplete())
+            if outstanding:
+                self.logger.warning(json.dumps({
+                    "event": "transfers_outstanding",
+                    "count": outstanding,
+                    "hint": "run 'ifetch resume' to finish them without a rescan",
+                }))
+            else:
+                del pruned
+        except Exception:
+            pass
+        try:
+            if self.index is not None:
+                self.index.close()
+        except Exception:
+            pass
+        finally:
+            self.index = None
+            self.journal = TransferJournal(None)
 
     def _record_sync_state(
         self, item: Any, local_path: Path, expanded: bool = False
@@ -1131,11 +1293,41 @@ class DownloadManager:
             status="completed",
             changes=1,
         ))
+        self.journal.complete(local_path, 0)
         self._record_sync_state(item, local_path)
         self.plugin_manager.dispatch(
             "after_download", remote_item=item, local_path=local_path, success=True
         )
         return True
+
+    # ------------------------------------------------------------------
+    # Bandwidth limiting
+    # ------------------------------------------------------------------
+    def _throttle(self, nbytes: int) -> None:
+        """Charge ``nbytes`` against the shared bandwidth limit, if there is one.
+
+        Called from every path that actually consumes bytes, always with the
+        count that really arrived, so the limit applies to the run as a whole
+        rather than to each worker separately.
+
+        This is optional machinery and is treated as such: if the limiter ever
+        raises, the limit is dropped for the rest of the run and said so out
+        loud.  A download must not fail because throttling failed - but a limit
+        that stops being enforced must never do so quietly.
+        """
+        limiter = self.limiter
+        if limiter is None or nbytes <= 0:
+            return
+        try:
+            limiter.consume(nbytes)
+        except Exception as exc:
+            self.limiter = None
+            self.logger.warning(json.dumps({
+                "event": "bandwidth_limit_disabled",
+                "bwlimit": self.bwlimit,
+                "error": str(exc),
+                "consequence": "the rest of this run is not rate limited",
+            }))
 
     def _stream_body_to_temp(
         self,
@@ -1157,6 +1349,10 @@ class DownloadManager:
             for chunk in iter_content(chunk_size=self.chunker.chunk_size):
                 if not chunk:
                     continue
+                # Charged before the next block is pulled off the socket: the
+                # pause lands between reads, which is the only place this
+                # process can apply back-pressure at all.
+                self._throttle(len(chunk))
                 out_file.write(chunk)
                 written += len(chunk)
                 self.plugin_manager.dispatch(
@@ -1218,6 +1414,14 @@ class DownloadManager:
             "listed_size": remote_size,
             "resume": False,
         }))
+
+        # resume_from=0 is not a formality here: this mode genuinely cannot
+        # resume, so a journal row claiming partial progress would send a later
+        # run looking for a tail that can never be requested.
+        self.journal.begin(
+            local_path, total_bytes=remote_size, remote_path=remote_path,
+            resume_from=0,
+        )
 
         attempts = max(1, self.max_retries)
         written = 0
@@ -1283,6 +1487,7 @@ class DownloadManager:
                 status="failed",
                 error=error,
             ))
+            self.journal.fail(local_path, error)
             return False
 
         if remote_size and written != remote_size:
@@ -1320,6 +1525,7 @@ class DownloadManager:
             status="completed",
             changes=1,
         ))
+        self.journal.complete(local_path, written)
         self._record_sync_state(item, local_path, expanded=expanded)
         self._record_manifest(item, local_path, checksum, expanded)
 
@@ -1376,6 +1582,10 @@ class DownloadManager:
                 status="skipped",
                 changes=0,
             ))
+            # A skip is recorded as settled, not ignored. A file left 'active'
+            # or 'failed' by an earlier run and since verified fine must stop
+            # appearing in the work list, or every resume re-fetches it forever.
+            self.journal.complete(local_path, remote_size)
             return True
 
         tracker = DownloadTracker(local_path)
@@ -1464,6 +1674,7 @@ class DownloadManager:
                         status="skipped",
                         changes=0,
                     ))
+                    self.journal.complete(local_path, total_size)
                     return True
 
                 # From here on the local copy is known-stale (or absent).  Drop
@@ -1473,6 +1684,14 @@ class DownloadManager:
                     self.sync_state.invalidate(local_path)
 
                 bytes_to_download = sum(end - start + 1 for start, end in changed_ranges)
+
+                # Journalled *before* the first byte is requested: a process
+                # killed mid-transfer never reaches any later line, and an
+                # attempt that left no record is the one worth counting.
+                self.journal.begin(
+                    local_path, total_bytes=total_size, remote_path=remote_path,
+                    resume_from=tracker.current_position,
+                )
 
                 # Create parent directories if they don't exist
                 local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1502,6 +1721,9 @@ class DownloadManager:
                         out_file.seek(start)
                         out_file.write(chunk)
                         tracker.save_status(end + 1)
+                        # Same durable write point the tracker already uses, so
+                        # the journal costs no extra fsync boundary.
+                        self.journal.progress(local_path, end + 1)
 
                         # Streaming progress event (generic)
                         self.plugin_manager.dispatch(
@@ -1526,6 +1748,11 @@ class DownloadManager:
                     }))
                     if self.sync_state is not None:
                         self.sync_state.invalidate(local_path)
+                    self.journal.fail(
+                        local_path,
+                        "the temporary file was empty or missing after the transfer",
+                        bytes_done=tracker.current_position,
+                    )
                     return False
 
                 self.download_results.append(DownloadStatus(
@@ -1537,6 +1764,7 @@ class DownloadManager:
                     changes=len(changed_ranges)
                 ))
                 tracker.cleanup()
+                self.journal.complete(local_path, total_size)
                 self._record_sync_state(item, local_path, expanded=expanded)
                 self._record_manifest(item, local_path, temp_checksum, expanded)
                 # Update version metadata with new checksum
@@ -1566,6 +1794,12 @@ class DownloadManager:
         except Exception as e:
             if self.sync_state is not None:
                 self.sync_state.invalidate(local_path)
+            # Durable, unlike download_results: the summary report is only
+            # written if this run finishes, so a killed run would otherwise
+            # take every record of what failed with it.
+            self.journal.fail(
+                local_path, str(e), bytes_done=tracker.current_position,
+            )
             error_str = str(e)
             is_shared_file_error = any(x in error_str.lower() for x in [
                 'wsobjectnotfound', 'objectnotfoundexception',
@@ -1668,7 +1902,13 @@ class DownloadManager:
                                 "parent": str(local_path),
                             }))
                         child_remote_path = name if not remote_path else f"{remote_path.rstrip('/')}/{name}"
-                        child_items.append((item[name], local_path / local_name, child_remote_path))
+                        child = item[name]
+                        # The recursive descent resolves children directly rather
+                        # than through _resolve_child, so the share context has
+                        # to be carried here too. Missing it is what makes every
+                        # file inside a folder shared by another Apple ID 404.
+                        sharing.inherit(item, child)
+                        child_items.append((child, local_path / local_name, child_remote_path))
                     for collision in sanitizer.collisions:
                         self.logger.warning(json.dumps({
                             "event": "name_collision",
@@ -1821,6 +2061,10 @@ class DownloadManager:
         # earlier runs survive a partial sync; entries are only ever replaced by
         # a newer download of the same path.
         self.manifest = Manifest.load(local_path_obj, key=self.manifest_key)
+        # The transfer journal makes an interrupted run resumable without
+        # re-listing the drive. It is best-effort: a destination whose index
+        # cannot be opened downloads exactly as it always did.
+        self._open_journal(local_path_obj)
 
         item = self.get_drive_item(icloud_path)
 
@@ -1835,6 +2079,7 @@ class DownloadManager:
             "region": self.region,
             "expand_packages": self.expand_packages,
             "manifest_signed": bool(self.manifest_key),
+            "bwlimit": self.limiter.describe() if self.limiter else "unlimited",
         }))
 
         remote_path = icloud_path.strip("/") or None
@@ -1850,6 +2095,10 @@ class DownloadManager:
                     "event": "manifest_save_failed",
                     "error": str(exc),
                 }))
+            # Completed rows are dropped so the journal stays a work list
+            # rather than a history: what is left in it is what is still owed.
+            # Anything unfinished survives, which is the entire point.
+            self._close_journal()
 
         report = self.generate_summary_report()
         self.logger.info(json.dumps({"event": "download_completed", "summary": report}))

@@ -12,7 +12,16 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from .exporters.googledrive import DEFAULT_TOKEN_FILE, GoogleDriveExporter
+try:
+    from .exporters.googledrive import DEFAULT_TOKEN_FILE, GoogleDriveExporter
+except ImportError as exc:  # the Google libraries are an optional extra
+    # Without this, `ifetch-export --help` ends in a ModuleNotFoundError
+    # traceback naming a transitive dependency the user never asked for. The
+    # missing piece is an install extra, and saying so is the whole fix.
+    raise SystemExit(
+        f"ifetch-export needs the Google Drive libraries, which are an optional "
+        f"extra: pip install 'ifetch[gdrive]'\n(missing: {exc.name})"
+    ) from exc
 
 
 def get_default_folders() -> List[str]:

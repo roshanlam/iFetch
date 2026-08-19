@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import argparse
+from importlib import import_module
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -12,45 +13,44 @@ if __package__ in (None, ""):
     # Running as a standalone script: add project root to path and import absolute
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from ifetch.downloader import DownloadManager  # type: ignore
+    from ifetch.ratelimit import BandwidthLimitError, parse_bwlimit  # type: ignore
+    from ifetch.notify import add_notification_arguments, build_notifier  # type: ignore
 else:
     # Running as part of package (python -m ifetch.cli)
     from .downloader import DownloadManager  # type: ignore
+    from .ratelimit import BandwidthLimitError, parse_bwlimit  # type: ignore
+    from .notify import add_notification_arguments, build_notifier  # type: ignore
+
+
+#: ``ifetch <name>`` -> the module and function that implements it. Imported
+#: lazily so a plain download does not pay for parsers it will not use.
+SUBCOMMANDS = {
+    "auth": ("auth_cli", "main"),
+    "snapshot": ("snapshot_cli", "main"),
+    "repair": ("repair_cli", "main"),
+    "resume": ("repair_cli", "resume_main"),
+    "conflicts": ("conflict_cli", "main"),
+    "recover": ("recover_cli", "main"),
+    "plan": ("plan_cli", "main"),
+    "audit": ("plan_cli", "audit_main"),
+    "guard": ("guard_cli", "main"),
+    "vanish": ("vanish_cli", "main"),
+    "sharecheck": ("sharecheck_cli", "main"),
+    "uplink": ("uplink_cli", "main"),
+    "serve": ("serve_cli", "main"),
+}
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
 
-    # `ifetch auth ...` is a distinct command tree rather than a flag soup on
-    # the download parser.  Dispatching before argparse runs keeps the two from
-    # having to share options that mean different things.
-    if argv and argv[0] == 'auth':
-        if __package__ in (None, ""):
-            from ifetch.auth_cli import main as auth_main  # type: ignore
-        else:
-            from .auth_cli import main as auth_main  # type: ignore
-        return sys.exit(auth_main(argv[1:]))
-
-    if argv and argv[0] == 'snapshot':
-        if __package__ in (None, ""):
-            from ifetch.snapshot_cli import main as snap_main  # type: ignore
-        else:
-            from .snapshot_cli import main as snap_main  # type: ignore
-        return sys.exit(snap_main(argv[1:]))
-
-    if argv and argv[0] == 'recover':
-        if __package__ in (None, ""):
-            from ifetch.recover_cli import main as recover_main  # type: ignore
-        else:
-            from .recover_cli import main as recover_main  # type: ignore
-        return sys.exit(recover_main(argv[1:]))
-
-    if argv and argv[0] in ('plan', 'audit'):
-        if __package__ in (None, ""):
-            from ifetch import plan_cli  # type: ignore
-        else:
-            from . import plan_cli  # type: ignore
-        entry = plan_cli.main if argv[0] == 'plan' else plan_cli.audit_main
-        return sys.exit(entry(argv[1:]))
+    # Each of these is its own command tree rather than more flags on the
+    # download parser, and each is dispatched before argparse runs so the two
+    # never have to share an option that means different things in each.
+    if argv and argv[0] in SUBCOMMANDS:
+        module_name, entry_name = SUBCOMMANDS[argv[0]]
+        module = import_module(f"{__package__ or 'ifetch'}.{module_name}")
+        return sys.exit(getattr(module, entry_name)(argv[1:]))
 
     parser = argparse.ArgumentParser(
         description=(
@@ -245,7 +245,40 @@ def main(argv=None):
         )
     )
 
+    parser.add_argument(
+        '--bwlimit',
+        dest='bwlimit',
+        default=None,
+        metavar='RATE|TIMETABLE',
+        help=(
+            'Cap total download bandwidth, rclone-style. Either one rate '
+            '("512k", "10M") or a timetable ("08:00,512k 12:00,10M 13:00,off '
+            '18:00,30M 23:00,off"), optionally with weekday prefixes '
+            '("Mon-08:00,512k"). Units are binary and a bare number means '
+            'KiB/s, as in rclone; "off" or 0 is unlimited. The cap applies to '
+            'the whole run, not to each worker, and is re-read as the clock '
+            'crosses a boundary so a limit change takes effect without '
+            'restarting. Default: unlimited.'
+        )
+    )
+
+    add_notification_arguments(parser)
+
     args = parser.parse_args(argv)
+
+    # A notifier is always constructed; with nothing configured it is a no-op,
+    # so the call sites below need no conditionals and an unattended run that
+    # nobody is watching costs nothing.
+    notifier = build_notifier(args)
+
+    # Reject a malformed limit before the banner prints and before any network
+    # I/O, so an overnight job fails in the first second rather than at the
+    # first byte.
+    if args.bwlimit is not None:
+        try:
+            parse_bwlimit(args.bwlimit)
+        except BandwidthLimitError as exc:
+            parser.error(str(exc))
 
     try:
         # Create a progress banner
@@ -298,6 +331,7 @@ def main(argv=None):
             portable_names=args.portable_names,
             normalize_names=args.normalize_names,
             password=password,
+            bwlimit=args.bwlimit,
         )
 
         two_factor = TwoFactorResolver(
@@ -312,6 +346,10 @@ def main(argv=None):
         # plugins override, and `two_factor` is a newer keyword. Fall back to
         # the no-argument form so an override written against the older
         # signature keeps working instead of dying on an unexpected kwarg.
+        notifier.start(
+            icloud_path=args.icloud_path,
+            local_path=str(args.local_path),
+        )
         print("Authenticating with iCloud...")
         try:
             downloader.authenticate(two_factor=two_factor)
@@ -342,7 +380,12 @@ def main(argv=None):
             )
 
             # Show a summary after download completes
-            summary = downloader.generate_summary_report()["summary"]
+            full_report = downloader.generate_summary_report()
+            # Sends success, and separately an anomaly if the run finished but
+            # some files failed. Conflating those two is how people learn to
+            # ignore alerts.
+            notifier.run_finished(full_report)
+            summary = full_report["summary"]
             print("\nDownload Summary:")
             print(f"- Total files: {summary['total_files']}")
             print(f"- Successfully downloaded: {summary['successful']}")
@@ -356,6 +399,7 @@ def main(argv=None):
         print("\nOperation cancelled by user.", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
+        notifier.failure(e)
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 

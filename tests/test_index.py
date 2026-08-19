@@ -33,6 +33,7 @@ from ifetch.index import (  # noqa: E402
     KIND_DIR,
     KIND_FILE,
     KIND_PACKAGE,
+    SCHEMA_VERSION,
     TRANSFER_ACTIVE,
     TRANSFER_DONE,
     TRANSFER_FAILED,
@@ -60,7 +61,77 @@ class TestSchema:
             assert s.path.exists()
 
     def test_schema_version_is_recorded(self, store):
-        assert store.get_meta("schema_version") == "1"
+        assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
+
+    def test_an_older_index_gains_columns_added_since(self, tmp_path):
+        """A v1 index must keep working, not raise on the first query."""
+        root = tmp_path / "dest"
+        with IndexStore(root) as s:
+            # Rebuild the table in its v1 shape rather than DROP COLUMN, which
+            # needs SQLite 3.35+ and Python 3.10 can ship an older amalgamation.
+            s._conn.executescript(
+                "DROP TABLE transfers;"
+                "CREATE TABLE transfers ("
+                " path TEXT PRIMARY KEY, state TEXT NOT NULL,"
+                " bytes_done INTEGER DEFAULT 0, total_bytes INTEGER,"
+                " attempts INTEGER DEFAULT 0, last_error TEXT,"
+                " updated_at REAL NOT NULL);"
+            )
+            s.set_meta("schema_version", "1")
+            s.record_local(LocalItem("kept.txt", size=5, sha256="abc"))
+
+        with IndexStore(root) as s:
+            assert s.get_meta("schema_version") == str(SCHEMA_VERSION)
+            s.set_transfer("a.bin", TRANSFER_ACTIVE, remote_path="Docs/a.bin")
+            assert s.get_transfer("a.bin")["remote_path"] == "Docs/a.bin"
+            # Migration is additive: nothing recorded earlier is lost.
+            assert s.get_local("kept.txt")["sha256"] == "abc"
+
+    def test_a_v2_index_gains_the_scan_error_columns(self, tmp_path):
+        """v2 recorded no scan failures, so a v2 scan row has nowhere to put them."""
+        root = tmp_path / "dest"
+        with IndexStore(root) as s:
+            s._conn.executescript(
+                "DROP TABLE scans;"
+                "CREATE TABLE scans ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, icloud_path TEXT,"
+                " started_at REAL NOT NULL, finished_at REAL,"
+                " item_count INTEGER DEFAULT 0, total_bytes INTEGER DEFAULT 0);"
+            )
+            s._conn.execute(
+                "INSERT INTO scans(icloud_path, started_at, finished_at, item_count)"
+                " VALUES('Documents', 1.0, 2.0, 7)"
+            )
+            s.set_meta("schema_version", "2")
+            s.record_local(LocalItem("kept.txt", size=5, sha256="abc"))
+
+        with IndexStore(root) as s:
+            assert s.get_meta("schema_version") == str(SCHEMA_VERSION)
+            # The pre-existing scan survives and simply has no errors recorded.
+            assert s.latest_scan()["icloud_path"] == "Documents"
+            assert s.latest_scan()["error_count"] in (0, None)
+            assert s.get_local("kept.txt")["sha256"] == "abc"
+            # And the new column is usable straight away.
+            scan = s.begin_scan("Photos")
+            s.finish_scan(scan, errors=[{"path": "P", "error": "HTTP 500"}])
+            assert s.latest_scan()["error_count"] == 1
+
+    def test_a_v2_index_gains_the_observations_table(self, tmp_path):
+        root = tmp_path / "dest"
+        with IndexStore(root) as s:
+            s._conn.executescript("DROP TABLE vanished_observations;")
+            s.set_meta("schema_version", "2")
+            s.record_local(LocalItem("kept.txt", size=5, sha256="abc"))
+
+        with IndexStore(root) as s:
+            assert s.note_missing("gone.txt", 100.0) == 100.0
+            assert s.get_local("kept.txt")["sha256"] == "abc"
+
+    def test_migrating_twice_is_harmless(self, tmp_path):
+        root = tmp_path / "dest"
+        for _ in range(3):
+            with IndexStore(root) as s:
+                assert s.get_meta("schema_version") == str(SCHEMA_VERSION)
 
     def test_reopening_preserves_data(self, tmp_path):
         root = tmp_path / "dest"
@@ -164,6 +235,104 @@ class TestScans:
 
     def test_no_scans_yet(self, store):
         assert store.latest_scan() is None
+
+    def test_listing_failures_outlive_the_process_that_saw_them(self, store):
+        """Absent rows and deleted files are the same thing to a later reader."""
+        scan = store.begin_scan("Documents")
+        store.record_remote(RemoteItem("a", size=1), scan_id=scan)
+        result = store.finish_scan(scan, errors=[{"path": "P", "error": "HTTP 500"}])
+
+        assert result["error_count"] == 1
+        assert store.latest_scan()["error_count"] == 1
+        assert store.scan_errors(scan)[0]["error"] == "HTTP 500"
+
+    def test_a_scan_with_no_failures_records_none(self, store):
+        scan = store.begin_scan("Documents")
+        store.finish_scan(scan)
+        assert store.latest_scan()["error_count"] == 0
+        assert store.scan_errors(scan) == []
+
+    def test_only_a_sample_of_failures_is_stored(self, store):
+        """An offline drive must not grow the index without bound."""
+        scan = store.begin_scan("Documents")
+        store.finish_scan(scan, errors=[
+            {"path": f"p{i}", "error": "boom"} for i in range(200)
+        ])
+        assert store.latest_scan()["error_count"] == 200
+        assert len(store.scan_errors(scan)) == 50
+
+    def test_unfinished_scans_can_be_found_deliberately(self, store):
+        done = store.begin_scan("done")
+        store.finish_scan(done)
+        store.begin_scan("interrupted")
+
+        assert [s["icloud_path"] for s in store.unfinished_scans()] == ["interrupted"]
+        assert store.unfinished_scans(after=done) != []
+        assert store.unfinished_scans(after=10_000) == []
+
+
+class TestObservedAbsences:
+    def test_the_first_observation_is_the_one_kept(self, store):
+        """A run three weeks later must not restart the clock."""
+        assert store.note_missing("a.txt", 1_000.0) == 1_000.0
+        assert store.note_missing("a.txt", 9_000.0) == 1_000.0
+
+    def test_an_earlier_observation_tightens_the_record(self, store):
+        store.note_missing("a.txt", 9_000.0)
+        assert store.note_missing("a.txt", 1_000.0) == 1_000.0
+
+    def test_the_latest_observation_is_tracked_separately(self, store):
+        store.note_missing("a.txt", 1_000.0)
+        store.note_missing("a.txt", 9_000.0)
+        row = store.get_missing_observation("a.txt")
+        assert row["first_missing_at"] == 1_000.0
+        assert row["last_missing_at"] == 9_000.0
+
+    def test_metadata_is_preserved_when_a_later_run_has_none(self, store):
+        store.note_missing("a.txt", 1_000.0, size=42, sha256="abc")
+        store.note_missing("a.txt", 2_000.0)
+        row = store.get_missing_observation("a.txt")
+        assert row["size"] == 42 and row["sha256"] == "abc"
+
+    def test_batch_form_returns_every_first_observation(self, store):
+        firsts = store.note_missing_many(
+            [{"path": "a.txt"}, {"path": "b.txt"}], 1_000.0
+        )
+        assert firsts == {"a.txt": 1_000.0, "b.txt": 1_000.0}
+
+    def test_an_empty_batch_is_a_noop(self, store):
+        assert store.note_missing_many([], 1_000.0) == {}
+
+    def test_forgetting_removes_the_record(self, store):
+        store.note_missing("a.txt", 1_000.0)
+        assert store.forget_missing(["a.txt"]) == 1
+        assert store.get_missing_observation("a.txt") is None
+
+    def test_forgetting_nothing_is_harmless(self, store):
+        assert store.forget_missing([]) == 0
+
+    def test_iteration_is_ordered_by_path(self, store):
+        store.note_missing_many([{"path": p} for p in ("c", "a", "b")], 1.0)
+        assert [r["path"] for r in store.iter_missing_observations()] == ["a", "b", "c"]
+
+    def test_observations_survive_reopening(self, tmp_path):
+        root = tmp_path / "dest"
+        with IndexStore(root) as s:
+            s.note_missing("a.txt", 1_000.0)
+        with IndexStore(root) as s:
+            assert s.get_missing_observation("a.txt")["first_missing_at"] == 1_000.0
+
+    def test_snapshot_entries_are_readable_as_a_baseline(self, store):
+        store.record_local(LocalItem("a.txt", size=5, sha256="abc"))
+        store.create_snapshot("march")
+        rows = store.snapshot_entries("march")
+        assert [r["path"] for r in rows] == ["a.txt"]
+        assert rows[0]["sha256"] == "abc"
+
+    def test_an_unknown_snapshot_raises_with_its_name(self, store):
+        with pytest.raises(KeyError) as excinfo:
+            store.snapshot_entries("nope")
+        assert "nope" in str(excinfo.value)
 
 
 class TestDiff:

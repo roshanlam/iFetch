@@ -187,7 +187,11 @@ class RemoteScanner:
         finally:
             self._flush(scan_id)
             self.stats.duration_seconds = time.time() - started
-            self.store.finish_scan(scan_id)
+            # The listing failures go into the scan row, not just into the
+            # stats object that dies with this process. A folder that failed to
+            # list contributed no rows, and later readers cannot tell those
+            # missing rows from deleted files unless the failure was recorded.
+            self.store.finish_scan(scan_id, errors=self.stats.errors)
 
         self.logger.info(json.dumps({
             "event": "remote_scan_completed",
