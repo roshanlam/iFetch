@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from typing import Any, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Iterable, List, Optional, Sequence
 
 _UNITS = ("B", "KB", "MB", "GB", "TB", "PB")
 
@@ -162,3 +162,35 @@ def plural(count: int, singular: str, plural_form: Optional[str] = None) -> str:
     if count == 1:
         return singular
     return plural_form if plural_form is not None else singular + "s"
+
+
+def say_once() -> Callable[[str], bool]:
+    """Return a filter that lets each distinct sentence through only once.
+
+    Refusal notices assemble their text from overlapping sources - a headline
+    reason, a list of alternatives, a list of underlying problems - and the same
+    sentence often reaches all three. Printed three times it reads as padding
+    and buries the parts that actually differ, in a report whose entire job is
+    to be read carefully under stress.
+
+    Matching is on *containment*, not equality, because the headline is usually
+    built by appending an underlying reason to a lead-in: the repeat arrives as
+    a substring of what was already printed, and equality catches none of them.
+
+    Usage::
+
+        fresh = say_once()
+        if fresh(headline):
+            lines.append(headline)
+        lines.extend(f"  - {a}" for a in alternatives if fresh(a))
+    """
+    said: List[str] = []
+
+    def fresh(text: str) -> bool:
+        key = " ".join(str(text).split()).rstrip(".").casefold()
+        if not key or any(key in seen for seen in said):
+            return False
+        said.append(key)
+        return True
+
+    return fresh
