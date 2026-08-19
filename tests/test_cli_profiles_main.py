@@ -112,6 +112,63 @@ def test_cli_loads_profile_patterns(monkeypatch, tmp_path):
     assert captured["path"] == "Documents"
 
 
+def test_cli_passes_skip_existing_flag(monkeypatch, tmp_path):
+    captured = {}
+
+    class _FakeDM:
+        def __init__(self, *args, **kwargs):
+            captured["skip_existing"] = kwargs.get("skip_existing")
+
+        def authenticate(self):
+            pass
+
+        def download(self, *args, **kwargs):
+            captured["downloaded"] = True
+
+        def generate_summary_report(self):
+            return {"summary": {
+                "total_files": 0, "successful": 0, "skipped": 0, "failed": 0,
+                "total_bytes_transferred": 0, "total_changed_chunks": 0,
+            }}
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cli.py", "/", str(tmp_path), "--email", "user@example.com", "--skip-existing"],
+    )
+    monkeypatch.setattr(cli, "DownloadManager", _FakeDM)
+
+    cli.main()
+
+    assert captured["skip_existing"] is True
+    assert captured.get("downloaded") is True
+
+
+def test_cli_skip_existing_defaults_to_false(monkeypatch, tmp_path):
+    captured = {}
+
+    class _FakeDM:
+        def __init__(self, *args, **kwargs):
+            captured["skip_existing"] = kwargs.get("skip_existing")
+
+        def authenticate(self):
+            pass
+
+        def list_contents(self, path):
+            pass
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cli.py", "/", "--email", "user@example.com", "--list"],
+    )
+    monkeypatch.setattr(cli, "DownloadManager", _FakeDM)
+
+    cli.main()
+
+    assert captured["skip_existing"] is False
+
+
 def test_main_module_routes_to_cli(monkeypatch):
     fake_cli = types.ModuleType("ifetch.cli")
     fake_cli.main = lambda: 7

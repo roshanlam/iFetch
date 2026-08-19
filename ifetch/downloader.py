@@ -381,6 +381,7 @@ class DownloadManager:
         normalize_names: str = NORMALIZE_PRESERVE,
         password: Optional[str] = None,
         bwlimit: Optional[Union[str, BandwidthLimiter]] = None,
+        skip_existing: bool = False,
     ):
         self.email = email or os.environ.get('ICLOUD_EMAIL')
         if not self.email:
@@ -395,11 +396,24 @@ class DownloadManager:
         self.download_results: List[DownloadStatus] = []
         self._active_downloads: Set[str] = set()
         self._download_lock = threading.Lock()
+        # Single, globally-bounded traversal pool (created in download()).
+        # Concurrency is capped at max_workers for BOTH directory listing and
+        # file downloads, instead of spawning a fresh pool per directory (which
+        # multiplied concurrency with tree depth and triggered iCloud throttling
+        # + connection churn). Workers submit children to this same pool and
+        # never block waiting on them, so there is no pool-starvation deadlock.
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._pending = 0
+        self._pending_lock = threading.Lock()
+        self._traversal_done = threading.Event()
         self.chunker = FileChunker(chunk_size)
         self.http = requests.Session()
         adapter = HTTPAdapter(
             pool_connections=max(1, max_workers),
-            pool_maxsize=max(1, max_workers * 2),
+            pool_maxsize=max(1, max_workers),
+            pool_block=True,  # wait for a free pooled connection rather than
+                              # opening+discarding extras (prevents the TCP/TLS
+                              # connection churn that piled up CLOSE_WAITs)
         )
         self.http.mount("http://", adapter)
         self.http.mount("https://", adapter)
@@ -412,6 +426,10 @@ class DownloadManager:
         self.fast_scan = fast_scan
         self.force = force
         self.sync_state: Optional[SyncState] = None
+
+        # When True, any file that already exists on disk is left untouched
+        # instead of being differentially updated or overwritten.
+        self.skip_existing = skip_existing
 
         # Load plugins once during instantiation
         self.plugin_manager = PluginManager()
@@ -1563,6 +1581,24 @@ class DownloadManager:
             }))
             return False
 
+        # Skip-existing mode: if the file is already on disk, leave it exactly
+        # as-is. We return before opening the remote item so no network request
+        # is made and the local copy can never be overwritten.
+        if self.skip_existing and local_path.exists():
+            self.logger.info(json.dumps({
+                "event": "file_skipped",
+                "file": item.name,
+                "path": str(local_path),
+                "reason": "already exists on disk (skip-existing enabled)"
+            }))
+            self.download_results.append(DownloadStatus(
+                path=str(local_path),
+                size=local_path.stat().st_size,
+                downloaded=0,
+                status="skipped"
+            ))
+            return True
+
         # ---- Metadata fast path: no HTTPS stream is opened at all ----------
         # The invariant guard is redundant with SyncState.is_unchanged (which
         # already stats the file) but stated explicitly here: a fast skip is
@@ -1780,7 +1816,9 @@ class DownloadManager:
                                 "archived_path": str(local_path),
                                 "timestamp": time.strftime("%Y%m%dT%H%M%S"),
                             }]
-                    self.version_manager._save()
+                    # NOTE: do NOT _save() here. Rewriting the whole metadata file
+                    # after every file is O(n^2) and serializes all download threads
+                    # on the version lock. The metadata is flushed once in download().
 
                 # Notify plugins about successful download
                 self.plugin_manager.dispatch(
@@ -1836,13 +1874,57 @@ class DownloadManager:
 
         # Notify plugins about before/after failures handled above
 
+    def _submit(self, item: Any, local_path: Path, remote_path: Optional[str] = None) -> None:
+        """Enqueue one tree item for processing on the shared pool."""
+        self._submit_task(self.process_item_parallel, item, local_path, remote_path)
+
+    def _submit_task(self, fn: Any, *args: Any) -> None:
+        """Run fn(*args) on the shared pool with traversal-completion counting.
+
+        Counting is done on the future's done-callback (not inside the worker),
+        so it stays correct even if the worker is replaced/mocked. The counter
+        is incremented *before* submit; a directory worker submits all of its
+        children (each incrementing) before its own future completes, so the
+        counter never hits zero until the whole tree is drained.
+
+        If there is no active pool (e.g. called directly outside download(),
+        as in unit tests), fn runs inline.
+        """
+        if self._executor is None:
+            fn(*args)
+            return
+
+        with self._pending_lock:
+            self._pending += 1
+        try:
+            future = self._executor.submit(fn, *args)
+        except RuntimeError:
+            # Executor already shutting down; undo the increment.
+            self._on_item_done()
+            return
+        future.add_done_callback(self._on_item_done)
+
+    def _on_item_done(self, _future: Any = None) -> None:
+        """Mark one submitted item as finished; signal when the tree is drained."""
+        with self._pending_lock:
+            self._pending -= 1
+            if self._pending == 0:
+                self._traversal_done.set()
+
     def process_item_parallel(
         self,
         item: Any,
         local_path: Path,
         remote_path: Optional[str] = None,
     ) -> None:
-        """Process files and directories in parallel."""
+        """Process exactly ONE item (file or directory).
+
+        Files are downloaded inline (this worker occupies one of the pool's
+        max_workers slots). Directories list their children and submit each
+        child back onto the *same* shared pool via _submit, then return - they
+        never block waiting on their children, so total live concurrency stays
+        capped at max_workers regardless of tree depth.
+        """
         try:
             # If file/dir is excluded by patterns, skip
             rel_path = local_path.relative_to(self.root_path) if self.root_path else local_path
@@ -1862,11 +1944,20 @@ class DownloadManager:
                         "before_download", remote_item=item, local_path=local_path
                     )
                     if self.download_drive_item(item, local_path, remote_path=remote_path):
-                        self.logger.info(json.dumps({
-                            "event": "download_success",
-                            "file": getattr(item, 'name', 'unknown'),
-                            "path": str(local_path)
-                        }))
+                        # download_drive_item returns True for both completed and
+                        # skipped files; check the recorded status to avoid
+                        # logging "download_success" for a file that was skipped.
+                        last_status = next(
+                            (r.status for r in reversed(self.download_results)
+                             if r.path == str(local_path)),
+                            "completed",
+                        )
+                        if last_status != "skipped":
+                            self.logger.info(json.dumps({
+                                "event": "download_success",
+                                "file": getattr(item, 'name', 'unknown'),
+                                "path": str(local_path)
+                            }))
                     else:
                         self.logger.error(json.dumps({
                             "event": "download_failed",
@@ -1875,16 +1966,15 @@ class DownloadManager:
                         }))
                 finally:
                     with self._download_lock:
-                        self._active_downloads.remove(local_path_str)
+                        self._active_downloads.discard(local_path_str)
 
             elif hasattr(item, 'dir'):
                 contents = item.dir()
                 if contents:
-                    # Pre-resolve all child items BEFORE parallel execution to avoid
-                    # "dictionary changed size during iteration" when pyicloud lazily
-                    # loads items and modifies its internal cache
+                    # Snapshot child names first (pyicloud mutates its internal
+                    # cache as items are lazily resolved), then submit each child
+                    # to the shared pool.
                     content_names = list(contents.keys()) if hasattr(contents, 'keys') else list(contents)
-                    child_items = []
                     # Apple names are not always legal filenames here. Sanitising
                     # per directory (rather than globally) is what lets two
                     # different remote names that map to the same local name be
@@ -1892,6 +1982,7 @@ class DownloadManager:
                     sanitizer = DirectorySanitizer(
                         portable=self.portable_names, normalize=self.normalize_names
                     )
+                    local_path.mkdir(parents=True, exist_ok=True)
                     for name in content_names:
                         local_name, changed = sanitizer.assign(name)
                         if changed:
@@ -1908,38 +1999,24 @@ class DownloadManager:
                         # to be carried here too. Missing it is what makes every
                         # file inside a folder shared by another Apple ID 404.
                         sharing.inherit(item, child)
-                        child_items.append((child, local_path / local_name, child_remote_path))
+                        # Submit onto the single shared bounded pool (origin/main's
+                        # concurrency model, which fixed the progressive slowdown on
+                        # large trees) using the sanitized local name.
+                        self._submit(child, local_path / local_name, child_remote_path)
                     for collision in sanitizer.collisions:
                         self.logger.warning(json.dumps({
                             "event": "name_collision",
                             "parent": str(local_path),
                             **collision,
                         }))
-                    local_path.mkdir(parents=True, exist_ok=True)
-                    with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                        futures = [
-                            executor.submit(self.process_item_parallel, child_item, child_path, child_remote_path)
-                            for child_item, child_path, child_remote_path in child_items
-                        ]
-                        for future in as_completed(futures):
-                            # Retrieve result or exception
-                            try:
-                                future.result()
-                            except Exception as e:
-                                self.logger.error(json.dumps({
-                                    "event": "future_exception",
-                                    "error": str(e),
-                                    "traceback": traceback.format_exc()
-                                }))
 
-                        # after_download hook success/failure already inside download_drive_item,
-                        # but make sure to send event even if function returned False
-                        self.plugin_manager.dispatch(
-                            "after_download",
-                            remote_item=item,
-                            local_path=local_path,
-                            success=False,
-                        )
+                    # after_download hook (directory-level event, parity with prior behaviour)
+                    self.plugin_manager.dispatch(
+                        "after_download",
+                        remote_item=item,
+                        local_path=local_path,
+                        success=False,
+                    )
 
         except Exception as e:
             self.logger.error(json.dumps({
@@ -2048,8 +2125,10 @@ class DownloadManager:
         if not self.api or not self.api.drive:
             raise Exception("iCloud Drive service not available")
 
-        # Convert local_path to Path if it's a string
-        local_path_obj = Path(local_path).resolve()
+        # Convert local_path to Path if it's a string. expanduser() makes a
+        # leading "~" resolve to the user's home directory even when the shell
+        # (e.g. PowerShell) passes it through literally.
+        local_path_obj = Path(local_path).expanduser().resolve()
 
         # Initialise version manager for this download session
         self.root_path = local_path_obj
@@ -2083,8 +2162,25 @@ class DownloadManager:
         }))
 
         remote_path = icloud_path.strip("/") or None
+        # Single shared pool for the whole traversal (origin/main's bounded
+        # concurrency). The root item is submitted onto it; directory workers
+        # submit their children onto the same pool. We wait on _traversal_done
+        # (set when the last outstanding item drains) rather than blocking pool
+        # workers on each other. The finally still runs on interruption so the
+        # transfer journal, sync state and manifest survive a killed run.
+        self._pending = 0
+        self._traversal_done = threading.Event()
         try:
-            self.process_item_parallel(item, local_path_obj, remote_path=remote_path)
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                self._executor = executor
+                self._submit(item, local_path_obj, remote_path=remote_path)
+                self._traversal_done.wait()
+            self._executor = None
+
+            # Flush version metadata once, after the whole traversal, instead of
+            # rewriting it per-file (which was O(n^2) and the main slowdown cause).
+            if self.version_manager:
+                self.version_manager._save()
         finally:
             # Persist whatever we learned even if the run was interrupted.
             self.sync_state.save()
@@ -2110,6 +2206,108 @@ class DownloadManager:
         report_path = local_path_obj / "download_report.json"
         with report_path.open('w') as f:
             json.dump(report, f, indent=2)
+
+    def retry_failed(
+        self,
+        report_path: Union[str, Path],
+        icloud_path: str,
+        local_path: Union[str, Path] = '.',
+        log_file: Optional[str] = None,
+    ) -> None:
+        """Re-download only the entries marked 'failed' in a prior report.
+
+        Skips the full-tree walk and the re-verification of every already-
+        downloaded file. Reads ``report_path``, maps each failed local path
+        back to its iCloud remote path (``icloud_path`` is the remote root that
+        ``local_path`` mirrors), and downloads just those. Writes a fresh
+        ``retry_<report>.json`` next to the original so a second pass can target
+        any still-failing files.
+        """
+        if log_file:
+            self.logger = setup_logging(log_file)
+        if not self.api:
+            self.authenticate()
+        if not self.api or not self.api.drive:
+            raise Exception("iCloud Drive service not available")
+
+        report_path = Path(report_path)
+        if not report_path.exists():
+            raise FileNotFoundError(f"Report not found: {report_path}")
+        try:
+            data = json.loads(report_path.read_text())
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid report JSON {report_path}: {e}") from e
+
+        local_root = Path(local_path).resolve()
+        self.root_path = local_root
+        self.version_manager = VersionManager(local_root)
+        remote_root = icloud_path.strip("/")
+
+        failed = [d for d in data.get("details", []) if d.get("status") == "failed"]
+        targets = []
+        for d in failed:
+            # Resolve so a symlinked/normalised local_root still matches the
+            # absolute paths stored in the report (e.g. /tmp -> /private/tmp).
+            p = Path(d.get("path", "")).resolve()
+            try:
+                rel = p.relative_to(local_root)
+            except ValueError:
+                self.logger.error(json.dumps({
+                    "event": "retry_path_outside_root",
+                    "path": str(p), "local_root": str(local_root)
+                }))
+                continue
+            remote = f"{remote_root}/{rel.as_posix()}" if remote_root else rel.as_posix()
+            targets.append((remote, p))
+
+        self.logger.info(json.dumps({
+            "event": "retry_started",
+            "report": str(report_path),
+            "failed_in_report": len(failed),
+            "retrying": len(targets),
+        }))
+        print(f"Retrying {len(targets)} failed file(s) from {report_path.name} ...")
+        if not targets:
+            print("Nothing to retry.")
+            return
+
+        # Submission guard (start at 1, release after the loop) so the counter
+        # cannot momentarily hit zero between independent submissions.
+        self._pending = 1
+        self._traversal_done = threading.Event()
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            self._executor = executor
+            for remote, p in targets:
+                self._submit_task(self._retry_one, remote, p)
+            self._on_item_done()  # release guard
+            self._traversal_done.wait()
+        self._executor = None
+
+        if self.version_manager:
+            self.version_manager._save()
+
+        report = self.generate_summary_report()
+        out_path = report_path.with_name(f"retry_{report_path.name}")
+        with out_path.open("w") as f:
+            json.dump(report, f, indent=2)
+        self.logger.info(json.dumps({"event": "retry_completed", "summary": report["summary"]}))
+        print(f"Retry report saved to {out_path}")
+
+    def _retry_one(self, remote_path: str, local_path: Path) -> None:
+        """Resolve a single remote path then download it (used by retry_failed)."""
+        try:
+            item = self.get_drive_item(remote_path)
+        except Exception as e:
+            self.logger.error(json.dumps({
+                "event": "retry_resolve_failed",
+                "remote_path": remote_path, "error": str(e)
+            }))
+            self.download_results.append(DownloadStatus(
+                path=str(local_path), size=0, downloaded=0,
+                checksum="", status="failed", error=str(e)
+            ))
+            return
+        self.process_item_parallel(item, local_path, remote_path=remote_path)
 
     def _should_process(self, rel_path: Path, is_dir: bool) -> bool:
         """Return True if path should be downloaded/traversed based on include/exclude patterns."""

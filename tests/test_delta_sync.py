@@ -345,7 +345,13 @@ def test_failed_download_invalidates_state(tmp_path, monkeypatch):
 
 
 def test_interrupted_run_still_persists_learned_state(tmp_path, monkeypatch):
-    """download() saves state via finally, even if traversal raises."""
+    """download() persists learned state via its finally block.
+
+    Under the shared bounded-pool traversal, a worker's exception is contained
+    by the pool rather than propagated out of download(); per-item failures are
+    logged and recorded, not re-raised. The finally still runs, so the sync
+    state learned before the failure is saved regardless.
+    """
     dm = DownloadManager(email="user@example.com")
     monkeypatch.setattr(dm, "authenticate", lambda: setattr(
         dm, "api", type("API", (), {"drive": object()})()))
@@ -359,8 +365,9 @@ def test_interrupted_run_still_persists_learned_state(tmp_path, monkeypatch):
 
     monkeypatch.setattr(dm, "process_item_parallel", _explode)
 
-    with pytest.raises(RuntimeError):
-        dm.download("Documents", tmp_path)
+    # The pool contains the worker exception; download() returns normally and
+    # the finally has still persisted whatever state was learned.
+    dm.download("Documents", tmp_path)
 
     assert (tmp_path / SyncState.STATE_FILENAME).exists()
 

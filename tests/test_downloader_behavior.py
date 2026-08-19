@@ -38,6 +38,23 @@ def test_process_item_parallel_skips_duplicate_active_download(monkeypatch, tmp_
     assert called == []
 
 
+def test_process_item_parallel_does_not_log_success_for_skipped_file(monkeypatch, tmp_path):
+    dm = DownloadManager(email="user@example.com", skip_existing=True)
+    dm.root_path = tmp_path
+    events = []
+    item = _File()
+    local_path = tmp_path / "file.txt"
+    local_path.write_bytes(b"existing")  # file already on disk
+
+    monkeypatch.setattr(dm.logger, "info", lambda payload: events.append(json.loads(payload)))
+
+    dm.process_item_parallel(item, local_path, remote_path="Documents/file.txt")
+
+    event_names = [e["event"] for e in events]
+    assert "file_skipped" in event_names
+    assert "download_success" not in event_names
+
+
 def test_process_item_parallel_logs_failed_download(monkeypatch, tmp_path):
     dm = DownloadManager(email="user@example.com")
     events = []
@@ -150,6 +167,25 @@ def test_generate_summary_report_counts_results():
     assert report["summary"]["failed"] == 1
     assert report["summary"]["total_bytes_transferred"] == 8
     assert report["summary"]["total_changed_chunks"] == 2
+
+
+def test_download_expands_home_directory_in_local_path(monkeypatch, tmp_path):
+    dm = DownloadManager(email="user@example.com")
+
+    # Redirect the home directory so "~" expands under tmp_path on any platform.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    monkeypatch.setattr(dm, "authenticate", lambda: setattr(dm, "api", type("API", (), {"drive": object()})()))
+    monkeypatch.setattr(dm, "get_drive_item", lambda path: "item")
+    monkeypatch.setattr(dm, "process_item_parallel", lambda item, local_path, remote_path=None: None)
+    monkeypatch.setattr(dm.plugin_manager, "dispatch", lambda *args, **kwargs: None)
+
+    dm.download("Documents", "~/LocalBackup")
+
+    # Report must land under the expanded home dir, not a literal "~" folder.
+    assert (tmp_path / "LocalBackup" / "download_report.json").exists()
+    assert not (Path("~") / "LocalBackup").exists()
 
 
 def test_download_writes_report_and_dispatches_completion(monkeypatch, tmp_path):

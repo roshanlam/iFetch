@@ -154,6 +154,49 @@ def test_download_drive_item_preserves_resumed_prefix_with_versioning(tmp_path, 
     assert any(tmp_path.joinpath(".versions").rglob("test.txt.v1_*"))
 
 
+class _ExplodingItem:
+    """File-like item whose open() must never be called."""
+
+    name = "test.txt"
+    type = "file"
+    size = 10
+
+    def open(self, stream: bool = True):
+        raise AssertionError("open() must not be called when skipping an existing file")
+
+
+def test_download_drive_item_skips_existing_file_without_overwriting(tmp_path):
+    dm = DownloadManager(email="user@example.com", skip_existing=True)
+
+    local_path = tmp_path / "test.txt"
+    local_path.write_bytes(b"original-bytes")  # different size than the remote item
+
+    ok = dm.download_drive_item(_ExplodingItem(), local_path, remote_path="Documents/test.txt")
+
+    # Returns success, never opened the remote, and left the local copy intact.
+    assert ok is True
+    assert local_path.read_bytes() == b"original-bytes"
+    assert len(dm.download_results) == 1
+    assert dm.download_results[0].status == "skipped"
+    assert dm.generate_summary_report()["summary"]["skipped"] == 1
+
+
+def test_download_drive_item_skip_existing_still_downloads_new_files(tmp_path, monkeypatch):
+    dm = DownloadManager(email="user@example.com", max_retries=1, skip_existing=True)
+    monkeypatch.setattr(dm.chunker, "get_file_chunks", lambda p: {})
+    # Merged chunker API: our branch replaced find_changed_chunks with
+    # compute_download_ranges(response, local_path=None, force=False).
+    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False: [(0, 9)])
+    monkeypatch.setattr(dm, "download_chunk", lambda url, start, end, item=None: b"0123456789")
+    monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
+
+    item = DummyItem("test.txt", 10, b"0123456789")
+    local_path = tmp_path / "test.txt"  # does not exist yet
+
+    assert dm.download_drive_item(item, local_path) is True
+    assert local_path.read_bytes() == b"0123456789"
+
+
 def test_should_process_keeps_directories_traversable_for_include_globs():
     dm = DownloadManager(email="user@example.com", include_patterns=["*.pdf"])
 

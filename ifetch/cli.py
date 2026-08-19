@@ -105,6 +105,13 @@ def main(argv=None):
     )
 
     parser.add_argument(
+        '--skip-existing',
+        dest='skip_existing',
+        action='store_true',
+        help='Skip files that already exist locally instead of updating/overwriting them'
+    )
+
+    parser.add_argument(
         '--list-shared',
         dest='list_shared',
         action='store_true',
@@ -262,6 +269,18 @@ def main(argv=None):
         )
     )
 
+    parser.add_argument(
+        '--retry-failed',
+        dest='retry_failed',
+        nargs='?',
+        const='',
+        default=None,
+        help='Retry ONLY the files marked "failed" in a prior report, skipping the '
+             'full-tree walk and re-verification of good files. Optionally give a '
+             'report path (default: <local_path>/download_report.json). Requires the '
+             'same icloud_path (remote root) and local_path as the original run.'
+    )
+
     add_notification_arguments(parser)
 
     args = parser.parse_args(argv)
@@ -288,6 +307,8 @@ def main(argv=None):
             print(f"Remote Path: {args.icloud_path}")
         print(f"Local Path: {args.local_path}")
         print(f"Parallel Workers: {args.max_workers}")
+        if args.skip_existing:
+            print("Skip-existing: ON (files already on disk will be left untouched)")
         print("=" * 70)
 
         # Load profile patterns
@@ -332,6 +353,7 @@ def main(argv=None):
             normalize_names=args.normalize_names,
             password=password,
             bwlimit=args.bwlimit,
+            skip_existing=args.skip_existing,
         )
 
         two_factor = TwoFactorResolver(
@@ -360,7 +382,25 @@ def main(argv=None):
         print("Authentication successful!")
 
         # Perform the requested operation
-        if args.list_shared:
+        if args.retry_failed is not None:
+            if not args.icloud_path:
+                raise ValueError("icloud_path (remote root) is required with --retry-failed")
+            from pathlib import Path as _P
+            report = args.retry_failed or str(_P(args.local_path) / "download_report.json")
+            print(f"\nRetrying failed entries from '{report}'")
+            downloader.retry_failed(
+                report,
+                args.icloud_path,
+                args.local_path,
+                log_file=args.log_file,
+            )
+            summary = downloader.generate_summary_report()["summary"]
+            print("\nRetry Summary:")
+            print(f"- Files retried: {summary['total_files']}")
+            print(f"- Successfully downloaded: {summary['successful']}")
+            print(f"- Still failed: {summary['failed']}")
+            print(f"- Total data transferred: {summary['total_bytes_transferred'] / (1024*1024):.2f} MB")
+        elif args.list_shared:
             print("\nListing top-level shared items:")
             print("-" * 50)
             downloader.list_shared_roots()
@@ -389,6 +429,7 @@ def main(argv=None):
             print("\nDownload Summary:")
             print(f"- Total files: {summary['total_files']}")
             print(f"- Successfully downloaded: {summary['successful']}")
+            print(f"- Skipped (already on disk): {summary['skipped']}")
             print(f"- Failed: {summary['failed']}")
             print(f"- Skipped (unchanged): {summary.get('skipped', 0)}")
             print(f"- Total data transferred: {summary['total_bytes_transferred'] / (1024*1024):.2f} MB")
