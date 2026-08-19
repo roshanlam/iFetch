@@ -1,0 +1,53 @@
+# Keep the build context small and keep secrets out of it. Everything the
+# image needs is listed explicitly in the Dockerfile's COPY lines; anything not
+# excluded here still lands in the build context and is uploaded to the daemon.
+
+.git
+.github
+.gitignore
+
+# Never build a credential into an image.
+.env
+*.pem
+*.key
+.ifetch_profiles.json
+
+# Vendored upstream checkout used for research only; large and irrelevant.
+learn/
+benchmarks/
+docs/
+plugins/
+tests/
+dist/
+build/
+*.egg-info/
+ifetch.egg-info/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+venv/
+.venv/
+env/
+
+.idea/
+.vscode/
+.DS_Store
+
+# Local mirrors and reports must never end up in a layer.
+LocalDoc/
+download_report.json
+*.log
+Dockerfile
+docker-compose.yml
+.dockerignore
+CHANGELOG.md
+CONTRIBUTING.md
+LICENSE
