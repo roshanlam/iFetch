@@ -1,0 +1,1588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>iFetch</title>
+<style>
+/* ---------------------------------------------------------------------------
+   Everything is inline on purpose. This page is opened from a NAS on a LAN
+   with no route to the internet: no CDN, no web font, no build step.
+   --------------------------------------------------------------------------- */
+
+:root {
+  --bg: #f4f6f8;
+  --panel: #ffffff;
+  --panel-2: #eef1f5;
+  --text: #14181d;
+  --muted: #515c69;
+  --line: #d3d9e0;
+  --accent: #0b57c9;
+  --accent-hover: #0a4bad;
+  --accent-fg: #ffffff;
+  --focus: #0b57c9;
+  --warn-bg: #fff6e6;
+  --warn-line: #a86a00;
+  --warn-text: #5c3a00;
+  --bad-bg: #fdeceb;
+  --bad-line: #b3261e;
+  --bad-text: #7a1810;
+  --good: #14652f;
+  --radius: 10px;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1216;
+    --panel: #161b21;
+    --panel-2: #1e252d;
+    --text: #e9eef4;
+    --muted: #a7b3c0;
+    --line: #2b333c;
+    --accent: #6ba6ff;
+    --accent-hover: #8bbaff;
+    --accent-fg: #0a1018;
+    --focus: #8bbaff;
+    --warn-bg: #2a2011;
+    --warn-line: #d59b3a;
+    --warn-text: #f2d6a4;
+    --bad-bg: #2c1516;
+    --bad-line: #e5807b;
+    --bad-text: #f6bebb;
+    --good: #6bd08e;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
+}
+
+h1, h2, h3 { line-height: 1.25; margin: 0 0 .4em; }
+h1 { font-size: 1.25rem; }
+h2 { font-size: 1.15rem; }
+h3 { font-size: 1rem; }
+p { margin: 0 0 .7em; }
+p:last-child { margin-bottom: 0; }
+
+a { color: var(--accent); }
+
+.skip {
+  position: absolute; left: -9999px; top: 0; z-index: 20;
+  background: var(--panel); color: var(--text); padding: .6em 1em;
+}
+.skip:focus { left: 8px; top: 8px; }
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.wrap { max-width: 1400px; margin: 0 auto; padding: 12px; }
+
+/* ---- header ---- */
+header.top {
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.topbar {
+  display: flex; flex-wrap: wrap; gap: 8px 14px;
+  align-items: center; justify-content: space-between;
+}
+.brand { display: flex; align-items: baseline; gap: 10px; }
+.brand .name { font-weight: 700; font-size: 1.2rem; letter-spacing: .01em; }
+.brand .sub { color: var(--muted); font-size: .85rem; }
+.whoami { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+          color: var(--muted); font-size: .88rem; }
+
+/* ---- generic blocks ---- */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin: 0 0 14px;
+}
+.card > h2 { margin-top: 0; }
+.muted { color: var(--muted); }
+.small { font-size: .87rem; }
+.mono { font-family: var(--mono); font-size: .9em; word-break: break-all; }
+.stack > * + * { margin-top: 12px; }
+.hidden { display: none !important; }
+
+/* ---- notices: the honesty furniture ---- */
+.notice {
+  border: 1px solid var(--line);
+  border-left-width: 6px;
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: var(--panel-2);
+}
+.notice + .notice { margin-top: 10px; }
+.notice h3 { margin-bottom: .35em; }
+.notice.warn { background: var(--warn-bg); border-color: var(--warn-line); color: var(--warn-text); }
+.notice.bad  { background: var(--bad-bg);  border-color: var(--bad-line);  color: var(--bad-text); }
+.notice ul { margin: .4em 0 0; padding-left: 1.2em; }
+.notice li { margin: .25em 0; }
+
+.errline {
+  margin-top: 8px;
+  color: var(--bad-text);
+  background: var(--bad-bg);
+  border: 1px solid var(--bad-line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: .92rem;
+}
+@media (prefers-color-scheme: dark) { .errline { color: var(--bad-text); } }
+
+/* ---- forms ---- */
+label { display: block; font-weight: 600; margin-bottom: 4px; }
+input[type="text"], input[type="email"] {
+  width: 100%;
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+input.code {
+  font-family: var(--mono);
+  font-size: 1.4rem;
+  letter-spacing: .35em;
+  text-align: center;
+  max-width: 11ch;
+}
+.field + .field { margin-top: 12px; }
+.hint { color: var(--muted); font-size: .87rem; margin-top: 4px; }
+
+button {
+  font: inherit;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 14px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { background: var(--panel-2); }
+button:disabled { opacity: .55; cursor: not-allowed; }
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-size: 1.05rem;
+  padding: 13px 20px;
+  width: 100%;
+}
+button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.link {
+  background: none; border: none; padding: 2px 4px;
+  color: var(--accent); text-decoration: underline; font-weight: 600;
+}
+
+/* ---- tabs ---- */
+.tabs {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 14px;
+}
+.tabs button {
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: none;
+  color: var(--muted);
+  margin-bottom: -1px;
+}
+.tabs button[aria-selected="true"] {
+  background: var(--panel);
+  border-color: var(--line);
+  color: var(--text);
+}
+
+/* ---- browse ---- */
+.browse-grid { display: grid; gap: 14px; grid-template-columns: 1fr; }
+@media (min-width: 900px) {
+  .browse-grid { grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr); align-items: start; }
+}
+.crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin-bottom: 10px; }
+.crumbs .sep { color: var(--muted); }
+.entries { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.entries li + li { border-top: 1px solid var(--line); }
+.entries .row {
+  display: flex; gap: 10px; align-items: center;
+  width: 100%; text-align: left;
+  padding: 11px 12px; background: none; border: none; border-radius: 0;
+  font-weight: 500;
+}
+.entries button.row { cursor: pointer; }
+.entries button.row:hover { background: var(--panel-2); }
+.entries .row .nm { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.entries .row .sz { flex: 0 0 auto; color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums; }
+.entries .row .kind { flex: 0 0 auto; color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; }
+.entries .row[aria-disabled="true"] { color: var(--muted); }
+.scroller { max-height: 52vh; overflow-y: auto; }
+
+/* ---- progress ---- */
+.bar {
+  position: relative;
+  height: 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.bar .fill { height: 100%; width: 0; background: var(--accent); transition: width .3s linear; }
+.bar.indeterminate .fill {
+  width: 34%;
+  animation: slide 1.5s ease-in-out infinite;
+}
+@keyframes slide {
+  0%   { transform: translateX(-110%); }
+  100% { transform: translateX(320%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .bar.indeterminate .fill { animation: none; width: 100%; opacity: .45; }
+  .bar .fill { transition: none; }
+}
+.stats { display: grid; gap: 8px 18px; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); margin-top: 12px; }
+.stat .k { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+.stat .v { font-size: 1.05rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.current { margin-top: 10px; }
+
+/* ---- headline number ---- */
+.headline {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  background: var(--panel-2);
+}
+.headline .big { font-size: clamp(1.9rem, 7vw, 3rem); font-weight: 800; line-height: 1.05; }
+.headline .qual { color: var(--muted); font-size: .9rem; }
+.headline.alarm { background: var(--bad-bg); border-color: var(--bad-line); color: var(--bad-text); }
+.headline.alarm .qual { color: inherit; }
+.headline.clean { border-color: var(--good); }
+
+/* ---- tables ---- */
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.path { font-family: var(--mono); font-size: .84rem; overflow-wrap: anywhere; }
+
+.tag {
+  display: inline-block; padding: 1px 7px; border-radius: 999px;
+  font-size: .75rem; font-weight: 700; letter-spacing: .03em;
+  border: 1px solid var(--line); white-space: nowrap;
+}
+.tag.lost { background: var(--bad-bg); border-color: var(--bad-line); color: var(--bad-text); }
+.tag.placeholder_only { background: var(--warn-bg); border-color: var(--warn-line); color: var(--warn-text); }
+
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; font-size: .9rem; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap topbar">
+    <div class="brand">
+      <span class="name">iFetch</span>
+      <span class="sub">your iCloud Drive, on your own disk</span>
+    </div>
+    <div class="whoami">
+      <span id="whoami-text"></span>
+      <button type="button" id="signout-btn" class="hidden">Sign out</button>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <!-- Connection / session banner. Always announced. -->
+  <div id="banner" role="status" aria-live="polite" class="hidden"></div>
+</div>
+
+<main id="main" class="wrap">
+
+  <!-- ==================== 1. SIGN IN ==================== -->
+  <section id="view-signin" aria-labelledby="signin-h">
+    <div class="card" style="max-width: 34rem; margin-left: auto; margin-right: auto;">
+      <h2 id="signin-h">Sign in to iCloud</h2>
+
+      <form id="email-form" novalidate>
+        <div class="field">
+          <label for="email">Your Apple ID email</label>
+          <input type="email" id="email" name="email" autocomplete="username"
+                 autocapitalize="none" spellcheck="false" placeholder="you@example.com" required>
+          <p class="hint">
+            iFetch never asks for your Apple ID password in this browser, and there is no
+            field here to type one into. The server reads it from your computer&rsquo;s keychain,
+            exactly as the command line does. The only thing this page ever sends to iCloud
+            is the six-digit code from your devices.
+          </p>
+        </div>
+        <div class="field">
+          <button type="submit" class="primary" id="email-submit">Continue</button>
+        </div>
+        <div id="email-error" class="errline hidden"></div>
+      </form>
+
+      <!-- 2FA step: calm, expected, retryable -->
+      <div id="twofa-step" class="hidden" style="margin-top: 6px;">
+        <hr style="border: none; border-top: 1px solid var(--line); margin: 18px 0;">
+        <h3>Apple just sent a code to your devices</h3>
+        <p class="small">
+          This is normal and it happens every time a new session is created. Look at your
+          iPhone, iPad or Mac: a notification says someone is trying to sign in, and after you
+          allow it you get a <strong>six-digit code</strong>. Type that code here.
+        </p>
+        <form id="twofa-form" novalidate>
+          <div class="field">
+            <label for="code">Six-digit code</label>
+            <input type="text" id="code" name="code" class="code" inputmode="numeric"
+                   autocomplete="one-time-code" pattern="[0-9]*" maxlength="6"
+                   spellcheck="false" aria-describedby="code-hint">
+            <p class="hint" id="code-hint">
+              Digits only. If you mistype it, nothing is lost &mdash; you can just enter it again.
+            </p>
+          </div>
+          <div class="field">
+            <button type="submit" class="primary" id="code-submit">Verify code</button>
+          </div>
+          <div id="twofa-error" class="errline hidden"></div>
+          <p class="small muted" style="margin-top: 10px;">
+            No code arrived? Use <button type="button" class="link" id="restart-signin">a different Apple ID</button>
+            to start again.
+          </p>
+        </form>
+      </div>
+    </div>
+
+    <p class="small muted" style="text-align: center;">
+      This page talks only to the copy of iFetch running on this machine. Nothing here
+      reaches the internet except the download itself.
+    </p>
+  </section>
+
+  <!-- ==================== SIGNED-IN APP ==================== -->
+  <section id="view-app" class="hidden">
+
+    <div class="tabs" role="tablist" aria-label="What do you want to do?">
+      <button type="button" role="tab" id="tab-btn-download" aria-controls="panel-download"
+              aria-selected="true" data-tab="download">Download</button>
+      <button type="button" role="tab" id="tab-btn-guard" aria-controls="panel-guard"
+              aria-selected="false" tabindex="-1" data-tab="guard">What your backups are missing</button>
+      <button type="button" role="tab" id="tab-btn-vanish" aria-controls="panel-vanish"
+              aria-selected="false" tabindex="-1" data-tab="vanish">What disappeared from iCloud</button>
+    </div>
+
+    <div id="app-error" class="errline hidden"></div>
+
+    <!-- ---------- 3. PROGRESS (shared, live) ---------- -->
+    <div id="progress-region" aria-live="polite" aria-atomic="false"></div>
+
+    <!-- ---------- 2. BROWSE AND DOWNLOAD ---------- -->
+    <div id="panel-download" role="tabpanel" tabindex="0" aria-labelledby="tab-btn-download">
+      <div class="browse-grid">
+
+        <div class="card">
+          <h2>Choose a folder in iCloud Drive</h2>
+          <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
+          <div class="scroller">
+            <ul class="entries" id="entries"></ul>
+          </div>
+          <p class="small muted" id="browse-note" style="margin-top: 10px;"></p>
+          <div id="browse-error" class="errline hidden"></div>
+        </div>
+
+        <div class="card">
+          <h2>Save it here</h2>
+          <div class="field">
+            <label for="dest">Folder on this computer</label>
+            <input type="text" id="dest" name="dest" spellcheck="false" autocapitalize="none">
+            <p class="hint">The folder is created if it does not exist. Running again only
+              fetches what changed.</p>
+          </div>
+          <div class="field">
+            <button type="button" class="primary" id="download-btn">Download this folder</button>
+          </div>
+          <div id="download-error" class="errline hidden"></div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ---------- 4. GUARD ---------- -->
+    <div id="panel-guard" role="tabpanel" tabindex="0" aria-labelledby="tab-btn-guard" class="hidden">
+      <div class="card">
+        <h2>What your backups are missing</h2>
+        <p class="small">
+          With &ldquo;Optimize Mac Storage&rdquo; on, macOS can throw away the contents of any
+          iCloud Drive file while leaving its name, its date and its <em>size</em> in place.
+          Finder shows a 4&nbsp;GB video; the disk holds nothing. Time Machine, Backblaze, Arq,
+          Carbon Copy Cloner and rsync all copy the empty shell and report success. It only
+          fails at restore time, when the original is gone.
+        </p>
+        <div class="field">
+          <label for="guard-path">Folder to check</label>
+          <input type="text" id="guard-path" name="guard-path" spellcheck="false" autocapitalize="none">
+          <p class="hint" id="guard-path-hint">Usually your iCloud Drive folder.</p>
+        </div>
+        <div class="field">
+          <button type="button" class="primary" id="guard-btn">Check this folder</button>
+        </div>
+        <div id="guard-error" class="errline hidden"></div>
+      </div>
+      <div id="guard-report" aria-live="polite"></div>
+    </div>
+
+    <!-- ---------- 5. VANISH ---------- -->
+    <div id="panel-vanish" role="tabpanel" tabindex="0" aria-labelledby="tab-btn-vanish" class="hidden">
+      <div class="card">
+        <h2>What disappeared from iCloud</h2>
+        <p class="small">
+          Every other check asks what your copy is missing. This one asks the opposite: what
+          did iCloud have last time that it does not have now? A bad sync, a family member, a
+          compromised account or one of Apple&rsquo;s own bugs can quietly remove a file, and
+          iCloud empties its Trash after about 30 days &mdash; so there is a clock on finding out.
+        </p>
+        <div class="field">
+          <label for="vanish-path">Local copy to compare against</label>
+          <input type="text" id="vanish-path" name="vanish-path" spellcheck="false" autocapitalize="none">
+          <p class="hint">The folder iFetch has been downloading into.</p>
+        </div>
+        <div class="field">
+          <button type="button" class="primary" id="vanish-btn">Look for missing files</button>
+        </div>
+        <div id="vanish-error" class="errline hidden"></div>
+      </div>
+      <div id="vanish-report" aria-live="polite"></div>
+    </div>
+
+  </section>
+</main>
+
+<footer class="wrap small muted">
+  <p id="version-line"></p>
+</footer>
+
+<script>
+(function () {
+  'use strict';
+
+  /* =====================================================================
+     Transport.
+     Exactly one call to the browser's fetch API lives in this file, inside
+     apiFetch below. Every endpoint it can reach is a literal string passed
+     in by a caller, and every one of those literals is documented in
+     docs/webui-api.md. tests/test_webui_assets.py diffs the two sets so
+     they cannot drift apart unnoticed.
+     ===================================================================== */
+
+  function ApiError(message, status) {
+    this.name = 'ApiError';
+    this.message = message;
+    this.status = status;
+  }
+  ApiError.prototype = Object.create(Error.prototype);
+
+  var LOST = 'lost';        // server unreachable
+  var EXPIRED = 'expired';  // 404: token no longer valid
+
+  async function apiFetch(path, init) {
+    var res;
+    try {
+      res = await fetch(path, init);
+    } catch (err) {
+      throw new ApiError('Lost contact with iFetch.', LOST);
+    }
+    if (res.status === 404) {
+      throw new ApiError('This link has expired.', EXPIRED);
+    }
+    var body = null;
+    try {
+      body = await res.json();
+    } catch (err) {
+      body = null;
+    }
+    if (!res.ok || (body && body.ok === false)) {
+      var msg = (body && body.error) || ('iFetch replied with an error (HTTP ' + res.status + ').');
+      throw new ApiError(msg, res.status);
+    }
+    if (body === null) {
+      throw new ApiError('iFetch sent a reply this page could not read.', res.status);
+    }
+    return body;
+  }
+
+  function apiGet(path) {
+    return apiFetch(path, { method: 'GET', headers: { 'Accept': 'application/json' } });
+  }
+
+  function apiPost(path, payload) {
+    return apiFetch(path, {
+      method: 'POST',
+      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {})
+    });
+  }
+
+  /* ---- the documented endpoints, one literal each ---- */
+  function getState()          { return apiGet('/api/state'); }
+  function getBrowse(path)     { return apiGet('/api/browse' + (path ? '?path=' + encodeURIComponent(path) : '')); }
+  function postAuthStart(e)    { return apiPost('/api/auth/start', { email: e }); }
+  function postAuth2fa(code)   { return apiPost('/api/auth/2fa', { code: code }); }
+  function postSignout()       { return apiPost('/api/auth/signout', {}); }
+  function postDownload(r, l)  { return apiPost('/api/download', { icloud_path: r, local_path: l }); }
+  function postGuard(l)        { return apiPost('/api/guard', { local_path: l }); }
+  function postVanish(l)       { return apiPost('/api/vanish', { local_path: l }); }
+  function postCancel()        { return apiPost('/api/cancel', {}); }
+
+  /* =====================================================================
+     Tiny DOM helpers. Everything user- or iCloud-supplied goes in as text,
+     never as markup.
+     ===================================================================== */
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, opts, kids) {
+    var node = document.createElement(tag);
+    opts = opts || {};
+    Object.keys(opts).forEach(function (key) {
+      var value = opts[key];
+      if (value === null || value === undefined) { return; }
+      if (key === 'class') { node.className = value; }
+      else if (key === 'text') { node.textContent = String(value); }
+      else if (key === 'html') { throw new Error('no raw html'); }
+      else { node.setAttribute(key, String(value)); }
+    });
+    (kids || []).forEach(function (kid) {
+      if (kid === null || kid === undefined || kid === false) { return; }
+      node.appendChild(typeof kid === 'string' ? document.createTextNode(kid) : kid);
+    });
+    return node;
+  }
+
+  function clear(node) { while (node.firstChild) { node.removeChild(node.firstChild); } }
+
+  function show(node, visible) { node.classList.toggle('hidden', !visible); }
+
+  function setError(node, message) {
+    if (!message) { node.textContent = ''; show(node, false); return; }
+    node.textContent = message;   // API errors are already one human sentence
+    show(node, true);
+  }
+
+  /* =====================================================================
+     Formatting. An unknown number is the string "unknown" and never a 0.
+     ===================================================================== */
+
+  var UNKNOWN = 'unknown';
+
+  function isNum(v) { return typeof v === 'number' && isFinite(v); }
+
+  function fmtBytes(n) {
+    if (!isNum(n)) { return UNKNOWN; }
+    if (n < 1024) { return n + ' B'; }
+    var units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+    var value = n / 1024;
+    var i = 0;
+    while (value >= 1024 && i < units.length - 1) { value /= 1024; i += 1; }
+    return (value >= 100 ? value.toFixed(0) : value.toFixed(1)) + ' ' + units[i];
+  }
+
+  function fmtCount(n) {
+    if (!isNum(n)) { return UNKNOWN; }
+    return n.toLocaleString();
+  }
+
+  function fmtWhen(iso, epoch) {
+    if (iso) {
+      var parsed = new Date(iso);
+      if (!isNaN(parsed.getTime())) { return parsed.toLocaleString(); }
+      return iso;
+    }
+    if (isNum(epoch)) { return new Date(epoch * 1000).toLocaleString(); }
+    return UNKNOWN;
+  }
+
+  function plural(n, one, many) { return n === 1 ? one : (many || one + 's'); }
+
+  /* =====================================================================
+     App state
+     ===================================================================== */
+
+  var state = null;
+  var tab = 'download';
+  var browsePath = '';
+  var browseLoaded = false;
+  var connection = 'ok';        // 'ok' | LOST | EXPIRED
+  var touched = { dest: false, guard: false, vanish: false };
+  var lastJobKey = '';
+  var focusedCode = false;
+  var renderedReports = { guard: null, vanish: null, download: null };
+  var pollTimer = null;
+  var idleDelay = 2000;
+
+  var RUNNING_MS = 1000;
+  var IDLE_MIN_MS = 2000;
+  var IDLE_MAX_MS = 15000;
+  var RETRY_MS = 3000;
+
+  function jobRunning() {
+    return !!(state && state.job && state.job.state === 'running');
+  }
+
+  function signedIn() {
+    return !!(state && state.auth && state.auth.state === 'signed_in');
+  }
+
+  /* =====================================================================
+     Polling: ~1s while a job runs, backing off when idle, paused when the
+     tab is hidden, resumed on focus.
+     ===================================================================== */
+
+  function stopPolling() {
+    if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+  }
+
+  function nextDelay() {
+    if (connection === LOST) { return RETRY_MS; }
+    if (jobRunning()) { return RUNNING_MS; }
+    idleDelay = Math.min(Math.round(idleDelay * 1.5), IDLE_MAX_MS);
+    return idleDelay;
+  }
+
+  function schedulePoll(ms) {
+    stopPolling();
+    if (connection === EXPIRED) { return; }   // retrying cannot help
+    if (document.hidden) { return; }
+    pollTimer = setTimeout(poll, ms === undefined ? nextDelay() : ms);
+  }
+
+  async function poll() {
+    try {
+      var fresh = await getState();
+      setConnection('ok');
+      applyState(fresh);
+    } catch (err) {
+      handleTransport(err);
+    }
+    schedulePoll();
+  }
+
+  function setConnection(kind) {
+    if (connection === kind) { return; }
+    connection = kind;
+    renderBanner();
+  }
+
+  function handleTransport(err) {
+    if (err && err.status === EXPIRED) { setConnection(EXPIRED); stopPolling(); return true; }
+    if (err && err.status === LOST) { setConnection(LOST); return true; }
+    return false;
+  }
+
+  function renderBanner() {
+    var banner = $('banner');
+    clear(banner);
+    if (connection === 'ok') { show(banner, false); return; }
+    show(banner, true);
+    if (connection === EXPIRED) {
+      banner.className = 'notice bad';
+      banner.appendChild(el('h3', { text: 'This link has expired' }));
+      banner.appendChild(el('p', {
+        text: 'The session token in this address is no longer valid, so iFetch will not answer ' +
+              'this page. Restart it with "ifetch serve" and open the new link it prints.'
+      }));
+    } else {
+      banner.className = 'notice warn';
+      banner.appendChild(el('h3', { text: 'Lost contact with iFetch' }));
+      banner.appendChild(el('p', {
+        text: 'Nothing has been lost. This page keeps trying, and picks up where it left off ' +
+              'as soon as iFetch answers again. If you closed the terminal window, start ' +
+              '"ifetch serve" again.'
+      }));
+    }
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) { stopPolling(); return; }
+    idleDelay = IDLE_MIN_MS;
+    schedulePoll(0);
+  });
+  window.addEventListener('focus', function () {
+    if (!document.hidden) { idleDelay = IDLE_MIN_MS; schedulePoll(0); }
+  });
+
+  function pokeSoon() { idleDelay = IDLE_MIN_MS; schedulePoll(0); }
+
+  /* =====================================================================
+     Render
+     ===================================================================== */
+
+  function applyState(fresh) {
+    var wasSignedIn = signedIn();
+    state = fresh;
+
+    renderIdentity();
+    renderAuthView();
+
+    if (signedIn()) {
+      if (!wasSignedIn) { idleDelay = IDLE_MIN_MS; }
+      prefillPaths();
+      if (!browseLoaded) { browseLoaded = true; loadBrowse(''); }
+    } else {
+      browseLoaded = false;
+    }
+
+    renderProgress();
+    renderReports();
+
+    var version = state.version ? ('iFetch ' + state.version) : '';
+    $('version-line').textContent = version;
+  }
+
+  function renderIdentity() {
+    var auth = (state && state.auth) || {};
+    var line = '';
+    if (auth.state === 'signed_in') {
+      line = 'Signed in' + (auth.email ? ' as ' + auth.email : '');
+      if (isNum(auth.expires_in_days)) {
+        line += ' · session valid for about ' + auth.expires_in_days + ' more ' +
+                plural(auth.expires_in_days, 'day');
+      }
+    }
+    $('whoami-text').textContent = line;
+    show($('signout-btn'), auth.state === 'signed_in');
+  }
+
+  function renderAuthView() {
+    var auth = (state && state.auth) || { state: 'signed_out' };
+    var isIn = auth.state === 'signed_in';
+    show($('view-signin'), !isIn);
+    show($('view-app'), isIn);
+
+    if (isIn) { return; }
+
+    var needs2fa = auth.state === 'needs_2fa';
+    show($('twofa-step'), needs2fa);
+    $('email-submit').disabled = needs2fa;
+    $('email').disabled = needs2fa;
+    // Move focus to the code box once, when the step first appears. Polling
+    // must never yank focus back out of whatever the user clicked next.
+    if (needs2fa && !focusedCode) { focusedCode = true; $('code').focus(); }
+    if (!needs2fa) { focusedCode = false; }
+    if (auth.state === 'error' && auth.message) {
+      setError($('email-error'), auth.message);
+    }
+  }
+
+  function prefillPaths() {
+    var paths = (state && state.paths) || {};
+    if (!touched.dest && paths.default_local && !$('dest').value) {
+      $('dest').value = paths.default_local;
+    }
+    if (!touched.guard && !$('guard-path').value) {
+      $('guard-path').value = paths.icloud_drive || paths.default_local || '';
+    }
+    if (!touched.vanish && !$('vanish-path').value) {
+      $('vanish-path').value = paths.default_local || '';
+    }
+    if (!paths.icloud_drive) {
+      $('guard-path-hint').textContent =
+        'No iCloud Drive folder was found on this machine, so nothing has been filled in ' +
+        'for you. Type the folder you want checked.';
+    }
+  }
+
+  /* ---------------- progress ---------------- */
+
+  function renderProgress() {
+    var region = $('progress-region');
+    var job = state && (state.job || state.last);
+    if (!job) { clear(region); return; }
+
+    var key = [job.id, job.state, JSON.stringify(job.progress || null), job.message].join('|');
+    if (key === lastJobKey) { return; }
+    lastJobKey = key;
+
+    clear(region);
+    region.appendChild(job.state === 'running' ? runningCard(job) : finishedCard(job));
+  }
+
+  function jobNoun(kind) {
+    if (kind === 'guard') { return 'Checking what your backups are missing'; }
+    if (kind === 'vanish') { return 'Looking for files that disappeared from iCloud'; }
+    return 'Downloading';
+  }
+
+  function runningCard(job) {
+    var p = job.progress || {};
+    var card = el('div', { class: 'card' });
+
+    card.appendChild(el('h2', { text: jobNoun(job.kind) }));
+    if (job.label) { card.appendChild(el('p', { class: 'small mono', text: job.label })); }
+
+    var knowsFiles = isNum(p.files_total) && p.files_total > 0;
+    var knowsBytes = isNum(p.bytes_total) && p.bytes_total > 0;
+    var indeterminate = !knowsFiles && !knowsBytes;
+
+    var fill = el('div', { class: 'fill' });
+    var bar = el('div', {
+      class: 'bar' + (indeterminate ? ' indeterminate' : ''),
+      role: 'progressbar',
+      'aria-valuemin': '0',
+      'aria-valuemax': '100'
+    }, [fill]);
+
+    if (indeterminate) {
+      // No denominator exists, so no percentage is invented.
+      bar.setAttribute('aria-valuetext', 'Working — the total is not yet known');
+      card.appendChild(bar);
+      card.appendChild(el('p', {
+        class: 'small muted current',
+        text: 'Working — the total is not yet known, so there is no percentage to show yet.'
+      }));
+    } else {
+      var done = knowsBytes ? (p.bytes_done || 0) : (p.files_done || 0);
+      var total = knowsBytes ? p.bytes_total : p.files_total;
+      var pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+      fill.style.width = pct + '%';
+      bar.setAttribute('aria-valuenow', String(pct));
+      bar.setAttribute('aria-valuetext', pct + '% complete');
+      card.appendChild(bar);
+      card.appendChild(el('p', { class: 'small muted current', text: pct + '% complete' }));
+    }
+
+    card.appendChild(statGrid([
+      ['Files', fmtCount(p.files_done) + ' of ' + (isNum(p.files_total) ? fmtCount(p.files_total) : UNKNOWN)],
+      ['Bytes', fmtBytes(p.bytes_done) + ' of ' + fmtBytes(p.bytes_total)],
+      ['Skipped', fmtCount(p.skipped)],
+      ['Failed', fmtCount(p.failed)]
+    ]));
+
+    if (p.current) {
+      card.appendChild(el('p', { class: 'small current' }, [
+        el('span', { class: 'muted', text: 'Now: ' }),
+        el('span', { class: 'mono', text: p.current })
+      ]));
+    }
+
+    var cancel = el('button', { type: 'button', id: 'cancel-btn', text: 'Stop' });
+    cancel.addEventListener('click', onCancel);
+    card.appendChild(el('p', { style: 'margin-top:12px' }, [cancel]));
+    card.appendChild(el('p', {
+      class: 'small muted',
+      text: 'Stopping waits for the file in flight to finish. Half-downloaded files stay ' +
+            'resumable, so starting again picks up where this left off.'
+    }));
+    return card;
+  }
+
+  function finishedCard(job) {
+    var p = job.progress || {};
+    var card = el('div', { class: 'card' });
+    var verb = { done: 'Finished', failed: 'Stopped by an error', cancelled: 'Stopped' }[job.state] || job.state;
+
+    card.appendChild(el('h2', { text: verb + ': ' + jobNoun(job.kind).toLowerCase() }));
+    if (job.label) { card.appendChild(el('p', { class: 'small mono', text: job.label })); }
+    if (job.message) { card.appendChild(el('p', { text: job.message })); }
+
+    card.appendChild(statGrid([
+      ['Files done', fmtCount(p.files_done)],
+      ['Bytes', fmtBytes(p.bytes_done)],
+      ['Skipped', fmtCount(p.skipped)],
+      ['Failed', fmtCount(p.failed)]
+    ]));
+
+    if (isNum(p.failed) && p.failed > 0) {
+      card.appendChild(el('p', { class: 'notice warn', style: 'margin-top:12px' }, [
+        el('strong', { text: fmtCount(p.failed) + ' ' + plural(p.failed, 'file') + ' did not come down.' }),
+        ' Run it again — finished files are skipped, so only the failures are retried.'
+      ]));
+    }
+    if (job.finished_at) {
+      card.appendChild(el('p', { class: 'small muted', text: 'Finished ' + fmtWhen(null, job.finished_at) }));
+    }
+    return card;
+  }
+
+  function statGrid(pairs) {
+    var grid = el('div', { class: 'stats' });
+    pairs.forEach(function (pair) {
+      grid.appendChild(el('div', { class: 'stat' }, [
+        el('div', { class: 'k', text: pair[0] }),
+        el('div', { class: 'v', text: pair[1] })
+      ]));
+    });
+    return grid;
+  }
+
+  /* ---------------- browse ---------------- */
+
+  async function loadBrowse(path) {
+    setError($('browse-error'), '');
+    var list = $('entries');
+    clear(list);
+    list.appendChild(el('li', {}, [el('span', { class: 'row muted', text: 'Loading…' })]));
+    try {
+      var data = await getBrowse(path);
+      browsePath = data.path || '';
+      renderCrumbs(data);
+      renderEntries(data);
+      setConnection('ok');
+    } catch (err) {
+      clear(list);
+      if (!handleTransport(err)) { setError($('browse-error'), err.message); }
+    }
+    updateDownloadButton();
+  }
+
+  function renderCrumbs(data) {
+    var crumbs = $('crumbs');
+    clear(crumbs);
+    var parts = (data.path || '').split('/').filter(function (s) { return s.length > 0; });
+
+    crumbs.appendChild(crumbButton('iCloud Drive', '', parts.length === 0));
+    var acc = '';
+    parts.forEach(function (part, i) {
+      acc = acc ? acc + '/' + part : part;
+      crumbs.appendChild(el('span', { class: 'sep', text: '/' }));
+      crumbs.appendChild(crumbButton(part, acc, i === parts.length - 1));
+    });
+  }
+
+  function crumbButton(label, path, current) {
+    if (current) {
+      return el('span', { class: 'mono', 'aria-current': 'true', style: 'font-weight:700', text: label });
+    }
+    var button = el('button', { type: 'button', class: 'link', text: label });
+    button.addEventListener('click', function () { loadBrowse(path); });
+    return button;
+  }
+
+  function renderEntries(data) {
+    var list = $('entries');
+    clear(list);
+
+    if (data.parent !== null && data.parent !== undefined) {
+      var up = el('button', { type: 'button', class: 'row' }, [
+        el('span', { class: 'kind', text: 'up' }),
+        el('span', { class: 'nm', text: 'Back to ' + (data.parent ? data.parent : 'iCloud Drive') })
+      ]);
+      up.addEventListener('click', function () { loadBrowse(data.parent); });
+      list.appendChild(el('li', {}, [up]));
+    }
+
+    var entries = data.entries || [];
+    if (entries.length === 0) {
+      list.appendChild(el('li', {}, [el('span', { class: 'row muted', text: 'This folder is empty.' })]));
+    }
+
+    entries.forEach(function (entry) {
+      var isDir = entry.kind === 'dir';
+      var size = el('span', { class: 'sz', text: entry.kind === 'dir' ? '' : fmtBytes(entry.size) });
+      var kind = el('span', { class: 'kind', text: entry.kind === 'package' ? 'bundle' : entry.kind });
+      var name = el('span', { class: 'nm', text: entry.name });
+      var row;
+      if (isDir) {
+        row = el('button', { type: 'button', class: 'row' }, [kind, name, size]);
+        row.addEventListener('click', function () {
+          loadBrowse(browsePath ? browsePath + '/' + entry.name : entry.name);
+        });
+      } else {
+        row = el('span', { class: 'row', 'aria-disabled': 'true' }, [kind, name, size]);
+      }
+      list.appendChild(el('li', {}, [row]));
+    });
+
+    var dirs = entries.filter(function (e) { return e.kind === 'dir'; }).length;
+    var files = entries.length - dirs;
+    $('browse-note').textContent =
+      fmtCount(dirs) + ' ' + plural(dirs, 'folder') + ', ' + fmtCount(files) + ' ' +
+      plural(files, 'file') + ' here. Downloading takes this whole folder, including ' +
+      'everything inside it.';
+  }
+
+  function currentFolderLabel() {
+    if (!browsePath) { return 'everything in iCloud Drive'; }
+    var parts = browsePath.split('/');
+    return parts[parts.length - 1];
+  }
+
+  function updateDownloadButton() {
+    $('download-btn').textContent = browsePath
+      ? 'Download “' + currentFolderLabel() + '”'
+      : 'Download everything in iCloud Drive';
+    var busy = jobRunning();
+    $('download-btn').disabled = busy;
+    $('guard-btn').disabled = busy;
+    $('vanish-btn').disabled = busy;
+  }
+
+  /* ---------------- reports ---------------- */
+
+  function renderReports() {
+    var jobs = [state && state.job, state && state.last];
+    jobs.forEach(function (job) {
+      if (!job || job.state !== 'done' || !job.result) { return; }
+      if (job.kind === 'guard' && renderedReports.guard !== job.id) {
+        renderedReports.guard = job.id;
+        renderGuard(job.result);
+      }
+      if (job.kind === 'vanish' && renderedReports.vanish !== job.id) {
+        renderedReports.vanish = job.id;
+        renderVanish(job.result);
+      }
+    });
+    updateDownloadButton();
+  }
+
+  /* ---- guard ---- */
+
+  function renderGuard(report) {
+    var host = $('guard-report');
+    clear(host);
+
+    var totals = report.totals || {};
+    var complete = report.complete === true;
+    var unknownSized = totals.evicted_unknown_size || 0;
+    var evictedBytes = totals.evicted_bytes;
+    var evictedFiles = totals.evicted_files || 0;
+
+    /* --- coverage first: an incomplete check is never dressed as a pass --- */
+    if (!complete) {
+      var gap = el('div', { class: 'notice warn' });
+      gap.appendChild(el('h3', { text: 'This check was partial' }));
+      gap.appendChild(el('p', {
+        text: 'Part of this folder could not be examined, so the number below describes only ' +
+              'the part iFetch could see. It is not a clean bill of health, and it is not a ' +
+              'total. Here is exactly what was not checked:'
+      }));
+      var reasons = el('ul');
+      (report.signals_unavailable || []).forEach(function (item) {
+        reasons.appendChild(el('li', {}, [
+          el('strong', { text: 'The “' + item.signal + '” test could not run here. ' }),
+          item.reason || ''
+        ]));
+      });
+      var unreadable = report.unreadable || [];
+      if (unreadable.length) {
+        reasons.appendChild(el('li', {}, [
+          el('strong', {
+            text: fmtCount(unreadable.length) + ' ' + plural(unreadable.length, 'path') +
+                  ' could not be read at all, so ' + plural(unreadable.length, 'it was', 'they were') +
+                  ' not counted in either direction: '
+          }),
+          unreadable.slice(0, 8).map(function (u) { return u.path + ' (' + u.error + ')'; }).join('; ') +
+          (unreadable.length > 8 ? '; … and ' + fmtCount(unreadable.length - 8) + ' more' : '')
+        ]));
+      }
+      gap.appendChild(reasons);
+      host.appendChild(gap);
+    }
+
+    /* --- the headline --- */
+    var alarm = isNum(evictedBytes) && evictedBytes > 0;
+    var head = el('div', { class: 'headline ' + (alarm ? 'alarm' : (complete ? 'clean' : '')) });
+
+    if (alarm) {
+      head.appendChild(el('div', { class: 'big', text: (complete ? '' : 'At least ') + fmtBytes(evictedBytes) }));
+      head.appendChild(el('p', {
+        text: 'exists only on Apple’s servers and is in none of your backups. ' +
+              fmtCount(evictedFiles) + ' ' + plural(evictedFiles, 'file') + ' ' +
+              plural(evictedFiles, 'has', 'have') + ' a name, a date and a size on this disk, ' +
+              'and no contents. Anything that copies files by reading them — Time Machine, ' +
+              'Backblaze, Arq, Carbon Copy Cloner, rsync — copies the empty shell and ' +
+              'reports success.'
+      }));
+    } else if (isNum(evictedBytes)) {
+      head.appendChild(el('div', { class: 'big', text: complete ? 'Nothing missing' : 'Nothing missing here' }));
+      head.appendChild(el('p', {
+        text: complete
+          ? 'Every file examined has its contents on this disk, so a backup of this folder would copy real bytes.'
+          : 'Every file iFetch could examine has its contents on this disk. That is not the same as ' +
+            'the folder being clean, because the check above was partial.'
+      }));
+    }
+
+    var quals = [];
+    if (unknownSized > 0) {
+      quals.push(fmtCount(unknownSized) + ' of those files recorded no size, so the figure above ' +
+                 'is a floor, not a total — the real number can only be larger.');
+    }
+    if (!complete) {
+      quals.push('The scan did not examine everything, so this is a floor, not a total.');
+    }
+    if (report.symlinks && report.symlinks.length) {
+      quals.push(fmtCount(report.symlinks.length) + ' ' + plural(report.symlinks.length, 'symlink') +
+                 ' ' + plural(report.symlinks.length, 'was', 'were') + ' not followed, so ' +
+                 plural(report.symlinks.length, 'its', 'their') + ' target is not counted above.');
+    }
+    quals.forEach(function (line) { head.appendChild(el('p', { class: 'qual', text: line })); });
+    host.appendChild(el('div', { class: 'card' }, [head]));
+
+    /* --- accounting --- */
+    var body = el('div', { class: 'card stack' });
+    body.appendChild(el('h2', { text: 'Where the bytes are' }));
+    body.appendChild(statGrid([
+      ['Files examined', fmtCount(totals.files)],
+      ['Size in Finder', fmtBytes(totals.logical_bytes)],
+      ['Really on disk', fmtBytes(totals.resident_bytes)],
+      ['Only in iCloud', fmtBytes(totals.evicted_bytes)]
+    ]));
+
+    var meta = el('dl', { class: 'kv' });
+    [['Folder', report.root], ['Checked on', report.platform || UNKNOWN],
+     ['Run at', report.generated_at || UNKNOWN]].forEach(function (pair) {
+      meta.appendChild(el('dt', { text: pair[0] }));
+      meta.appendChild(el('dd', { class: 'mono', text: pair[1] || UNKNOWN }));
+    });
+    body.appendChild(meta);
+
+    var signals = report.signals_available || [];
+    if (signals.length) {
+      var sig = el('ul', { class: 'small' });
+      signals.forEach(function (s) {
+        sig.appendChild(el('li', {}, [
+          el('strong', { text: s.signal + ' (' + s.confidence + '): ' }), s.evidence || ''
+        ]));
+      });
+      body.appendChild(el('div', {}, [el('h3', { text: 'How it can tell' }), sig]));
+    }
+    host.appendChild(body);
+
+    var folders = report.by_folder || [];
+    if (folders.length) {
+      host.appendChild(reportTable('By top-level folder',
+        ['Folder', 'Only in iCloud', 'On disk', 'Evicted files', 'Files'],
+        folders.slice(0, 40).map(function (a) {
+          return [
+            { text: a.label, cls: 'path' },
+            { text: fmtBytes(a.evicted_bytes), cls: 'num' },
+            { text: fmtBytes(a.resident_bytes), cls: 'num' },
+            { text: fmtCount(a.evicted_files), cls: 'num' },
+            { text: fmtCount(a.files), cls: 'num' }
+          ];
+        })));
+    }
+
+    var evicted = (report.evicted || []).slice().sort(function (a, b) {
+      var au = !isNum(a.size), bu = !isNum(b.size);
+      if (au !== bu) { return au ? 1 : -1; }
+      return (b.size || 0) - (a.size || 0);
+    });
+    if (evicted.length) {
+      host.appendChild(reportTable('Largest files that are not really here',
+        ['Size', 'Confidence', 'Evidence', 'Path'],
+        evicted.slice(0, 50).map(function (e) {
+          return [
+            { text: fmtBytes(e.size), cls: 'num' },
+            { text: e.confidence, cls: '' },
+            { text: e.evidence, cls: '' },
+            { text: e.path, cls: 'path' }
+          ];
+        }),
+        evicted.length > 50 ? 'Showing the 50 largest of ' + fmtCount(evicted.length) + '.' : ''));
+    }
+  }
+
+  /* ---- vanish ---- */
+
+  var CLASS_INFO = {
+    lost: {
+      title: 'Lost',
+      blurb: 'Gone from iCloud and not on this disk. This is real data loss, and the only ' +
+             'group worth raising your voice about.'
+    },
+    placeholder_only: {
+      title: 'Placeholder only',
+      blurb: 'Gone from iCloud, and the local copy is an empty shell — full size in Finder, ' +
+             'no contents. Looks like the safe case, behaves like the lost one.'
+    },
+    ambiguous: {
+      title: 'Ambiguous',
+      blurb: 'It may not have vanished at all — it may have been renamed or moved. iFetch ' +
+             'could not prove which, and is not going to guess.'
+    },
+    safe_local_copy: {
+      title: 'Safe local copy',
+      blurb: 'Gone from iCloud, still on this disk. Nothing lost.'
+    }
+  };
+  var CLASS_ORDER = ['lost', 'placeholder_only', 'ambiguous', 'safe_local_copy'];
+
+  function renderVanish(report) {
+    var host = $('vanish-report');
+    clear(host);
+
+    var baseline = report.baseline || {};
+    var breaker = report.breaker || {};
+
+    /* --- no baseline: an absence of evidence, not a pass --- */
+    if (baseline.present === false) {
+      host.appendChild(noticeBlock('warn', 'There is nothing to compare against', [
+        'This index holds no earlier record of what iCloud contained, so nothing can be ' +
+        'reported as vanished. That is not a clean bill of health — it is an absence of ' +
+        'evidence. Download or scan once to establish a baseline, then ask again.'
+      ]));
+      host.appendChild(vanishFooter(report));
+      return;
+    }
+
+    /* --- the circuit breaker outranks the findings --- */
+    if (report.refused === true || breaker.tripped === true) {
+      var refusal = el('div', { class: 'notice bad' });
+      refusal.appendChild(el('h3', { text: 'Refused: these are not being reported as deletions' }));
+      refusal.appendChild(el('p', {
+        text: breaker.detail ||
+              'This result is too suspicious to present as a set of deletions.'
+      }));
+      refusal.appendChild(el('p', {
+        text: 'A listing failure, a partial walk, an expired session or a drive that never ' +
+              'mounted all look exactly like a mass deletion from here, and are likelier. ' +
+              'The findings are being withheld rather than shown as deletions, because ' +
+              'showing them is the mistake this check exists to prevent.'
+      }));
+      var alts = report.breaker && report.breaker.cannot_rule_out || [];
+      if (alts.length) {
+        refusal.appendChild(el('p', { text: 'What this could be instead — none of it ruled out:' }));
+        var altList = el('ul');
+        alts.forEach(function (a) { altList.appendChild(el('li', { text: a })); });
+        refusal.appendChild(altList);
+      }
+      refusal.appendChild(el('p', {
+        class: 'small',
+        text: 'Fix the evidence — re-scan, re-connect the drive, sign in again — and run ' +
+              'this check once more.'
+      }));
+      host.appendChild(el('div', { class: 'card' }, [refusal]));
+      host.appendChild(vanishFooter(report));
+      return;
+    }
+
+    /* --- findings --- */
+    var counts = report.counts || {};
+    var items = report.items || [];
+    var loud = (counts.lost || 0) + (counts.placeholder_only || 0);
+
+    var head = el('div', { class: 'headline ' + (loud > 0 ? 'alarm' : 'clean') });
+    if (items.length === 0) {
+      head.appendChild(el('div', { class: 'big', text: 'Nothing has vanished' }));
+      head.appendChild(el('p', { text: 'Every file in the baseline is still listed by iCloud.' }));
+    } else {
+      head.appendChild(el('div', { class: 'big', text: fmtCount(items.length) }));
+      head.appendChild(el('p', {
+        text: plural(items.length, 'file', 'files') + ' in your local record ' +
+              plural(items.length, 'is', 'are') + ' no longer listed by iCloud' +
+              (loud > 0 ? ', and ' + fmtCount(loud) + ' of them ' +
+                          plural(loud, 'has', 'have') + ' no usable copy on this disk.' : '.')
+      }));
+      head.appendChild(el('p', {
+        class: 'qual',
+        text: 'Their combined size is ' + fmtBytes(report.total_bytes) +
+              (report.files_without_a_recorded_size > 0
+                ? ', but ' + fmtCount(report.files_without_a_recorded_size) + ' of them recorded no ' +
+                  'size, so that is a floor, not a total.'
+                : '.')
+      }));
+    }
+    host.appendChild(el('div', { class: 'card' }, [head]));
+
+    if (items.length) {
+      var clock = el('div', { class: 'notice' });
+      clock.appendChild(el('h3', { text: 'Every date below is the latest possible date, not an exact one' }));
+      clock.appendChild(el('p', {
+        text: 'iFetch does not know when these files were deleted. It knows when it first ' +
+              'observed them missing, and a deletion happens at or before it is noticed. iCloud ' +
+              'purges its Trash roughly ' + fmtCount(report.trash_retention_days) + ' days after ' +
+              'a delete, so each instant below is an upper bound: the cloud copy is gone no ' +
+              'later than that, quite possibly sooner. It is a ceiling, not an appointment.'
+      }));
+      if (report.soonest_purge_deadline_before_iso) {
+        clock.appendChild(el('p', {}, [
+          el('strong', { text: 'Soonest of these: gone from iCloud’s Trash at or before ' +
+                               fmtWhen(report.soonest_purge_deadline_before_iso,
+                                       report.soonest_purge_deadline_before) + '.' })
+        ]));
+      }
+      host.appendChild(el('div', { class: 'card' }, [clock]));
+    }
+
+    CLASS_ORDER.forEach(function (cls) {
+      var group = items.filter(function (i) { return i.classification === cls; });
+      if (!group.length) { return; }
+      var info = CLASS_INFO[cls];
+      var card = el('div', { class: 'card stack' });
+      card.appendChild(el('h2', {}, [
+        el('span', { class: 'tag ' + cls, text: info.title }),
+        ' · ' + fmtCount(group.length) + ' ' + plural(group.length, 'file')
+      ]));
+      card.appendChild(el('p', { class: 'small muted', text: info.blurb }));
+      card.appendChild(tableEl(
+        ['Size', 'Purged from iCloud at or before', 'Path'],
+        group.slice(0, 100).map(function (i) {
+          return [
+            { text: fmtBytes(i.size), cls: 'num' },
+            { text: i.purge_deadline_before_iso
+                ? 'at or before ' + fmtWhen(i.purge_deadline_before_iso, i.purge_deadline_before)
+                : UNKNOWN, cls: '' },
+            { text: i.path, cls: 'path' }
+          ];
+        })));
+      if (group.length > 100) {
+        card.appendChild(el('p', { class: 'small muted', text: 'Showing 100 of ' + fmtCount(group.length) + '.' }));
+      }
+      host.appendChild(card);
+    });
+
+    var moved = report.moved_not_deleted || [];
+    if (moved.length) {
+      host.appendChild(noticeBlock('', fmtCount(moved.length) + ' ' + plural(moved.length, 'file') +
+        ' moved rather than disappeared', [
+        'These were proven to be the same file in a new place, so they are not counted as ' +
+        'deletions above.'
+      ]));
+    }
+
+    host.appendChild(vanishFooter(report));
+  }
+
+  function vanishFooter(report) {
+    var card = el('div', { class: 'card stack' });
+    var baseline = report.baseline || {};
+    var scan = report.scan || {};
+
+    card.appendChild(el('h2', { text: 'What this was compared against' }));
+    var meta = el('dl', { class: 'kv' });
+    [
+      ['Local copy', report.root || UNKNOWN],
+      ['Baseline', (baseline.description || UNKNOWN) + ' (' + fmtCount(baseline.count) + ' files)'],
+      ['iCloud scan', scan.usable === true
+        ? 'usable · ' + fmtCount(scan.item_count) + ' items · ' + fmtWhen(scan.finished_at_iso, scan.finished_at)
+        : 'not usable as evidence'],
+      ['Run at', report.generated_at || UNKNOWN]
+    ].forEach(function (pair) {
+      meta.appendChild(el('dt', { text: pair[0] }));
+      meta.appendChild(el('dd', { text: pair[1] }));
+    });
+    card.appendChild(meta);
+
+    var problems = (scan.problems || []).concat();
+    if (problems.length) {
+      card.appendChild(noticeBlock('warn', 'Problems with the evidence itself', problems));
+    }
+    var unexamined = report.unexamined || [];
+    if (unexamined.length) {
+      var lines = unexamined.map(function (u) {
+        return u.what + ' (' + u.count + '): ' + u.why;
+      });
+      card.appendChild(noticeBlock('warn', 'Not examined', lines));
+    }
+    var notes = report.notes || [];
+    if (notes.length) {
+      var noteList = el('ul', { class: 'small muted' });
+      notes.forEach(function (n) { noteList.appendChild(el('li', { text: n })); });
+      card.appendChild(noteList);
+    }
+    return card;
+  }
+
+  function noticeBlock(kind, title, lines) {
+    var node = el('div', { class: 'notice' + (kind ? ' ' + kind : '') });
+    node.appendChild(el('h3', { text: title }));
+    var list = el('ul');
+    lines.forEach(function (line) { list.appendChild(el('li', { text: line })); });
+    if (lines.length === 1) { node.appendChild(el('p', { text: lines[0] })); }
+    else { node.appendChild(list); }
+    return node;
+  }
+
+  function tableEl(headers, rows) {
+    var thead = el('thead', {}, [el('tr', {}, headers.map(function (h) { return el('th', { text: h }); }))]);
+    var tbody = el('tbody', {}, rows.map(function (cells) {
+      return el('tr', {}, cells.map(function (c) { return el('td', { class: c.cls || '', text: c.text }); }));
+    }));
+    return el('div', { class: 'tablewrap' }, [el('table', {}, [thead, tbody])]);
+  }
+
+  function reportTable(title, headers, rows, footnote) {
+    var card = el('div', { class: 'card stack' });
+    card.appendChild(el('h2', { text: title }));
+    card.appendChild(tableEl(headers, rows));
+    if (footnote) { card.appendChild(el('p', { class: 'small muted', text: footnote })); }
+    return card;
+  }
+
+  /* =====================================================================
+     Actions
+     ===================================================================== */
+
+  async function act(button, errorNode, run) {
+    setError(errorNode, '');
+    var label = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Working…';
+    try {
+      await run();
+      pokeSoon();
+    } catch (err) {
+      if (!handleTransport(err)) { setError(errorNode, err.message); }
+    }
+    button.textContent = label;
+    button.disabled = false;
+  }
+
+  $('email-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var email = $('email').value.trim();
+    if (!email) { setError($('email-error'), 'Type the email address of your Apple ID first.'); return; }
+    act($('email-submit'), $('email-error'), async function () {
+      var reply = await postAuthStart(email);
+      if (reply.state === 'needs_2fa') {
+        show($('twofa-step'), true);
+        $('code').value = '';
+        focusedCode = true;
+        $('code').focus();
+      }
+    });
+  });
+
+  $('twofa-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var code = $('code').value.trim();
+    if (!/^[0-9]{6}$/.test(code)) {
+      setError($('twofa-error'), 'The code is six digits. Check your Apple device and type all six.');
+      return;
+    }
+    act($('code-submit'), $('twofa-error'), async function () {
+      try {
+        await postAuth2fa(code);
+      } catch (err) {
+        // A wrong code leaves the session at needs_2fa: clear the box, keep the step.
+        $('code').value = '';
+        $('code').focus();
+        throw err;
+      }
+    });
+  });
+
+  $('restart-signin').addEventListener('click', function () {
+    show($('twofa-step'), false);
+    focusedCode = false;
+    $('email').disabled = false;
+    $('email-submit').disabled = false;
+    $('email').focus();
+    setError($('twofa-error'), '');
+    postSignout().catch(function () { /* already signed out is fine */ });
+    pokeSoon();
+  });
+
+  $('signout-btn').addEventListener('click', function () {
+    act($('signout-btn'), $('app-error'), async function () {
+      await postSignout();
+      browseLoaded = false;
+      renderedReports = { guard: null, vanish: null, download: null };
+      clear($('guard-report'));
+      clear($('vanish-report'));
+      clear($('progress-region'));
+      lastJobKey = '';
+    });
+  });
+
+  $('download-btn').addEventListener('click', function () {
+    var dest = $('dest').value.trim();
+    if (!dest) { setError($('download-error'), 'Type the folder on this computer to save into.'); return; }
+    act($('download-btn'), $('download-error'), async function () {
+      await postDownload(browsePath, dest);
+      lastJobKey = '';
+    });
+  });
+
+  $('guard-btn').addEventListener('click', function () {
+    var path = $('guard-path').value.trim();
+    if (!path) { setError($('guard-error'), 'Type the folder you want checked.'); return; }
+    act($('guard-btn'), $('guard-error'), async function () {
+      renderedReports.guard = null;
+      clear($('guard-report'));
+      await postGuard(path);
+      lastJobKey = '';
+    });
+  });
+
+  $('vanish-btn').addEventListener('click', function () {
+    var path = $('vanish-path').value.trim();
+    if (!path) { setError($('vanish-error'), 'Type the folder holding your local copy.'); return; }
+    act($('vanish-btn'), $('vanish-error'), async function () {
+      renderedReports.vanish = null;
+      clear($('vanish-report'));
+      await postVanish(path);
+      lastJobKey = '';
+    });
+  });
+
+  async function onCancel(event) {
+    // The progress card this button lives in is re-rendered on every poll, so
+    // any error goes to a node that outlives it.
+    await act(event.currentTarget, $('app-error'), async function () {
+      await postCancel();
+      lastJobKey = '';
+    });
+  }
+
+  ['dest', 'guard-path', 'vanish-path'].forEach(function (id, index) {
+    var key = ['dest', 'guard', 'vanish'][index];
+    $(id).addEventListener('input', function () { touched[key] = true; });
+  });
+
+  /* ---- tabs ---- */
+  var tabButtons = Array.prototype.slice.call(document.querySelectorAll('[role="tab"]'));
+  function selectTab(name) {
+    tab = name;
+    tabButtons.forEach(function (button) {
+      var on = button.getAttribute('data-tab') === name;
+      button.setAttribute('aria-selected', on ? 'true' : 'false');
+      button.tabIndex = on ? 0 : -1;
+      show($('panel-' + button.getAttribute('data-tab')), on);
+    });
+  }
+  tabButtons.forEach(function (button, index) {
+    button.addEventListener('click', function () { selectTab(button.getAttribute('data-tab')); });
+    button.addEventListener('keydown', function (event) {
+      var delta = event.key === 'ArrowRight' ? 1 : (event.key === 'ArrowLeft' ? -1 : 0);
+      if (!delta) { return; }
+      event.preventDefault();
+      var next = tabButtons[(index + delta + tabButtons.length) % tabButtons.length];
+      selectTab(next.getAttribute('data-tab'));
+      next.focus();
+    });
+  });
+  selectTab('download');
+
+  /* ---- go ---- */
+  poll();
+})();
+</script>
+</body>
+</html>
