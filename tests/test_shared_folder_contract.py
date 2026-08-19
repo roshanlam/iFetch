@@ -249,8 +249,15 @@ class TestSharedFallbackIsAttempted:
         # The zone must be in the path, not invented.
         assert "com.apple.CloudDocs" in first["url"]
 
-    def test_a_node_with_no_share_id_does_not_attempt_the_fallback(self, manager):
-        """An ordinary owned file that 404s is a different problem."""
+    def test_a_node_with_no_share_id_anywhere_does_not_attempt_the_fallback(self, manager):
+        """An ordinary owned file that 404s is a different problem.
+
+        "No shareID" here means none on the node *and* none inherited from an
+        ancestor - this node was never reached through a share root. That
+        distinction is the whole of iFetch #15: a file inside somebody else's
+        shared folder also arrives with no shareID of its own, and it must
+        reach the fallback. See :class:`TestShareContextReachesDescendants`.
+        """
         calls = []
 
         def handler(url, params):
@@ -412,3 +419,312 @@ class TestRecordedFixtures:
         """Apple returns one or the other; code that assumes both would be wrong."""
         assert "package_token" not in DATA_TOKEN_RESPONSE
         assert "data_token" not in PACKAGE_TOKEN_RESPONSE
+
+
+# ---------------------------------------------------------------------------
+# iFetch #15 / rclone #9477: the share context has to survive the descent
+# ---------------------------------------------------------------------------
+
+class SharedFolderNode:
+    """A shared folder whose children arrive exactly as pyicloud builds them.
+
+    ``DriveNode.get_children()`` constructs each child from Apple's raw item
+    payload and injects nothing::
+
+        DriveNode(self.connection, item_data)
+
+    Apple does not repeat ``shareID`` on those items, so every descendant of a
+    share root is born without one. This fake reproduces that faithfully - a
+    helpful fake that copied the identifier down would make the tests below
+    pass while the real defect survived.
+    """
+
+    type = "folder"
+
+    def __init__(self, name="Oeuvres", share_id="SHARE-ABC", children=None):
+        self.name = name
+        self.data = {
+            "drivewsid": f"FOLDER::com.apple.CloudDocs::{name}",
+            "docwsid": f"DOC-{name}",
+            "zone": "com.apple.CloudDocs",
+            "type": "FOLDER",
+        }
+        if share_id is not None:
+            self.data["shareID"] = share_id
+        self._children = {c.name: c for c in (children or [])}
+
+    def dir(self):
+        return list(self._children)
+
+    def __getitem__(self, name):
+        return self._children[name]
+
+
+def bare_child(name="JAB-007.jxl", docwsid="DOC-JAB"):
+    """A file inside a share: no shareID of its own, because Apple sends none."""
+    node = SharedNode(name=name, docwsid=docwsid)
+    node.data.pop("shareID")
+    return node
+
+
+class TestShareContextReachesDescendants:
+    """The regression for issue #15, at the level the user actually hit it.
+
+    The unit-level behaviour of the inheritance rule lives in
+    ``tests/test_sharing.py``. What these assert is that iFetch's *traversal*
+    applies it, on both paths that resolve a child - because a rule that is
+    never invoked fixes nothing.
+    """
+
+    @staticmethod
+    def _share_tree():
+        leaf = bare_child()
+        subfolder = SharedFolderNode("Photoshoot", share_id=None, children=[leaf])
+        root = SharedFolderNode("Oeuvres", share_id="SHARE-ABC", children=[subfolder])
+        return root, subfolder, leaf
+
+    def test_the_fake_reproduces_the_defect_it_is_testing(self):
+        """Pins the premise: children really do arrive without a shareID."""
+        root, subfolder, leaf = self._share_tree()
+        assert root.data["shareID"] == "SHARE-ABC"
+        assert "shareID" not in subfolder.data
+        assert "shareID" not in leaf.data
+
+    def test_walking_to_a_file_carries_the_share_id_down(self, manager):
+        mgr, _ = manager()
+        root, _, _ = self._share_tree()
+
+        subfolder = mgr._resolve_child(root, "Photoshoot")
+        leaf = mgr._resolve_child(subfolder, "JAB-007.jxl")
+
+        assert subfolder.data["shareID"] == "SHARE-ABC"
+        assert leaf.data["shareID"] == "SHARE-ABC"
+
+    def test_the_seeded_key_is_the_one_pyicloud_reads_for_listings(self, manager):
+        """Seeding fixes the HTTP 400 on the next listing, not just the download.
+
+        pyicloud does ``get_node_data(drivewsid, self.data.get("shareID"))``
+        when it fetches children, so a subfolder that carries the identifier
+        can be listed. That is rclone #9477's symptom, repaired in passing.
+        """
+        mgr, _ = manager()
+        root, _, _ = self._share_tree()
+        subfolder = mgr._resolve_child(root, "Photoshoot")
+        assert subfolder.data.get("shareID") == "SHARE-ABC"
+
+    def test_an_inherited_file_now_reaches_the_fallback(self, manager):
+        """Before the fix this file's shareID was None and Strategy 1 was skipped."""
+        calls = []
+
+        def handler(url, params):
+            calls.append(params)
+            return RecordedResponse(payload=DATA_TOKEN_RESPONSE)
+
+        service = SharedDriveService(RecordingDriveSession({"get": handler}))
+        mgr, _ = manager()
+        attach_drive(mgr, service)
+
+        root, _, _ = self._share_tree()
+        subfolder = mgr._resolve_child(root, "Photoshoot")
+        leaf = mgr._resolve_child(subfolder, "JAB-007.jxl")
+
+        mgr._try_shared_open(leaf)
+
+        assert calls, "the inherited shareID never reached the download request"
+        assert calls[0]["shareID"] == "SHARE-ABC"
+        assert calls[0]["document_id"] == "DOC-JAB"
+
+    def test_the_recursive_download_walk_inherits_too(self, manager):
+        """process_item_parallel resolves children with ``item[name]`` directly.
+
+        That bypasses ``_resolve_child`` entirely, so the descent needs its own
+        inheritance step - and this is the path a real ``ifetch <folder>`` run
+        takes, which is to say the one issue #15 was filed against.
+        """
+        mgr, root_dir = manager()
+        attach_drive(mgr, SharedDriveService(RecordingDriveSession({})))
+        share_root, _, leaf = self._share_tree()
+
+        mgr.process_item_parallel(share_root, root_dir / "Oeuvres", "Oeuvres")
+
+        assert leaf.data.get("shareID") == "SHARE-ABC"
+
+    def test_a_nested_share_keeps_its_own_identifier(self, manager):
+        """A share inside a share overrides; it must not be masked by the outer one."""
+        mgr, _ = manager()
+        inner_leaf = bare_child("inner.txt", docwsid="DOC-INNER")
+        inner = SharedFolderNode("Inner", share_id="SHARE-INNER", children=[inner_leaf])
+        outer = SharedFolderNode("Outer", share_id="SHARE-OUTER", children=[inner])
+
+        resolved_inner = mgr._resolve_child(outer, "Inner")
+        resolved_leaf = mgr._resolve_child(resolved_inner, "inner.txt")
+
+        assert resolved_inner.data["shareID"] == "SHARE-INNER"
+        assert resolved_leaf.data["shareID"] == "SHARE-INNER"
+
+    def test_owned_content_gains_no_share_keys(self, manager):
+        """The unshared path must be untouched by any of this."""
+        mgr, _ = manager()
+        leaf = bare_child("report.pdf", docwsid="DOC-OWNED")
+        owned = SharedFolderNode("Documents", share_id=None, children=[leaf])
+
+        resolved = mgr._resolve_child(owned, "report.pdf")
+
+        assert "shareID" not in resolved.data
+
+    def test_nfd_named_children_inherit_as_well(self, manager):
+        """Apple returns NFD; the user types NFC. Share context must survive both."""
+        mgr, _ = manager()
+        leaf = bare_child("Café.pdf", docwsid="DOC-NFD")
+        share_root = SharedFolderNode("Shared", share_id="SHARE-ABC", children=[leaf])
+
+        resolved = mgr._resolve_child(share_root, "Café.pdf")
+
+        assert resolved.data["shareID"] == "SHARE-ABC"
+
+
+class TestExhaustedFallbackIsDiagnosable:
+    """Every strategy used to fail into ``except Exception: pass``.
+
+    A user reporting "still 404" then gave us nothing: no way to tell which
+    strategies ran, which were skipped for want of a precondition, or how each
+    one failed. That silence is also what this codebase's own rule forbids -
+    anything that could not be examined is named, not dropped.
+    """
+
+    def test_exhausting_every_strategy_reports_what_each_one_did(self, manager, caplog):
+        service = SharedDriveService(RecordingDriveSession({
+            "get": RecordedResponse(payload={}, status_code=404),
+        }))
+        mgr, _ = manager()
+        attach_drive(mgr, service)
+
+        with caplog.at_level("WARNING"):
+            assert mgr._try_shared_open(SharedNode()) is None
+
+        record = _exhausted_record(caplog)
+        assert record is not None, "no shared_open_exhausted record was logged"
+        strategies = {a["strategy"] for a in record["attempts"]}
+        assert strategies == {
+            "by_id_with_share",
+            "drivewsid_as_document_id",
+            "refresh_node_metadata",
+        }
+
+    def test_a_rejected_request_records_the_status_code(self, manager, caplog):
+        service = SharedDriveService(RecordingDriveSession({
+            "get": RecordedResponse(payload={}, status_code=423),
+        }))
+        mgr, _ = manager()
+        attach_drive(mgr, service)
+
+        with caplog.at_level("WARNING"):
+            mgr._try_shared_open(SharedNode())
+
+        attempts = _exhausted_record(caplog)["attempts"]
+        by_id = next(a for a in attempts if a["strategy"] == "by_id_with_share")
+        assert by_id["outcome"] == "rejected"
+        assert "423" in by_id["detail"]
+
+    def test_a_skipped_strategy_names_the_missing_precondition(self, manager, caplog):
+        mgr, _ = manager()
+        attach_drive(mgr, SharedDriveService(RecordingDriveSession({})))
+
+        node = SharedNode()
+        node.data.pop("shareID")
+        with caplog.at_level("WARNING"):
+            mgr._try_shared_open(node)
+
+        attempts = _exhausted_record(caplog)["attempts"]
+        by_id = next(a for a in attempts if a["strategy"] == "by_id_with_share")
+        assert by_id["outcome"] == "skipped"
+        assert "shareID" in by_id["detail"]
+
+    def test_a_missing_share_id_states_the_likely_cause(self, manager, caplog):
+        mgr, _ = manager()
+        attach_drive(mgr, SharedDriveService(RecordingDriveSession({})))
+
+        node = SharedNode()
+        node.data.pop("shareID")
+        with caplog.at_level("WARNING"):
+            mgr._try_shared_open(node)
+
+        record = _exhausted_record(caplog)
+        assert record["share_id_present"] is False
+        assert "inherited during traversal" in record["likely_cause"]
+
+    def test_an_inherited_identifier_is_reported_as_inherited(self, manager, caplog):
+        """Owned and inherited fail differently and must not read the same."""
+        service = SharedDriveService(RecordingDriveSession({
+            "get": RecordedResponse(payload={}, status_code=404),
+        }))
+        mgr, _ = manager()
+        attach_drive(mgr, service)
+
+        leaf = bare_child()
+        share_root = SharedFolderNode("Shared", share_id="SHARE-ABC", children=[leaf])
+        resolved = mgr._resolve_child(share_root, "JAB-007.jxl")
+
+        with caplog.at_level("WARNING"):
+            mgr._try_shared_open(resolved)
+
+        record = _exhausted_record(caplog)
+        assert record["share_id_present"] is True
+        assert "inherited" in record["share_evidence"]
+
+    def test_a_raised_error_is_recorded_rather_than_swallowed(self, manager, caplog):
+        def boom(url, params):
+            raise RuntimeError("connection reset by peer")
+
+        service = SharedDriveService(RecordingDriveSession({"get": boom}))
+        mgr, _ = manager()
+        attach_drive(mgr, service)
+
+        with caplog.at_level("WARNING"):
+            mgr._try_shared_open(SharedNode())
+
+        attempts = _exhausted_record(caplog)["attempts"]
+        by_id = next(a for a in attempts if a["strategy"] == "by_id_with_share")
+        assert by_id["outcome"] == "error"
+        assert "connection reset by peer" in by_id["detail"]
+
+    def test_a_success_logs_no_exhaustion_record(self, manager, caplog):
+        service = SharedDriveService(RecordingDriveSession({
+            "get": RecordedResponse(payload=DATA_TOKEN_RESPONSE),
+        }))
+        mgr, _ = manager()
+        attach_drive(mgr, service)
+
+        with caplog.at_level("WARNING"):
+            assert mgr._try_shared_open(SharedNode()) is not None
+
+        assert _exhausted_record(caplog) is None
+
+    def test_a_multiline_apple_error_stays_on_one_line(self, manager, caplog):
+        """Apple's bodies are multi-line JSON; a run's worth must stay readable."""
+        def boom(url, params):
+            raise RuntimeError(json.dumps(WS_OBJECT_NOT_FOUND, indent=2))
+
+        service = SharedDriveService(RecordingDriveSession({"get": boom}))
+        mgr, _ = manager()
+        attach_drive(mgr, service)
+
+        with caplog.at_level("WARNING"):
+            mgr._try_shared_open(SharedNode())
+
+        attempts = _exhausted_record(caplog)["attempts"]
+        by_id = next(a for a in attempts if a["strategy"] == "by_id_with_share")
+        assert "\n" not in by_id["detail"]
+        assert len(by_id["detail"]) <= 200
+
+
+def _exhausted_record(caplog):
+    """Return the parsed ``shared_open_exhausted`` log payload, if one was emitted."""
+    for record in caplog.records:
+        try:
+            payload = json.loads(record.getMessage())
+        except (ValueError, TypeError):
+            continue
+        if payload.get("event") == "shared_open_exhausted":
+            return payload
+    return None
