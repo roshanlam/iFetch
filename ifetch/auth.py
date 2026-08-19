@@ -23,10 +23,30 @@ and over:
    the real cookie expiry off disk so a run can warn *days before* the token
    dies, and exit non-zero while there is still time to act.
 
+4. **Advanced Data Protection.**  With ADP on, Apple encrypts iCloud Drive
+   end-to-end and refuses every web-API request that does not carry a *PCS*
+   (Per-Service Encryption) cookie.  Obtaining one is a separate gate from 2FA:
+   it needs "Access iCloud Data on the Web" enabled and an approval tapped on a
+   trusted device.  :func:`ensure_pcs_cookies` performs that request/approve/
+   poll exchange with a bounded, injectable clock, and every way it can fail is
+   turned into a named cause by :func:`classify_auth_error`.
+
 Everything here is deliberately usable without a network connection: the
 diagnosis of local session state, the expiry arithmetic and the error
 classification are pure functions over on-disk data and exception text, which is
 also what makes them testable.
+
+What is *verified*, and what is not
+-----------------------------------
+The ADP code below has **never been run against a live ADP-enabled Apple ID**,
+because provisioning one for CI is not possible.  It is validated in
+``tests/test_adp.py`` against *replayed* responses - the payload shapes taken
+from Apple's own web client and from two independent working implementations
+(pyicloud's ``_request_pcs_for_service`` and rclone's ``acquirePCSCookiesFor``).
+Those tests prove that iFetch takes the right branch on the payloads we believe
+Apple sends, and nothing more.  Anywhere the observed field names are not a
+documented API this module reports "could not determine" rather than guessing;
+that is deliberate, and it is the only honest position available.
 """
 
 from __future__ import annotations
@@ -207,6 +227,97 @@ def resolve_password(
 
 
 # ---------------------------------------------------------------------------
+# Per-service encryption (PCS) vocabulary and secret redaction
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PCSService:
+    """One iCloud service and the PCS cookies Apple issues for it.
+
+    ``app_name`` is the value Apple's ``requestPCS`` endpoint expects; it is not
+    the same string as the web-service key, and getting it wrong yields a
+    perfectly successful-looking response that sets no cookie at all.  Both
+    values are taken from Apple's own web client and match the two independent
+    implementations we cross-checked (pyicloud and rclone).
+    """
+
+    key: str
+    app_name: str
+    webservice: str
+    cookies: Tuple[str, ...]
+
+
+#: The services iFetch can obtain PCS cookies for.  Photos is listed because the
+#: cookie set differs (Apple issues two, and a client that checks only one
+#: reports success while sharing still fails); ``ifetch-photos`` can use it.
+PCS_SERVICES: Dict[str, PCSService] = {
+    "drive": PCSService(
+        key="drive",
+        app_name="iclouddrive",
+        webservice="drivews",
+        cookies=("X-APPLE-WEBAUTH-PCS-Documents",),
+    ),
+    "photos": PCSService(
+        key="photos",
+        app_name="photos",
+        webservice="ckdatabasews",
+        cookies=("X-APPLE-WEBAUTH-PCS-Photos", "X-APPLE-WEBAUTH-PCS-Sharing"),
+    ),
+}
+
+DEFAULT_PCS_SERVICE = "drive"
+
+#: Every cookie name that is a credential in its own right.
+PCS_COOKIE_NAMES = frozenset(
+    name for service in PCS_SERVICES.values() for name in service.cookies
+)
+
+REDACTED = "<redacted>"
+
+#: ``NAME=value`` for any Apple web-auth cookie.  Matching on the *name* rather
+#: than on a remembered value is what makes redaction work for a secret we have
+#: never seen - a value that arrives in an error body we merely pass through.
+_COOKIE_ASSIGNMENT = re.compile(
+    r"(X-APPLE-WEBAUTH-(?:PCS-[A-Za-z]+|TOKEN|VALIDATE))\s*=\s*[^;,\s\"'\\]+",
+    re.IGNORECASE,
+)
+
+
+def pcs_service(name: Optional[str] = None) -> PCSService:
+    """Look up a :class:`PCSService` by key, rejecting unknown names loudly."""
+    key = (name or DEFAULT_PCS_SERVICE).strip().lower()
+    if key not in PCS_SERVICES:
+        raise ValueError(
+            f"unknown iCloud service {name!r}; expected one of "
+            f"{', '.join(sorted(PCS_SERVICES))}"
+        )
+    return PCS_SERVICES[key]
+
+
+def redact_secrets(text: Any, values: Sequence[str] = ()) -> str:
+    """Strip cookie values out of arbitrary text.
+
+    A PCS cookie is a bearer credential for end-to-end-encrypted data: anything
+    holding one can read the account's files.  It must therefore never reach a
+    log file, a ``--json`` report, or an exception message that a user will
+    paste into a bug tracker.  Rather than trusting every call site to remember
+    that, every string that leaves this module through an error or a summary is
+    passed through here first.
+
+    ``values`` lets a caller name secrets whose *format* is not recognisable -
+    the raw cookie values it happens to hold - so they are removed even when
+    they appear without their cookie name attached.
+    """
+    result = str(text or "")
+    for value in values:
+        if value and len(str(value)) >= 8:
+            # A short "value" is far more likely to be a status word than a
+            # secret; blanking it would corrupt the message it appears in.
+            result = result.replace(str(value), REDACTED)
+    return _COOKIE_ASSIGNMENT.sub(lambda m: f"{m.group(1)}={REDACTED}", result)
+
+
+# ---------------------------------------------------------------------------
 # Failure classification
 # ---------------------------------------------------------------------------
 
@@ -245,12 +356,78 @@ def classify_auth_error(error: Any) -> AuthFailure:
     request`` with a sentence a person can act on.  Matching is done on lowered
     substrings because the underlying libraries surface these conditions as
     unstructured text in several different shapes.
+
+    An exception that already carries a classification (:class:`ADPError`) is
+    passed through untouched: re-deriving a cause from our own prose would be a
+    strictly worse answer than the one we already computed.
     """
-    text = str(error or "")
+    carried = getattr(error, "failure", None)
+    if isinstance(carried, AuthFailure):
+        return carried
+
+    text = redact_secrets(str(error or ""))
     low = text.lower()
 
     # Ordered most-specific first: several of these conditions can co-occur in
-    # one message and the first match must be the one that is actionable.
+    # one message and the first match must be the one that is actionable.  The
+    # three ADP shapes come before the generic PCS-cookie rule because each of
+    # them contains the substrings that rule matches on.
+    if WEBAUTH_COOKIE.lower() in low:
+        return AuthFailure(
+            code="adp_webauth_token_missing",
+            summary=(
+                f"The session has no {WEBAUTH_COOKIE} cookie, so Apple treats it "
+                "as signed out. Nothing was encrypted or refused - the request "
+                "never carried a usable web session in the first place."
+            ),
+            remedy=(
+                "Run 'ifetch auth renew --reset' to sign in again and rebuild the "
+                "cookie jar. If this recurs on every run, the stored cookie jar is "
+                "not being written: check that the --cookie-directory is writable "
+                "and is not a container layer that is discarded on exit."
+            ),
+            raw=text,
+        )
+
+    if "requestpcs" in low or "unable to request pcs access" in low:
+        return AuthFailure(
+            code="adp_request_pcs_failed",
+            summary=(
+                "Apple's requestPCS exchange did not complete, so no per-service "
+                "encryption cookie was issued for this account. This is the "
+                "Advanced Data Protection approval step, not two-factor sign-in."
+            ),
+            remedy=(
+                "Approve the 'iCloud Data on the Web' prompt on a trusted Apple "
+                "device (it appears within a few seconds of the request), then "
+                "re-run 'ifetch auth renew --adp'. If no prompt ever appears, "
+                "turn Settings > [your name] > iCloud > 'Access iCloud Data on "
+                "the Web' off and on again to re-arm it."
+            ),
+            raw=text,
+        )
+
+    if "access icloud data on the web" in low and (
+        "off" in low or "disabled" in low or "not enabled" in low
+    ):
+        return AuthFailure(
+            code="adp_web_access_disabled",
+            summary=(
+                "Apple reports that 'Access iCloud Data on the Web' is turned off "
+                "for this account. With Advanced Data Protection enabled that "
+                "setting is what authorises any web/API client at all, so no "
+                "amount of re-authentication will help until it is on."
+            ),
+            remedy=(
+                "On a trusted Apple device: Settings > [your name] > iCloud > "
+                "'Access iCloud Data on the Web' -> ON (macOS: System Settings > "
+                "[your name] > iCloud > Access iCloud Data on the Web). Then run "
+                "'ifetch auth renew --adp'. The change can take a few minutes to "
+                "propagate."
+            ),
+            raw=text,
+        )
+
     if "pcs" in low and "cookie" in low or "423" in low and "locked" in low:
         return AuthFailure(
             code="adp_pcs_cookies",
@@ -262,8 +439,8 @@ def classify_auth_error(error: Any) -> AuthFailure:
             remedy=(
                 "On an Apple device: Settings > [your name] > iCloud > "
                 "'Access iCloud Data on the Web' must be ON. If Advanced Data "
-                "Protection is on, approve the prompt that appears on a trusted "
-                "device, then re-run 'ifetch auth renew'. Changes can take a few "
+                "Protection is on, run 'ifetch auth renew --adp' and approve the "
+                "prompt that appears on a trusted device. Changes can take a few "
                 "minutes to propagate."
             ),
             raw=text,
@@ -398,6 +575,10 @@ class SessionSnapshot:
     #: When the session file was last written; the best available proxy for
     #: "when was this token issued" if the cookie expiry is unreadable.
     session_written_at: Optional[float] = None
+    #: Expiry of each stored PCS cookie, by name.  A name maps to ``None`` when
+    #: the cookie is present but carries no expiry, which is not the same thing
+    #: as being absent and must not be collapsed into it.
+    pcs_expiries: Dict[str, Optional[float]] = field(default_factory=dict)
     read_errors: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -411,6 +592,9 @@ class SessionSnapshot:
             "has_trust_token": self.has_trust_token,
             "webauth_expires_at": self.webauth_expires_at,
             "session_written_at": self.session_written_at,
+            # Names and expiries only.  The values are credentials and are never
+            # read off disk by this module, let alone serialised.
+            "pcs_cookies": dict(self.pcs_expiries),
             "read_errors": list(self.read_errors),
         }
 
@@ -450,37 +634,59 @@ def read_session_snapshot(
 
     if snapshot.cookiejar_path.exists():
         snapshot.exists = True
-        snapshot.webauth_expires_at = _read_webauth_expiry(
-            snapshot.cookiejar_path, snapshot.read_errors
-        )
+        expiries = _read_cookie_expiries(snapshot.cookiejar_path, snapshot.read_errors)
+        snapshot.webauth_expires_at = expiries.get(WEBAUTH_COOKIE)
+        snapshot.pcs_expiries = {
+            name: value for name, value in expiries.items() if name in PCS_COOKIE_NAMES
+        }
 
     return snapshot
 
 
-def _read_webauth_expiry(path: Path, errors: List[str]) -> Optional[float]:
-    """Read the expiry of the web-auth cookie from an LWP-format cookie jar.
+def _read_cookie_expiries(
+    path: Path, errors: List[str]
+) -> Dict[str, Optional[float]]:
+    """Read the expiry of every cookie iFetch cares about from an LWP jar.
 
     ``ignore_expires=True`` is essential: an already-expired cookie must still
     be loaded, because reporting *how long ago* a session died is the whole
     point of the diagnostic.
+
+    A cookie present but empty is reported as an error *and* omitted from the
+    result.  That combination is deliberate: a truncated write leaves exactly
+    that shape, and treating it as "present" would make the next run skip
+    re-acquisition and fail against Apple instead.
     """
+    interesting = {WEBAUTH_COOKIE} | set(PCS_COOKIE_NAMES)
     jar = LWPCookieJar(str(path))
     try:
         jar.load(ignore_discard=True, ignore_expires=True)
     except (OSError, ValueError) as exc:
         errors.append(f"load cookie jar: {exc}")
-        return None
+        return {}
 
-    expiries = [
-        float(cookie.expires)
-        for cookie in jar
-        if cookie.name == WEBAUTH_COOKIE and cookie.expires
-    ]
-    if not expiries:
-        return None
-    # Several cookies can share the name across domains; the session survives
-    # as long as the longest-lived one.
-    return max(expiries)
+    found: Dict[str, Optional[float]] = {}
+    for cookie in jar:
+        if cookie.name not in interesting:
+            continue
+        if not cookie.value:
+            errors.append(
+                f"stored {cookie.name} cookie has no value; treating it as absent"
+            )
+            continue
+        expires = float(cookie.expires) if cookie.expires else None
+        if cookie.name in found:
+            previous = found[cookie.name]
+            # Several cookies can share a name across domains; the session
+            # survives as long as the longest-lived one.  A cookie with no
+            # expiry outlives every dated one, so it wins.
+            if previous is None or expires is None:
+                found[cookie.name] = None
+            else:
+                found[cookie.name] = max(previous, expires)
+        else:
+            found[cookie.name] = expires
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +984,903 @@ class TwoFactorResolver:
 
 
 # ---------------------------------------------------------------------------
+# Advanced Data Protection: status, cookie state, acquisition
+# ---------------------------------------------------------------------------
+#
+# Division of labour with pyicloud
+# --------------------------------
+# pyicloud already owns: SRP sign-in, 2FA, the trust token, the requests
+# session, and the cookie jar on disk - *including* the PCS cookies, which Apple
+# sets with ordinary ``Set-Cookie`` headers on the shared session.  It also
+# performs its own ``requestPCS`` attempt whenever ``api.drive`` is touched.
+#
+# What it does not do is anything a person can act on: its loop sleeps on the
+# real clock for a fixed 5s x 10, it cannot be told to wait longer for someone
+# to walk to their phone, and every failure exits as
+# ``PyiCloudAPIResponseException("Unable to request PCS access!")``, which is
+# the opaque-error problem this module exists to fix.
+#
+# So iFetch drives the exchange itself - through pyicloud's authenticated
+# session, so the cookies land in pyicloud's jar and are persisted by pyicloud's
+# existing mechanism - and adds: a bounded wait with backoff and an injectable
+# clock, a service-scoped cookie check, three distinct named diagnoses, and
+# redaction.  No second credential store is introduced anywhere.
+
+#: How long, by default, to keep waiting for someone to approve the prompt on a
+#: trusted device.  Five minutes matches rclone; it is long enough to fetch a
+#: phone from another room and short enough that a cron job does not wedge.
+DEFAULT_PCS_TIMEOUT = 300.0
+
+#: A hard cap on requests, independent of the clock.  Both bounds are enforced:
+#: an injected clock that never advances must still terminate the loop.
+DEFAULT_PCS_MAX_ATTEMPTS = 30
+
+#: Polling starts fast (approval is often instant) and backs off, so a five
+#: minute wait costs a handful of requests rather than one every two seconds.
+PCS_INITIAL_INTERVAL = 2.0
+PCS_MAX_INTERVAL = 15.0
+PCS_BACKOFF = 1.5
+
+#: Apple's setup endpoints, relative to the account's setup web service.
+PCS_WEB_ACCESS_STATE_PATH = "requestWebAccessState"
+PCS_ENABLE_CONSENT_PATH = "enableDeviceConsentForPCS"
+PCS_REQUEST_PATH = "requestPCS"
+
+#: ``requestPCS`` answers with one of these while the trusted device has not
+#: finished uploading the keys.  They mean "not ready", not "failed".
+PCS_PENDING_MESSAGES = (
+    "requested the device to upload cookies",
+    "cookies not available yet on server",
+    "waiting for device",
+)
+
+#: Field names observed in Apple's ``requestWebAccessState`` payload.  This is
+#: not a documented API, so several spellings are accepted and a payload that
+#: carries none of them yields "undetermined" rather than a guess.
+_WEB_ACCESS_KEYS = ("isWebAccessAllowed", "isWebAccessEnabled", "webAccessEnabled")
+
+ADP_ON = "on"
+ADP_OFF = "off"
+ADP_UNDETERMINED = "undetermined"
+
+WEB_ACCESS_ENABLED = "enabled"
+WEB_ACCESS_DISABLED = "disabled"
+WEB_ACCESS_UNDETERMINED = "undetermined"
+
+CONSENT_GRANTED = "granted"
+CONSENT_PENDING = "pending"
+CONSENT_UNDETERMINED = "undetermined"
+
+PCS_ACQUIRED = "acquired"
+PCS_ALREADY_PRESENT = "already_present"
+PCS_NOT_REQUIRED = "not_required"
+PCS_UNDETERMINED = "undetermined"
+
+
+class ADPError(Exception):
+    """A named, redacted ADP failure.
+
+    Carries the :class:`AuthFailure` that explains it, so callers report the
+    cause and the remedy rather than re-deriving them from the message text.
+    The message itself is redacted at construction: an ADP error is raised in
+    the middle of handling a credential, and this is the one exception in the
+    program most likely to be pasted into a public bug report.
+    """
+
+    def __init__(self, failure: AuthFailure):
+        self.failure = failure
+        super().__init__(redact_secrets(f"{failure.summary} {failure.remedy}"))
+
+
+@dataclass(frozen=True)
+class ADPStatus:
+    """What is known - and, explicitly, what is not - about ADP on an account.
+
+    Three fields are tri-state on purpose.  "Could not determine" is a real
+    answer here: Apple exposes no documented "is ADP on" flag, and reporting
+    ``off`` because a field was missing would be the single most damaging lie
+    this module could tell, since it would send a user hunting for a
+    non-existent problem while their real one goes unnamed.
+    """
+
+    state: str = ADP_UNDETERMINED
+    web_access: str = WEB_ACCESS_UNDETERMINED
+    device_consent: str = CONSENT_UNDETERMINED
+    detail: str = ""
+    #: What we looked at to reach this conclusion.
+    evidence: Tuple[str, ...] = ()
+    #: What we could *not* look at.  Never empty when anything was skipped:
+    #: "no problem found" must not be able to mean "I could not look".
+    unchecked: Tuple[str, ...] = ()
+
+    @property
+    def undetermined(self) -> bool:
+        return self.state == ADP_UNDETERMINED
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "state": self.state,
+            "web_access": self.web_access,
+            "device_consent": self.device_consent,
+            "detail": self.detail,
+            "evidence": list(self.evidence),
+            "unchecked": list(self.unchecked),
+        }
+
+
+def interpret_web_access_state(payload: Any) -> ADPStatus:
+    """Read Apple's ``requestWebAccessState`` answer.
+
+    ``isICDRSDisabled`` is the signal both pyicloud and Apple's own web client
+    key off: ICDRS is the iCloud Data Recovery Service, and turning on Advanced
+    Data Protection is precisely what disables it.  So ``isICDRSDisabled: true``
+    means "this account's data is end-to-end encrypted and a PCS cookie is
+    required"; ``false`` means an ordinary account that needs none.
+
+    A payload that is not a dict, or that carries none of the fields we know,
+    produces an undetermined status naming what was missing.
+    """
+    if not isinstance(payload, dict):
+        return ADPStatus(
+            detail=(
+                "Apple's web-access state response was not a JSON object, so "
+                "nothing could be concluded from it."
+            ),
+            unchecked=("requestWebAccessState returned an unreadable payload",),
+        )
+
+    evidence: List[str] = []
+    unchecked: List[str] = []
+
+    state = ADP_UNDETERMINED
+    icdrs = payload.get("isICDRSDisabled")
+    if isinstance(icdrs, bool):
+        state = ADP_ON if icdrs else ADP_OFF
+        evidence.append(f"isICDRSDisabled={icdrs}")
+    else:
+        unchecked.append(
+            "isICDRSDisabled was absent from Apple's web-access state response, "
+            "so whether Advanced Data Protection is enabled is unknown"
+        )
+
+    web_access = WEB_ACCESS_UNDETERMINED
+    for key in _WEB_ACCESS_KEYS:
+        value = payload.get(key)
+        if isinstance(value, bool):
+            web_access = WEB_ACCESS_ENABLED if value else WEB_ACCESS_DISABLED
+            evidence.append(f"{key}={value}")
+            break
+    else:
+        unchecked.append(
+            "Apple's web-access state response named no web-access field "
+            f"({', '.join(_WEB_ACCESS_KEYS)}), so whether 'Access iCloud Data on "
+            "the Web' is enabled could not be read directly"
+        )
+
+    consent = CONSENT_UNDETERMINED
+    consented = payload.get("isDeviceConsentedForPCS")
+    if isinstance(consented, bool):
+        consent = CONSENT_GRANTED if consented else CONSENT_PENDING
+        evidence.append(f"isDeviceConsentedForPCS={consented}")
+    else:
+        unchecked.append(
+            "isDeviceConsentedForPCS was absent, so whether a trusted device has "
+            "already consented is unknown"
+        )
+
+    if state == ADP_ON:
+        detail = (
+            "Apple reports iCloud Data Recovery Service disabled, which is what "
+            "Advanced Data Protection does; this account needs a PCS cookie."
+        )
+    elif state == ADP_OFF:
+        detail = (
+            "Apple reports iCloud Data Recovery Service enabled, so Advanced "
+            "Data Protection is off and no PCS cookie is needed."
+        )
+    else:
+        detail = (
+            "Apple answered the web-access state request but not with a field "
+            "that says whether Advanced Data Protection is enabled."
+        )
+
+    return ADPStatus(
+        state=state,
+        web_access=web_access,
+        device_consent=consent,
+        detail=detail,
+        evidence=tuple(evidence),
+        unchecked=tuple(unchecked),
+    )
+
+
+def adp_status_from_webservices(
+    webservices: Any,
+    service: Optional[PCSService] = None,
+) -> ADPStatus:
+    """Derive ADP status from the account payload iFetch already holds.
+
+    ``pcsRequired`` rides along on the web-service descriptor Apple returns from
+    ``accountLogin``/``validate``, which pyicloud has already fetched by the
+    time any of this runs.  Reading it therefore costs **no additional
+    request**, which is what lets a non-ADP account take exactly the path it
+    took before: we look at what we have, see ``false``, and stop.
+    """
+    target = service or pcs_service()
+    if webservices is None:
+        return ADPStatus(
+            detail=(
+                "iFetch has no account web-service description for this session, "
+                "so it cannot tell whether Apple requires a PCS cookie."
+            ),
+            unchecked=(
+                "the account's webservices payload was not available "
+                "(sign in first, or pass --adp to attempt the flow regardless)",
+            ),
+        )
+    if not isinstance(webservices, dict):
+        return ADPStatus(
+            detail="The account's web-service description was not a JSON object.",
+            unchecked=("webservices payload was unreadable",),
+        )
+
+    descriptor = webservices.get(target.webservice)
+    if not isinstance(descriptor, dict):
+        return ADPStatus(
+            detail=(
+                f"Apple's account description lists no '{target.webservice}' web "
+                f"service, so whether {target.key} needs a PCS cookie is unknown."
+            ),
+            unchecked=(
+                f"webservices['{target.webservice}'] was absent from the account "
+                "payload",
+            ),
+        )
+
+    required = descriptor.get("pcsRequired")
+    if not isinstance(required, bool):
+        return ADPStatus(
+            detail=(
+                f"Apple's '{target.webservice}' descriptor carries no pcsRequired "
+                "flag, so whether a PCS cookie is needed is unknown."
+            ),
+            unchecked=(
+                f"webservices['{target.webservice}'].pcsRequired was absent",
+            ),
+        )
+
+    if required:
+        return ADPStatus(
+            state=ADP_ON,
+            detail=(
+                f"Apple marks the {target.key} service pcsRequired, which it does "
+                "for accounts with Advanced Data Protection enabled."
+            ),
+            evidence=(f"webservices['{target.webservice}'].pcsRequired=True",),
+        )
+    return ADPStatus(
+        state=ADP_OFF,
+        detail=(
+            f"Apple does not mark the {target.key} service pcsRequired, so this "
+            "account does not use per-service encryption for it."
+        ),
+        evidence=(f"webservices['{target.webservice}'].pcsRequired=False",),
+    )
+
+
+def _merge_status(first: ADPStatus, second: ADPStatus) -> ADPStatus:
+    """Combine two partial readings, preferring a determined answer to neither.
+
+    Contradictions are not smoothed over: if the two sources disagree the result
+    is undetermined and both readings are kept as evidence, because a client
+    that picks a winner between two disagreeing signals is guessing.
+    """
+    if first.state == ADP_UNDETERMINED:
+        state = second.state
+    elif second.state == ADP_UNDETERMINED or second.state == first.state:
+        state = first.state
+    else:
+        state = ADP_UNDETERMINED
+
+    def pick(a: str, b: str, undetermined: str) -> str:
+        return b if a == undetermined else a
+
+    return ADPStatus(
+        state=state,
+        web_access=pick(second.web_access, first.web_access, WEB_ACCESS_UNDETERMINED),
+        device_consent=pick(
+            second.device_consent, first.device_consent, CONSENT_UNDETERMINED
+        ),
+        detail=second.detail or first.detail,
+        evidence=tuple(first.evidence) + tuple(second.evidence),
+        unchecked=tuple(first.unchecked) + tuple(second.unchecked),
+    )
+
+
+# -- stored cookie state ----------------------------------------------------
+
+@dataclass(frozen=True)
+class PCSCookieState:
+    """Which PCS cookies are on disk for a service, and whether they are alive."""
+
+    service: str
+    present: Tuple[str, ...] = ()
+    missing: Tuple[str, ...] = ()
+    expires_at: Optional[float] = None
+    expired: bool = False
+    read_errors: Tuple[str, ...] = ()
+
+    @property
+    def usable(self) -> bool:
+        """True when a re-run can proceed without asking for approval again."""
+        return not self.missing and not self.expired
+
+    @property
+    def detail(self) -> str:
+        if self.missing and not self.present:
+            return (
+                f"No PCS cookie is stored for {self.service}. If this account "
+                "has Advanced Data Protection enabled, the next run will need "
+                "approval on a trusted device."
+            )
+        if self.missing:
+            return (
+                f"Only part of the PCS cookie set for {self.service} is stored "
+                f"(missing: {', '.join(self.missing)}). Apple issues them "
+                "together, so this session will be refused."
+            )
+        if self.expired:
+            return (
+                f"The stored PCS cookie for {self.service} has expired; the next "
+                "run will re-request it and may need approval on a trusted device."
+            )
+        return f"A live PCS cookie for {self.service} is stored and will be reused."
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "service": self.service,
+            "present": list(self.present),
+            "missing": list(self.missing),
+            "expires_at": (
+                None
+                if self.expires_at is None
+                else datetime.fromtimestamp(self.expires_at, timezone.utc).isoformat()
+            ),
+            "expired": self.expired,
+            "read_errors": list(self.read_errors),
+            "detail": self.detail,
+        }
+
+
+def pcs_cookie_state(
+    snapshot: SessionSnapshot,
+    service: Optional[str] = None,
+    now: Optional[float] = None,
+) -> PCSCookieState:
+    """Report the stored PCS cookies for ``service`` from a session snapshot.
+
+    This is what makes an unattended re-run possible: the cookie Apple issued
+    last time is already in pyicloud's jar, so a run that finds a live one never
+    asks anybody to approve anything.  Expiry needs no enforcement of ours -
+    ``http.cookiejar`` drops expired cookies when the jar is loaded, so the next
+    run simply does not see one and re-requests it.  This function reads the jar
+    with ``ignore_expires=True`` for the opposite reason: a *diagnostic* must be
+    able to say "it expired two days ago" rather than "there isn't one".
+
+    A corrupt or empty entry was dropped by :func:`_read_cookie_expiries` and
+    surfaces here as missing plus a named read error - discarded cleanly, never
+    crashed on.
+    """
+    target = pcs_service(service)
+    current = time.time() if now is None else now
+
+    present: List[str] = []
+    missing: List[str] = []
+    expiries: List[float] = []
+    unbounded = False
+    for name in target.cookies:
+        if name in snapshot.pcs_expiries:
+            present.append(name)
+            value = snapshot.pcs_expiries[name]
+            if value is None:
+                unbounded = True
+            else:
+                expiries.append(float(value))
+        else:
+            missing.append(name)
+
+    # The set expires when its earliest member does; a cookie without an expiry
+    # never forces a refresh on its own.
+    expires_at = min(expiries) if expiries else None
+    expired = bool(expires_at is not None and expires_at <= current)
+    if unbounded and not expiries:
+        expires_at = None
+
+    relevant = tuple(
+        error
+        for error in snapshot.read_errors
+        if any(name in error for name in target.cookies)
+    )
+    return PCSCookieState(
+        service=target.key,
+        present=tuple(present),
+        missing=tuple(missing),
+        expires_at=expires_at,
+        expired=expired,
+        read_errors=relevant,
+    )
+
+
+# -- acquisition ------------------------------------------------------------
+
+@dataclass
+class PCSResult:
+    """The outcome of an attempt to make PCS cookies available for a service.
+
+    ``requests_made`` is part of the contract, not debug output: "a non-ADP
+    account issues no extra requests" is a promise that can only be kept if it
+    can be asserted, and this is what the regression test asserts on.
+    """
+
+    service: str
+    status: str
+    detail: str = ""
+    attempts: int = 0
+    requests_made: int = 0
+    waited_seconds: float = 0.0
+    cookies_present: Tuple[str, ...] = ()
+    cookies_missing: Tuple[str, ...] = ()
+    adp: ADPStatus = field(default_factory=ADPStatus)
+
+    @property
+    def acquired(self) -> bool:
+        return self.status == PCS_ACQUIRED
+
+    def to_dict(self) -> Dict[str, Any]:
+        """A summary safe to print, log and serialise.
+
+        Cookie *names* only.  No value ever enters this dictionary, which is why
+        the JSON report can be pasted into an issue.
+        """
+        return {
+            "service": self.service,
+            "status": self.status,
+            "detail": redact_secrets(self.detail),
+            "attempts": self.attempts,
+            "requests_made": self.requests_made,
+            "waited_seconds": round(self.waited_seconds, 2),
+            "cookies_present": list(self.cookies_present),
+            "cookies_missing": list(self.cookies_missing),
+            "adp": self.adp.to_dict(),
+        }
+
+
+class PyiCloudPCSTransport:
+    """Adapts a ``PyiCloudService`` to the three calls the PCS flow needs.
+
+    Deliberately thin.  It borrows pyicloud's *authenticated* session, so the
+    cookies Apple returns land in pyicloud's jar and are persisted by pyicloud's
+    own save-after-request path; iFetch stores nothing of its own.  The
+    alternative - a second HTTP client with a second cookie store - would mean
+    two places to expire, two places to corrupt and two places to leak from.
+    """
+
+    def __init__(self, service: Any):
+        self._service = service
+
+    # -- reads ---------------------------------------------------------
+    def cookie_names(self) -> List[str]:
+        """Names of the cookies the live session currently holds.
+
+        Values are never read.  There is no reason for this module to touch
+        one, and not touching it is the cheapest possible guarantee that it
+        cannot be logged.
+        """
+        jar = getattr(getattr(self._service, "session", None), "cookies", None)
+        if jar is None:
+            return []
+        try:
+            return [cookie.name for cookie in jar]
+        except TypeError:
+            return list(getattr(jar, "keys", list)())
+
+    def webservices(self) -> Optional[Dict[str, Any]]:
+        """The account's web-service map, or ``None`` when it is not known yet."""
+        data = getattr(self._service, "data", None)
+        if not isinstance(data, dict):
+            return None
+        services = data.get("webservices")
+        return services if isinstance(services, dict) else None
+
+    # -- writes --------------------------------------------------------
+    def post(self, path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+        session = getattr(self._service, "session", None)
+        if session is None:
+            raise RuntimeError(
+                "This iCloud session cannot make requests, so the Advanced Data "
+                "Protection flow could not be attempted."
+            )
+        endpoint = getattr(self._service, "_setup_endpoint", None)
+        if not endpoint:
+            raise RuntimeError(
+                "This iCloud session exposes no setup endpoint, so the Advanced "
+                "Data Protection flow could not be attempted."
+            )
+        params = getattr(self._service, "params", None)
+        response = session.post(f"{endpoint}/{path}", json=payload, params=params)
+        return response.json()
+
+    def persist(self) -> None:
+        """Flush the cookie jar.
+
+        pyicloud already saves after every request; this is belt-and-braces for
+        the case where a caller supplied a bare session, and it must never turn
+        a successful acquisition into a failure.
+        """
+        jar = getattr(getattr(self._service, "session", None), "cookies", None)
+        save = getattr(jar, "save", None)
+        if save is None:
+            return
+        try:
+            save()
+        except (OSError, ValueError):
+            pass
+
+
+def _is_pending(message: str) -> bool:
+    low = (message or "").lower()
+    return any(marker in low for marker in PCS_PENDING_MESSAGES)
+
+
+def _pcs_failure(code: str, summary: str, remedy: str, raw: str = "") -> AuthFailure:
+    return AuthFailure(
+        code=code,
+        summary=redact_secrets(summary),
+        remedy=redact_secrets(remedy),
+        raw=redact_secrets(raw),
+    )
+
+
+_APPROVE_ON_DEVICE = (
+    "Approve the 'iCloud Data on the Web' prompt on a trusted Apple device, "
+    "then re-run 'ifetch auth renew --adp'."
+)
+
+
+def ensure_pcs_cookies(
+    transport: Any,
+    service: Optional[str] = None,
+    *,
+    force: bool = False,
+    timeout: float = DEFAULT_PCS_TIMEOUT,
+    max_attempts: int = DEFAULT_PCS_MAX_ATTEMPTS,
+    initial_interval: float = PCS_INITIAL_INTERVAL,
+    max_interval: float = PCS_MAX_INTERVAL,
+    backoff: float = PCS_BACKOFF,
+    now: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+    log: Optional[Callable[[str], None]] = None,
+) -> PCSResult:
+    """Make PCS cookies available for ``service``, or explain why they are not.
+
+    The flow, in the order Apple requires it:
+
+    1. **Do nothing if nothing is needed.**  If the session already carries the
+       cookies, or Apple's own ``pcsRequired`` flag - which we already hold, at
+       no request cost - says this service does not use per-service encryption,
+       this returns immediately having issued *zero* requests.  Without ``force``
+       we also refuse to proceed on no evidence at all: an account we cannot
+       classify is left exactly as it was, and told so.
+    2. **Check web access.**  ``requestWebAccessState`` is what distinguishes
+       "Access iCloud Data on the Web is off" from every other ADP failure, and
+       it is the one condition no amount of retrying will fix.
+    3. **Ask for device consent** when Apple says it has not been given.
+    4. **Poll ``requestPCS``** until Apple says success, bounded by both a
+       deadline and an attempt cap, sleeping with backoff in between.
+
+    ``derivedFromUserAction`` is sent only on the first request.  That flag is
+    what makes Apple push the approval prompt to trusted devices; repeating it
+    on every poll would re-notify the user once per attempt.
+
+    Raises :class:`ADPError` - never a bare Apple error - for every failure,
+    with a distinct code per cause.  Returns a :class:`PCSResult` otherwise.
+    """
+    target = pcs_service(service)
+    emit = log or (lambda message: None)
+
+    def held() -> Tuple[List[str], List[str]]:
+        names = set(transport.cookie_names())
+        return (
+            [c for c in target.cookies if c in names],
+            [c for c in target.cookies if c not in names],
+        )
+
+    present, missing = held()
+    if not missing and not force:
+        return PCSResult(
+            service=target.key,
+            status=PCS_ALREADY_PRESENT,
+            detail=(
+                f"The session already carries the PCS cookies for {target.key}; "
+                "no approval was needed."
+            ),
+            cookies_present=tuple(present),
+            adp=ADPStatus(
+                detail=(
+                    "A PCS cookie is already held. That does not by itself say "
+                    "whether Advanced Data Protection is enabled."
+                ),
+                evidence=("session already holds the PCS cookie set",),
+                unchecked=(
+                    "Apple was not asked for the account's web-access state, "
+                    "because nothing needed to be acquired",
+                ),
+            ),
+        )
+
+    status = adp_status_from_webservices(transport.webservices(), target)
+
+    if not force:
+        if status.state == ADP_OFF:
+            return PCSResult(
+                service=target.key,
+                status=PCS_NOT_REQUIRED,
+                detail=(
+                    f"Apple does not require a PCS cookie for {target.key} on "
+                    "this account, so nothing was requested."
+                ),
+                cookies_present=tuple(present),
+                cookies_missing=tuple(missing),
+                adp=status,
+            )
+        if status.state == ADP_UNDETERMINED:
+            return PCSResult(
+                service=target.key,
+                status=PCS_UNDETERMINED,
+                detail=(
+                    "iFetch could not determine whether this account needs a PCS "
+                    "cookie, so it changed nothing and made no request. Pass "
+                    "--adp to attempt the Advanced Data Protection flow anyway."
+                ),
+                cookies_present=tuple(present),
+                cookies_missing=tuple(missing),
+                adp=status,
+            )
+
+    requests_made = 0
+    emit(
+        f"Advanced Data Protection: requesting per-service encryption access for "
+        f"{target.key}."
+    )
+
+    web_state = _post(transport, PCS_WEB_ACCESS_STATE_PATH, None, target)
+    requests_made += 1
+    status = _merge_status(status, interpret_web_access_state(web_state))
+
+    if status.web_access == WEB_ACCESS_DISABLED:
+        raise ADPError(
+            _pcs_failure(
+                code="adp_web_access_disabled",
+                summary=(
+                    "Apple reports that 'Access iCloud Data on the Web' is turned "
+                    "off for this account. With Advanced Data Protection enabled "
+                    "that setting is what authorises any web or API client, so no "
+                    "credential iFetch can obtain will work until it is on."
+                ),
+                remedy=(
+                    "On a trusted Apple device: Settings > [your name] > iCloud > "
+                    "'Access iCloud Data on the Web' -> ON (macOS: System Settings "
+                    "> [your name] > iCloud > Access iCloud Data on the Web). Then "
+                    "run 'ifetch auth renew --adp'. Allow a few minutes for the "
+                    "change to propagate."
+                ),
+                raw=json.dumps(web_state, default=str)[:500],
+            )
+        )
+
+    if not force and status.state == ADP_OFF:
+        # Apple's authoritative answer arrived only now; believe it over the
+        # webservices flag and stop rather than requesting a cookie nothing needs.
+        return PCSResult(
+            service=target.key,
+            status=PCS_NOT_REQUIRED,
+            detail=(
+                "Apple reports Advanced Data Protection is not in force for this "
+                "account, so no PCS cookie was requested."
+            ),
+            requests_made=requests_made,
+            cookies_present=tuple(present),
+            cookies_missing=tuple(missing),
+            adp=status,
+        )
+
+    if status.device_consent == CONSENT_PENDING:
+        emit("Advanced Data Protection: asking a trusted device for consent.")
+        consent = _post(transport, PCS_ENABLE_CONSENT_PATH, None, target)
+        requests_made += 1
+        if not (isinstance(consent, dict) and consent.get("isDeviceConsentNotificationSent")):
+            raise ADPError(
+                _pcs_failure(
+                    code="adp_consent_not_sent",
+                    summary=(
+                        "Apple declined to send the Advanced Data Protection "
+                        "consent request to a trusted device, so approval can "
+                        "never arrive and waiting for it would be pointless."
+                    ),
+                    remedy=(
+                        "Confirm at least one Apple device is signed in to this "
+                        "Apple ID, online, and running a current OS; then re-run "
+                        "'ifetch auth renew --adp'. Devices too old to support "
+                        "Advanced Data Protection cannot approve this request."
+                    ),
+                    raw=json.dumps(consent, default=str)[:500],
+                )
+            )
+
+    deadline = now() + max(0.0, timeout)
+    attempts = 0
+    waited = 0.0
+    last_message = ""
+
+    while True:
+        attempts += 1
+        payload = _post(
+            transport,
+            PCS_REQUEST_PATH,
+            {
+                "appName": target.app_name,
+                # Only the first request claims a user action; see docstring.
+                "derivedFromUserAction": attempts == 1,
+            },
+            target,
+        )
+        requests_made += 1
+
+        state = str((payload or {}).get("status") or "").lower() if isinstance(payload, dict) else ""
+        message = str((payload or {}).get("message") or "") if isinstance(payload, dict) else ""
+
+        if state == "success":
+            transport.persist()
+            present, missing = held()
+            if missing:
+                raise ADPError(
+                    _pcs_failure(
+                        code="adp_pcs_cookies_not_set",
+                        summary=(
+                            "Apple reported the per-service encryption request "
+                            "succeeded but set no "
+                            f"{', '.join(missing)} cookie, so iCloud Drive "
+                            "requests will still be refused."
+                        ),
+                        remedy=(
+                            "This usually means the session's cookie jar is not "
+                            "being kept: check that --cookie-directory is "
+                            "writable and shared between runs. Then re-run "
+                            "'ifetch auth renew --adp'."
+                        ),
+                    )
+                )
+            emit(f"Advanced Data Protection: PCS access granted for {target.key}.")
+            return PCSResult(
+                service=target.key,
+                status=PCS_ACQUIRED,
+                detail=(
+                    f"Apple granted per-service encryption access for "
+                    f"{target.key} after {attempts} request(s)."
+                ),
+                attempts=attempts,
+                requests_made=requests_made,
+                waited_seconds=waited,
+                cookies_present=tuple(present),
+                adp=_merge_status(
+                    status,
+                    ADPStatus(
+                        state=ADP_ON,
+                        detail=(
+                            "Apple issued a per-service encryption cookie, which "
+                            "it only does for accounts that require one."
+                        ),
+                        evidence=("requestPCS returned success",),
+                    ),
+                ),
+            )
+
+        if not _is_pending(message):
+            raise ADPError(
+                _pcs_failure(
+                    code="adp_request_pcs_failed",
+                    summary=(
+                        "Apple's requestPCS exchange returned a state iFetch does "
+                        f"not recognise: {message or state or 'no status'}. No "
+                        "per-service encryption cookie was issued."
+                    ),
+                    remedy=(
+                        _APPROVE_ON_DEVICE
+                        + " If no prompt appears, confirm 'Access iCloud Data on "
+                        "the Web' is ON in iCloud settings. Unrecognised states "
+                        "are treated as failures rather than retried, because "
+                        "retrying an error is how a backup job hangs forever - "
+                        "please report this message so it can be named properly."
+                    ),
+                    raw=json.dumps(payload, default=str)[:500],
+                )
+            )
+
+        last_message = message
+        interval = min(initial_interval * (backoff ** (attempts - 1)), max_interval)
+        # Both bounds, checked before sleeping: an injected clock that never
+        # advances still terminates on the attempt cap, and a slow approval
+        # still stops at the deadline instead of overshooting it by an interval.
+        if attempts >= max_attempts or now() + interval > deadline:
+            break
+        emit(
+            "Advanced Data Protection: waiting for approval on a trusted device "
+            f"({message or 'not ready yet'})."
+        )
+        sleep(interval)
+        waited += interval
+
+    raise ADPError(
+        _pcs_failure(
+            code="adp_approval_timeout",
+            summary=(
+                f"Apple never granted per-service encryption access for "
+                f"{target.key}: it was still answering "
+                f"'{last_message or 'not ready'}' after {attempts} attempts over "
+                f"{waited:.0f}s. The most likely cause is that the approval "
+                "prompt on a trusted device was not tapped; the next most likely "
+                "is that 'Access iCloud Data on the Web' is off."
+            ),
+            remedy=(
+                "Unlock a trusted Apple device, approve the 'iCloud Data on the "
+                "Web' prompt, and re-run 'ifetch auth renew --adp'. If no prompt "
+                "arrives, turn Settings > [your name] > iCloud > 'Access iCloud "
+                "Data on the Web' off and on again, then retry. Use "
+                "--adp-timeout to wait longer than the default "
+                f"{DEFAULT_PCS_TIMEOUT:.0f}s. This is a separate approval from "
+                "two-factor sign-in; a 2FA code cannot satisfy it."
+            ),
+        )
+    )
+
+
+def _post(
+    transport: Any,
+    path: str,
+    payload: Optional[Dict[str, Any]],
+    target: PCSService,
+) -> Any:
+    """POST one setup-endpoint call, converting any failure into a named cause.
+
+    A raw ``requests`` traceback or a pyicloud exception reaching the user is
+    the exact failure mode this module exists to remove, so nothing escapes
+    unclassified - and an error body that happens to quote a cookie is redacted
+    on the way past.
+    """
+    try:
+        return transport.post(path, payload)
+    except ADPError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - deliberately total
+        failure = classify_auth_error(exc)
+        if failure.code == "unknown":
+            failure = _pcs_failure(
+                code="adp_request_pcs_failed",
+                summary=(
+                    f"Apple's {path} request failed while setting up per-service "
+                    f"encryption for {target.key}, so no cookie was issued."
+                ),
+                remedy=(
+                    _APPROVE_ON_DEVICE
+                    + " If the error above looks like a network problem, retry; "
+                    "if it repeats, run 'ifetch auth doctor --online --adp'."
+                ),
+                raw=str(exc),
+            )
+        raise ADPError(failure) from exc
+
+
+# ---------------------------------------------------------------------------
 # Diagnosis
 # ---------------------------------------------------------------------------
 
@@ -869,6 +1972,9 @@ class AuthDoctor:
         drive_probe: Optional[Callable[[Any], Any]] = None,
         now: Optional[float] = None,
         password: Optional[str] = None,
+        adp: Optional[bool] = None,
+        pcs_service_name: str = DEFAULT_PCS_SERVICE,
+        adp_transport: Optional[Callable[[Any], Any]] = None,
     ):
         self.account = account
         self.region = region
@@ -879,6 +1985,13 @@ class AuthDoctor:
         self.drive_probe = drive_probe
         self.now = now
         self.password = password
+        #: ``True`` ask Apple about ADP even without evidence, ``False`` never
+        #: ask, ``None`` ask only when the account payload says a PCS cookie is
+        #: required.  ``None`` is what keeps a non-ADP account's request count
+        #: identical to what it was before ADP support existed.
+        self.adp = adp
+        self.pcs_service = pcs_service(pcs_service_name)
+        self.adp_transport = adp_transport or PyiCloudPCSTransport
 
     # -- local checks ---------------------------------------------------
     def run(self) -> Diagnosis:
@@ -888,6 +2001,7 @@ class AuthDoctor:
         diagnosis.checks.append(self._check_region())
         diagnosis.checks.append(self._check_session_present(snapshot))
         diagnosis.checks.append(self._check_expiry(snapshot))
+        diagnosis.checks.append(self._check_pcs_cookies(snapshot))
 
         if self.online:
             diagnosis.checks.extend(self._live_checks())
@@ -898,6 +2012,28 @@ class AuthDoctor:
                     status=CHECK_SKIP,
                     detail="Offline mode; no request was made to Apple.",
                     remedy="Re-run with --online to test the session against Apple.",
+                )
+            )
+            diagnosis.checks.append(
+                Check(
+                    name="advanced_data_protection",
+                    status=CHECK_INFO,
+                    detail=(
+                        "Whether Advanced Data Protection is enabled could not be "
+                        "determined: Apple was not asked, because this run is "
+                        "offline. This is not a report that it is off."
+                    ),
+                    remedy=(
+                        "Re-run with --online (add --adp to force the check even "
+                        "when the account payload says no PCS cookie is needed)."
+                    ),
+                    data=ADPStatus(
+                        detail="Offline; no request was made to Apple.",
+                        unchecked=(
+                            "Apple's requestWebAccessState (needs --online)",
+                            "the account's pcsRequired flag (needs a live session)",
+                        ),
+                    ).to_dict(),
                 )
             )
 
@@ -981,7 +2117,153 @@ class AuthDoctor:
             data=verdict.to_dict(),
         )
 
+    def _check_pcs_cookies(self, snapshot: SessionSnapshot) -> Check:
+        """Report the stored per-service encryption cookies, with no network.
+
+        This runs for every account, ADP or not, because its *absence* is not a
+        finding: a non-ADP account legitimately has no PCS cookie, and saying so
+        plainly is what stops the check being read as a fault.
+        """
+        state = pcs_cookie_state(snapshot, self.pcs_service.key, now=self.now)
+
+        if state.read_errors:
+            status = CHECK_WARN
+            remedy = (
+                "Run 'ifetch auth renew --adp' to request a fresh one; the stored "
+                "entry is unusable and will be replaced."
+            )
+        elif state.missing and not state.present:
+            status = CHECK_INFO
+            remedy = (
+                "Nothing to do unless this account has Advanced Data Protection "
+                "enabled, in which case run 'ifetch auth renew --adp'."
+            )
+        elif state.missing or state.expired:
+            status = CHECK_WARN
+            remedy = "Run 'ifetch auth renew --adp' before the next scheduled run."
+        else:
+            status = CHECK_OK
+            remedy = ""
+
+        detail = state.detail
+        if state.read_errors:
+            detail = f"{detail} Unreadable: {'; '.join(state.read_errors)}"
+
+        return Check(
+            name="pcs_cookies",
+            status=status,
+            detail=detail,
+            remedy=remedy,
+            data=state.to_dict(),
+        )
+
     # -- live checks ----------------------------------------------------
+    def _check_adp(self, service: Any) -> Check:
+        """Ask what is knowable about ADP for this account, and say what is not.
+
+        Costs no request on the happy path: ``pcsRequired`` is already in the
+        account payload pyicloud fetched during sign-in.  Apple is only asked
+        the follow-up question when that flag says a PCS cookie is required, or
+        when ``--adp`` demands it.
+        """
+        if self.adp is False:
+            return Check(
+                name="advanced_data_protection",
+                status=CHECK_SKIP,
+                detail=(
+                    "Advanced Data Protection was not checked because --no-adp "
+                    "was given. Its state is therefore unknown, not off."
+                ),
+                data=ADPStatus(unchecked=("--no-adp was given",)).to_dict(),
+            )
+
+        try:
+            transport = self.adp_transport(service)
+            status = adp_status_from_webservices(
+                transport.webservices(), self.pcs_service
+            )
+            if self.adp is True or status.state == ADP_ON:
+                status = _merge_status(
+                    status,
+                    interpret_web_access_state(
+                        transport.post(PCS_WEB_ACCESS_STATE_PATH, None)
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not die here
+            failure = classify_auth_error(exc)
+            return Check(
+                name="advanced_data_protection",
+                status=CHECK_WARN,
+                detail=(
+                    "Whether Advanced Data Protection is enabled could not be "
+                    f"determined: {failure.summary}"
+                ),
+                remedy=failure.remedy,
+                data=ADPStatus(
+                    unchecked=(redact_secrets(str(exc))[:300],),
+                ).to_dict(),
+            )
+
+        if status.web_access == WEB_ACCESS_DISABLED:
+            return Check(
+                name="advanced_data_protection",
+                status=CHECK_FAIL,
+                detail=(
+                    "Apple reports 'Access iCloud Data on the Web' is turned off. "
+                    "With Advanced Data Protection enabled, that blocks every "
+                    "web/API client - including iFetch - regardless of sign-in."
+                ),
+                remedy=(
+                    "On a trusted Apple device: Settings > [your name] > iCloud > "
+                    "'Access iCloud Data on the Web' -> ON, then run "
+                    "'ifetch auth renew --adp'."
+                ),
+                data=status.to_dict(),
+            )
+
+        if status.state == ADP_ON:
+            return Check(
+                name="advanced_data_protection",
+                status=CHECK_INFO,
+                detail=(
+                    "Advanced Data Protection is in force for this account: "
+                    f"{status.detail} iFetch will request a per-service "
+                    "encryption cookie, which needs approval on a trusted device "
+                    "the first time."
+                ),
+                remedy=(
+                    "Run 'ifetch auth renew --adp' and approve the prompt on a "
+                    "trusted device."
+                ),
+                data=status.to_dict(),
+            )
+
+        if status.state == ADP_OFF:
+            return Check(
+                name="advanced_data_protection",
+                status=CHECK_OK,
+                detail=(
+                    "Advanced Data Protection is not in force for this account, "
+                    "so no per-service encryption cookie is needed."
+                ),
+                data=status.to_dict(),
+            )
+
+        return Check(
+            name="advanced_data_protection",
+            status=CHECK_INFO,
+            detail=(
+                "Whether Advanced Data Protection is enabled could not be "
+                f"determined. {status.detail} Not checked: "
+                f"{'; '.join(status.unchecked) or 'nothing'}."
+            ),
+            remedy=(
+                "Re-run with --adp to ask Apple directly. If Drive access fails "
+                "with a PCS error, run 'ifetch auth renew --adp'."
+            ),
+            data=status.to_dict(),
+        )
+
     def _live_checks(self) -> List[Check]:
         """Probe Apple. Every failure is classified, never surfaced raw."""
         factory = self.service_factory or self._default_service_factory
@@ -1041,6 +2323,10 @@ class AuthDoctor:
                 )
             )
 
+        # ADP is a *separate* gate from 2FA: a session can be fully trusted and
+        # still be refused for want of a PCS cookie, so this is reported on its
+        # own rather than folded into the trust check above.
+        checks.append(self._check_adp(service))
         checks.append(self._probe_drive(service))
         return checks
 

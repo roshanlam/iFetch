@@ -10,6 +10,13 @@ Three subcommands:
 ``status``
     A one-line, script-friendly expiry report; exits non-zero *before* the
     session dies so a scheduled job can renew while there is still time.
+
+All three understand Advanced Data Protection.  ``--adp`` forces the
+per-service-encryption flow, ``--no-adp`` forbids it, and the default - attempt
+it only when Apple's own account payload says a PCS cookie is required - is what
+keeps a non-ADP account on byte-for-byte the same code path it took before ADP
+support existed.  The PCS cookie itself never appears in any output of this
+module, in either text or ``--json`` form.
 """
 
 from __future__ import annotations
@@ -23,17 +30,26 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from .auth import (
     CHECK_FAIL,
+    DEFAULT_PCS_SERVICE,
+    DEFAULT_PCS_TIMEOUT,
     DEFAULT_WARN_DAYS,
+    PCS_ACQUIRED,
+    PCS_SERVICES,
+    PCS_UNDETERMINED,
     REGIONS,
     STATUS_EXPIRED,
     STATUS_OK,
     STATUS_UNKNOWN,
     STATUS_WARN,
+    ADPError,
     AuthDoctor,
+    PyiCloudPCSTransport,
     TwoFactorResolver,
     TwoFactorUnavailable,
     classify_auth_error,
+    ensure_pcs_cookies,
     evaluate_expiry,
+    pcs_cookie_state,
     resolve_password,
     read_session_snapshot,
     region_service_kwargs,
@@ -118,6 +134,57 @@ def _add_twofactor(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_adp(parser: argparse.ArgumentParser, with_flow: bool = False) -> None:
+    """Add the Advanced Data Protection switches.
+
+    ``--adp`` and ``--no-adp`` share one destination with a ``None`` default, so
+    "the user said nothing" stays distinguishable from "the user said no". That
+    distinction is the whole safety property: only ``None`` means "decide from
+    Apple's own pcsRequired flag, and make no extra request when it says no".
+    """
+    group = parser.add_argument_group(
+        "Advanced Data Protection",
+        "Accounts with ADP need a per-service encryption (PCS) cookie, which "
+        "requires 'Access iCloud Data on the Web' to be enabled and an approval "
+        "tapped on a trusted device. This is a separate gate from two-factor "
+        "sign-in.",
+    )
+    group.add_argument(
+        "--adp",
+        dest="adp",
+        action="store_true",
+        default=None,
+        help=(
+            "Assume this account may use Advanced Data Protection and run the "
+            "PCS flow even when Apple's account payload does not say so"
+        ),
+    )
+    group.add_argument(
+        "--no-adp",
+        dest="adp",
+        action="store_false",
+        help="Never attempt the PCS flow, and report ADP status as unchecked",
+    )
+    group.add_argument(
+        "--adp-service",
+        dest="adp_service",
+        choices=sorted(PCS_SERVICES),
+        default=DEFAULT_PCS_SERVICE,
+        help=f"Which service to obtain PCS cookies for (default: {DEFAULT_PCS_SERVICE})",
+    )
+    if with_flow:
+        group.add_argument(
+            "--adp-timeout",
+            dest="adp_timeout",
+            type=float,
+            default=DEFAULT_PCS_TIMEOUT,
+            help=(
+                "Seconds to wait for the approval on a trusted device "
+                f"(default: {DEFAULT_PCS_TIMEOUT:.0f})"
+            ),
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ifetch auth",
@@ -141,10 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_WARN_DAYS,
         help=f"Warn when fewer than this many days remain (default: {DEFAULT_WARN_DAYS})",
     )
+    _add_adp(doctor)
 
     renew = sub.add_parser("renew", help="Sign in and trust the session")
     _add_common(renew)
     _add_twofactor(renew)
+    _add_adp(renew, with_flow=True)
     renew.add_argument(
         "--reset",
         action="store_true",
@@ -165,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_WARN_DAYS,
         help=f"Exit 1 when fewer than this many days remain (default: {DEFAULT_WARN_DAYS})",
     )
+    _add_adp(status)
 
     return parser
 
@@ -201,6 +271,8 @@ def cmd_doctor(args: argparse.Namespace, stdout: Any) -> int:
         warn_days=args.warn_days,
         online=args.online,
         password=resolve_password(getattr(args, "password_command", None)),
+        adp=getattr(args, "adp", None),
+        pcs_service_name=getattr(args, "adp_service", DEFAULT_PCS_SERVICE),
     )
     diagnosis = doctor.run()
     _emit(diagnosis.to_dict(), render_diagnosis(diagnosis), args.as_json, stdout)
@@ -212,20 +284,44 @@ def cmd_doctor(args: argparse.Namespace, stdout: Any) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_status(args: argparse.Namespace, stdout: Any) -> int:
+    """One-line expiry report, plus the PCS cookie when it has something to say.
+
+    The extra line is conditional on purpose. ``status`` is parsed by cron
+    wrappers and printed into MOTDs; an account with no PCS cookie because it
+    has no ADP has nothing to report, and saying so every day would train people
+    to ignore the line that matters. The ``--json`` form always carries the full
+    state, including what could not be determined, so nothing is hidden from a
+    machine reader - and ``--adp`` shows it in text too.
+    """
     email = _resolve_email(args)
     region = resolve_region(args.region)
     snapshot = read_session_snapshot(email, _cookie_directory(args))
     verdict = evaluate_expiry(snapshot, warn_days=args.warn_days)
+    cookies = pcs_cookie_state(snapshot, getattr(args, "adp_service", DEFAULT_PCS_SERVICE))
 
-    payload = {"account": email, "region": region, **verdict.to_dict()}
-    _emit(payload, f"{email} [{region}]: {verdict.detail}", args.as_json, stdout)
+    payload = {
+        "account": email,
+        "region": region,
+        **verdict.to_dict(),
+        "pcs_cookies": cookies.to_dict(),
+    }
+    lines = [f"{email} [{region}]: {verdict.detail}"]
+    actionable = bool(cookies.present) and not cookies.usable
+    if actionable or cookies.read_errors or getattr(args, "adp", None) is True:
+        lines.append(f"  ADP/PCS: {cookies.detail}")
+    _emit(payload, "\n".join(lines), args.as_json, stdout)
 
-    return {
+    exit_code = {
         STATUS_OK: EXIT_OK,
         STATUS_WARN: EXIT_WARN,
         STATUS_EXPIRED: EXIT_FAIL,
         STATUS_UNKNOWN: EXIT_WARN,
     }[verdict.status]
+    # A dead PCS cookie breaks the next unattended run just as surely as a dead
+    # session token, so it must be able to raise the exit code - never lower it.
+    if actionable or cookies.read_errors:
+        exit_code = max(exit_code, EXIT_WARN)
+    return exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +358,7 @@ def cmd_renew(
     args: argparse.Namespace,
     stdout: Any,
     service_factory: Optional[Callable[..., Any]] = None,
+    adp_transport: Optional[Callable[[Any], Any]] = None,
 ) -> int:
     email = _resolve_email(args)
     region = resolve_region(args.region)
@@ -284,6 +381,7 @@ def cmd_renew(
 
     resolver = _build_resolver(args)
     factory = service_factory or _default_factory
+    pcs = None
 
     try:
         service = factory(
@@ -292,10 +390,24 @@ def cmd_renew(
             **region_service_kwargs(region),
         )
         _complete_two_factor(service, resolver, args, stdout)
+        # Strictly after 2FA: the PCS request is only meaningful on a session
+        # Apple already accepts, and conflating the two gates is exactly the
+        # confusion this command exists to remove.
+        pcs = _complete_adp(service, args, stdout, adp_transport)
     except TwoFactorUnavailable as exc:
         _emit(
             {"account": email, "renewed": False, "error": str(exc), "code": "no_2fa_code"},
             f"FAIL: {exc}",
+            args.as_json,
+            stdout,
+        )
+        return EXIT_FAIL
+    except ADPError as exc:
+        # Already named and already redacted; re-classifying our own prose could
+        # only make the answer worse.
+        _emit(
+            {"account": email, "renewed": False, **exc.failure.to_dict()},
+            f"FAIL: {exc.failure.summary}\n  -> {exc.failure.remedy}",
             args.as_json,
             stdout,
         )
@@ -317,13 +429,71 @@ def cmd_renew(
 
     snapshot = read_session_snapshot(email, cookie_directory)
     verdict = evaluate_expiry(snapshot)
+    payload: Dict[str, Any] = {
+        "account": email,
+        "region": region,
+        "renewed": True,
+        **verdict.to_dict(),
+    }
+    if pcs is not None:
+        payload["adp"] = pcs.to_dict()
     _emit(
-        {"account": email, "region": region, "renewed": True, **verdict.to_dict()},
+        payload,
         f"OK: session renewed for {email}. {verdict.detail}",
         args.as_json,
         stdout,
     )
     return EXIT_OK
+
+
+def _complete_adp(
+    service: Any,
+    args: argparse.Namespace,
+    stdout: Any,
+    adp_transport: Optional[Callable[[Any], Any]] = None,
+) -> Any:
+    """Obtain PCS cookies when the account needs them, and say so either way.
+
+    Returns the :class:`~ifetch.auth.PCSResult`, or ``None`` when ``--no-adp``
+    forbade the attempt. Failures propagate as :class:`ADPError`, which the
+    caller's handler renders as a named cause - the PCS cookie itself appears in
+    neither path.
+    """
+    if getattr(args, "adp", None) is False:
+        if not getattr(args, "as_json", False):
+            print(
+                "Skipping the Advanced Data Protection check (--no-adp); its state "
+                "is unknown, not off.",
+                file=stdout,
+            )
+        return None
+
+    build = adp_transport or PyiCloudPCSTransport
+    # Progress narration goes to the same stream as the report, so in --json
+    # mode it is suppressed rather than interleaved: a half-JSON document is
+    # worse than a silent wait for the script that has to parse it.
+    as_json = bool(getattr(args, "as_json", False))
+    result = ensure_pcs_cookies(
+        build(service),
+        getattr(args, "adp_service", DEFAULT_PCS_SERVICE),
+        force=getattr(args, "adp", None) is True,
+        timeout=getattr(args, "adp_timeout", DEFAULT_PCS_TIMEOUT),
+        log=None if as_json else (lambda message: print(message, file=stdout)),
+    )
+    if as_json:
+        return result
+
+    # Quiet on the happy path of an ordinary account: a run that needed nothing
+    # and did nothing has nothing to announce. Everything else is stated, and
+    # the --json form carries all of it unconditionally.
+    if result.status == PCS_ACQUIRED:
+        print(
+            f"OK: per-service encryption cookie obtained for {result.service}.",
+            file=stdout,
+        )
+    elif result.status == PCS_UNDETERMINED and getattr(args, "adp", None) is None:
+        print(f"Note: {result.detail}", file=stdout)
+    return result
 
 
 def _complete_two_factor(
