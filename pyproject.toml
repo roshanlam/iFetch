@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ifetch"
-version = "1.0.0"
+version = "1.1.0"
 description = "Bulk download, back up, and mirror your iCloud Drive from the command line"
 readme = "ReadMe.md"
 license = { text = "MIT" }

@@ -11,7 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-23
+
 ### Fixed
+
+- **Large folders no longer slow down as they go.** Downloads now run on a
+  single bounded worker pool instead of nesting a new pool per directory, and
+  version history is written once at the end of a run rather than rewritten for
+  every file (which was O(n^2) and the main cause of the slowdown on big trees).
 
 - **Files in a folder shared by someone else now download**
   ([#15](https://github.com/roshanlam/iFetch/issues/15)). Before this, the
@@ -34,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with its result.
 
 ### Added
+
+- **`--skip-existing`** leaves any file already on disk untouched instead of
+  updating or overwriting it, for topping up a partial copy without re-checking
+  everything already downloaded.
+- **`--retry-failed`** re-downloads only the files marked "failed" in a previous
+  run's report, skipping the full-tree walk and the re-verification of files
+  that already succeeded.
 
 - **`ifetch guard` — find the files your backups are quietly skipping.** With
   "Optimize Mac Storage" turned on, macOS removes the contents of files you
