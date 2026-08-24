@@ -8,7 +8,7 @@
 
 Apple gives you two ways to get your data out of iCloud Drive: drag files around in Finder, or wait days for a privacy export. iFetch gives you a third: a scriptable CLI that downloads exactly what you want, skips files that haven't changed since the last run, resumes interrupted transfers, and keeps a local version history so an accidental overwrite in the cloud never costs you a file.
 
-<!-- TODO: demo GIF here — record with vhs/asciinema: `ifetch Documents ~/icloud-backup` showing the skip-unchanged fast path + summary report -->
+> **📹 Demo GIF coming soon** — a ~20-second `ifetch Documents ~/icloud-backup` run showing the skip-unchanged fast path and the summary report. *(placeholder — to be recorded)*
 
 ## Why iFetch?
 
@@ -80,6 +80,37 @@ pip install -e ".[gdrive]"
 ```
 
 > **Note on pyicloud:** iFetch is built on [pyicloud](https://github.com/timlaing/pyicloud), which is actively maintained again on PyPI (v2.5.0+ adds the shared-drive support iFetch relies on). It is installed automatically.
+
+## Three commands to know
+
+Most of iFetch is recovery tooling you reach for when something has gone wrong. Day to day, three commands cover it.
+
+**1. Download a folder and keep it in sync**
+
+```sh
+ifetch Documents ~/icloud-backup
+```
+
+Re-run it tomorrow and unchanged files are skipped entirely — zero bytes, and thanks to the metadata fast path, zero network round-trips per file.
+
+**2. Mirror iCloud → NAS → Google Drive in one command**
+
+```sh
+ifetch-mirror Documents /Volumes/nas/icloud --gdrive-folder "iCloud Mirror" --watch 900
+```
+
+Delta-aware at both hops; `--watch` repeats the pipeline on an interval.
+
+**3. Finish a download that was interrupted**
+
+```sh
+ifetch resume ~/icloud-backup      # re-fetch only the files that didn't finish
+ifetch repair  ~/icloud-backup     # offline: report what was left behind
+```
+
+A run cut off mid-transfer — closed laptop, dropped connection, power cut — resumes without starting over, and without re-listing your whole drive.
+
+Everything else — planning, auditing, snapshots, conflict detection, recovery, uploads, the web UI — is in the [full command reference](#full-command-reference).
 
 ## Features
 
@@ -205,7 +236,10 @@ Don't take these numbers on faith — the harness ships in the repo:
 python benchmarks/benchmark.py "Documents/SomeFolder" --email you@example.com --workers 4 8
 ```
 
-## CLI reference
+## Full command reference
+
+<details>
+<summary><b>Expand — every command, with flags and defaults verified against <code>--help</code></b></summary>
 
 The core downloader is `ifetch`. Around it is a family of focused tools that share the same on-disk index, sync state and signed manifest.
 
@@ -460,6 +494,8 @@ Uploads only files that are **absent** from iCloud. It never overwrites, renames
 
 - **`ifetch sharecheck <share_path>`** — validates iFetch against a folder shared by *another* Apple ID, including the nested-subdirectory case that breaks other clients. Read-only against iCloud. See [docs/shared-folder-validation.md](https://github.com/roshanlam/iFetch/blob/main/docs/shared-folder-validation.md).
 - **`ifetch serve`** — runs the local web UI, binding `127.0.0.1:8765` and printing a URL that contains a one-time access token. `--allow-path DIR` widens the download destinations it will offer. See [docs/webui.md](https://github.com/roshanlam/iFetch/blob/main/docs/webui.md) and [docs/webui-api.md](https://github.com/roshanlam/iFetch/blob/main/docs/webui-api.md).
+
+</details>
 
 ## Mirror: iCloud → NAS → Google Drive
 
