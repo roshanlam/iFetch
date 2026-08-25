@@ -962,7 +962,12 @@ class TestJsonOutput:
 
         assert json.loads(target.read_text())["totals"]["evicted_files"] == 1
 
-    def test_the_materialisation_plan_is_in_the_json(self, mirror, capsys):
+    def test_the_materialisation_plan_is_in_the_json(self, mirror, capsys, monkeypatch):
+        # Materialisation via brctl is macOS-only, so on Linux (CI) the CLI has
+        # no strategy and correctly refuses. Force brctl available so the JSON
+        # plan itself is exercised on every platform, matching how the unit-level
+        # dry-run tests inject a strategy.
+        monkeypatch.setattr("ifetch.guard.brctl_available", lambda: True)
         write_brick(mirror, "gone.bin", size=1)
         guard_cli.main([str(mirror), "--json", "--no-dataless", "--materialize"])
         payload = json.loads(capsys.readouterr().out)
