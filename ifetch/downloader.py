@@ -1,11 +1,13 @@
 import os
+import sys
 import time
 import shutil
 import json
 import threading
 import traceback
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Set, Dict, Any, Union
+from typing import Optional, List, Set, Dict, Any, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
@@ -21,6 +23,342 @@ from .tracker import DownloadTracker
 from .utils import can_read_file
 from .plugin import PluginManager
 from .versioning import VersionManager
+from .auth import (
+    DEFAULT_WARN_DAYS,
+    TwoFactorResolver,
+    TwoFactorUnavailable,
+    classify_auth_error,
+    evaluate_expiry,
+    read_session_snapshot,
+    region_service_kwargs,
+    render_expiry_warning,
+    resolve_region,
+)
+from .manifest import Manifest
+from . import sharing
+from .ratelimit import BandwidthLimiter, create_limiter
+from .transfers import TransferJournal
+from .naming import (
+    NORMALIZE_PRESERVE,
+    DirectorySanitizer,
+    find_match,
+)
+from .packages import (
+    PackageExpansionError,
+    expand_package,
+    is_package_name,
+    should_expand,
+)
+
+
+def remote_metadata(item: Any) -> Tuple[Optional[int], Optional[str]]:
+    """Extract (size, modified-token) from a pyicloud DriveNode without I/O.
+
+    Both values come from the folder listing payload that pyicloud already
+    holds in ``DriveNode.data`` (``size`` / ``dateModified`` / ``dateChanged``),
+    so reading them costs zero network round-trips.  Verified against pyicloud
+    2.6.5: ``DriveNode.size`` -> ``Optional[int]``, ``DriveNode.date_modified``
+    and ``DriveNode.date_changed`` -> ``Optional[datetime]`` (UTC).
+
+    Either element is ``None`` when the attribute is missing or unusable; the
+    caller must then treat the item as "unknown" and fall back to the network
+    check.  The modified token is prefixed with its source so a value read from
+    ``date_modified`` can never be mistaken for one read from ``date_changed``.
+    """
+    size: Optional[int] = None
+    try:
+        raw_size = getattr(item, 'size', None)
+        if isinstance(raw_size, bool):
+            raw_size = None
+        if raw_size is not None:
+            size = int(raw_size)
+            if size < 0:
+                size = None
+    except Exception:  # property access or int() may fail on odd payloads
+        size = None
+
+    token: Optional[str] = None
+    for attr in ('date_modified', 'date_changed'):
+        try:
+            value = getattr(item, attr, None)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        if isinstance(value, datetime):
+            token = f"{attr}={value.isoformat()}"
+        else:
+            text = str(value).strip()
+            token = f"{attr}={text}" if text else None
+        if token:
+            break
+
+    if token is None:
+        data = getattr(item, 'data', None)
+        if isinstance(data, dict):
+            for key in ('dateModified', 'dateChanged'):
+                value = data.get(key)
+                if value:
+                    token = f"{key}={value}"
+                    break
+
+    return size, token
+
+
+class SyncState:
+    """Thread-safe, on-disk record of what was last synced for each file.
+
+    Persisted as ``.ifetch_state.json`` in the destination root.  Entries are
+    keyed by POSIX-style path relative to that root and hold the remote size and
+    remote modified token observed at completion time plus the local size and
+    mtime written.  It exists solely to answer one question cheaply: "is this
+    file *definitely* unchanged?".  Any uncertainty is reported as "unknown" and
+    the caller performs the full network check.
+    """
+
+    STATE_FILENAME = ".ifetch_state.json"
+    FLUSH_INTERVAL = 200
+
+    #: Status recorded for an expanded Apple package bundle.  It is a separate
+    #: value from ``"completed"`` because the evidence that proves a package is
+    #: unchanged is different in kind: there is no single local file whose size
+    #: can be compared against the remote size.
+    STATUS_PACKAGE = "completed_package"
+
+    def __init__(self, root: Path):
+        self.root = Path(root).resolve()
+        self.state_path = self.root / self.STATE_FILENAME
+        self._data: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._dirty = 0
+        self._load()
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+    def _load(self) -> None:
+        """Load state, tolerating a missing, unreadable or corrupt file."""
+        if not self.state_path.exists():
+            return
+        try:
+            payload = json.loads(self.state_path.read_text())
+        except (json.JSONDecodeError, OSError, ValueError, UnicodeDecodeError):
+            self._data = {}
+            return
+
+        files = payload.get("files") if isinstance(payload, dict) else None
+        if not isinstance(files, dict):
+            self._data = {}
+            return
+
+        # Drop anything that isn't a well-formed entry so a truncated or
+        # hand-edited file can never produce a false "unchanged" verdict.
+        self._data = {
+            key: value for key, value in files.items()
+            if isinstance(key, str) and isinstance(value, dict)
+        }
+
+    def save(self) -> None:
+        """Atomically write the state file. Failures are non-fatal."""
+        with self._lock:
+            snapshot = {
+                "version": 1,
+                "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "files": {k: dict(v) for k, v in self._data.items()},
+            }
+            self._dirty = 0
+        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            with tmp_path.open("w") as fp:
+                json.dump(snapshot, fp, indent=2)
+            os.replace(tmp_path, self.state_path)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+    def _maybe_flush(self) -> None:
+        with self._lock:
+            should_flush = self._dirty >= self.FLUSH_INTERVAL
+        if should_flush:
+            self.save()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def key_for(self, local_path: Path) -> str:
+        """Relative POSIX key for a local file (absolute path if outside root)."""
+        try:
+            return Path(local_path).resolve().relative_to(self.root).as_posix()
+        except ValueError:
+            return Path(local_path).as_posix()
+
+    def is_unchanged(
+        self,
+        local_path: Path,
+        remote_size: Optional[int],
+        remote_token: Optional[str],
+    ) -> bool:
+        """Return True only when every piece of evidence agrees.
+
+        Requires: remote metadata present, a completed entry recorded for this
+        path, remote size AND remote modified token identical to what was
+        recorded, and the local file still present with exactly the size we
+        wrote (which must also equal the remote size).  Anything else -> False.
+        """
+        if remote_size is None or not remote_token:
+            return False
+
+        with self._lock:
+            entry = self._data.get(self.key_for(local_path))
+            entry = dict(entry) if isinstance(entry, dict) else None
+
+        if not entry:
+            return False
+
+        if entry.get("status") == self.STATUS_PACKAGE:
+            return self._package_unchanged(entry, local_path, remote_size, remote_token)
+
+        if entry.get("status") != "completed":
+            return False
+        if entry.get("remote_size") != remote_size:
+            return False
+        if entry.get("remote_modified") != remote_token:
+            return False
+
+        recorded_local_size = entry.get("local_size")
+        if not isinstance(recorded_local_size, int):
+            return False
+        if recorded_local_size != remote_size:
+            return False
+
+        try:
+            stat = local_path.stat()
+        except OSError:
+            return False
+        if not local_path.is_file():
+            return False
+        return stat.st_size == recorded_local_size
+
+    def record_completed(
+        self,
+        local_path: Path,
+        remote_size: Optional[int],
+        remote_token: Optional[str],
+    ) -> None:
+        """Record a fully-materialised local file. Missing metadata -> forget."""
+        key = self.key_for(local_path)
+        try:
+            stat = local_path.stat()
+        except OSError:
+            self.invalidate(local_path)
+            return
+
+        if not local_path.is_file():
+            # A directory (or anything that is not a regular file) is not a
+            # completed download, whatever its stat() says.
+            self.invalidate(local_path)
+            return
+
+        if remote_size is None or not remote_token or stat.st_size != remote_size:
+            # We cannot prove this file is complete next run; don't claim we can.
+            self.invalidate(local_path)
+            return
+
+        with self._lock:
+            self._data[key] = {
+                "remote_size": remote_size,
+                "remote_modified": remote_token,
+                "local_size": stat.st_size,
+                "local_mtime": stat.st_mtime,
+                "status": "completed",
+                "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            self._dirty += 1
+        self._maybe_flush()
+
+    def _package_unchanged(
+        self,
+        entry: Dict[str, Any],
+        local_path: Path,
+        remote_size: Optional[int],
+        remote_token: Optional[str],
+    ) -> bool:
+        """Decide whether an expanded package bundle can be skipped.
+
+        A package cannot be checked the way a file is: Apple reports a logical
+        size that never equals what lands on disk, so ``remote_size == local
+        size`` is meaningless here.  Instead we require that Apple's own
+        metadata is byte-identical to what it was when we expanded the bundle
+        *and* that the local directory still has exactly the file count and
+        total byte count we recorded at that moment.  A bundle that lost or
+        gained a member, or had one truncated, fails and is re-downloaded.
+        """
+        if entry.get("remote_size") != remote_size:
+            return False
+        if entry.get("remote_modified") != remote_token:
+            return False
+
+        recorded_count = entry.get("local_file_count")
+        recorded_bytes = entry.get("local_total_bytes")
+        if not isinstance(recorded_count, int) or not isinstance(recorded_bytes, int):
+            return False
+
+        if not local_path.is_dir():
+            return False
+
+        from .packages import directory_fingerprint
+
+        try:
+            count, total = directory_fingerprint(local_path)
+        except OSError:
+            return False
+        return count == recorded_count and total == recorded_bytes
+
+    def record_completed_package(
+        self,
+        local_path: Path,
+        remote_size: Optional[int],
+        remote_token: Optional[str],
+    ) -> None:
+        """Record an expanded package directory so the next run can skip it."""
+        if remote_size is None or not remote_token:
+            self.invalidate(local_path)
+            return
+        if not local_path.is_dir():
+            self.invalidate(local_path)
+            return
+
+        from .packages import directory_fingerprint
+
+        try:
+            count, total = directory_fingerprint(local_path)
+        except OSError:
+            self.invalidate(local_path)
+            return
+
+        with self._lock:
+            self._data[self.key_for(local_path)] = {
+                "remote_size": remote_size,
+                "remote_modified": remote_token,
+                "local_file_count": count,
+                "local_total_bytes": total,
+                "status": self.STATUS_PACKAGE,
+                "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            self._dirty += 1
+        self._maybe_flush()
+
+    def invalidate(self, local_path: Path) -> None:
+        """Forget any entry for this path (failed/partial/unknown download)."""
+        key = self.key_for(local_path)
+        with self._lock:
+            if key in self._data:
+                del self._data[key]
+                self._dirty += 1
 
 
 class DownloadManager:
@@ -33,6 +371,16 @@ class DownloadManager:
         chunk_size: int = 1024 * 1024,
         include_patterns: Optional[List[str]] = None,
         exclude_patterns: Optional[List[str]] = None,
+        fast_scan: bool = True,
+        force: bool = False,
+        region: Optional[str] = None,
+        expand_packages: bool = True,
+        manifest_key: Optional[bytes] = None,
+        warn_days: int = DEFAULT_WARN_DAYS,
+        portable_names: bool = False,
+        normalize_names: str = NORMALIZE_PRESERVE,
+        password: Optional[str] = None,
+        bwlimit: Optional[Union[str, BandwidthLimiter]] = None,
         skip_existing: bool = False,
     ):
         self.email = email or os.environ.get('ICLOUD_EMAIL')
@@ -73,6 +421,12 @@ class DownloadManager:
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
 
+        # Metadata fast-path: skip provably-unchanged files without opening an
+        # HTTPS stream.  --no-fast-scan disables it; --force re-downloads all.
+        self.fast_scan = fast_scan
+        self.force = force
+        self.sync_state: Optional[SyncState] = None
+
         # When True, any file that already exists on disk is left untouched
         # instead of being differentially updated or overwritten.
         self.skip_existing = skip_existing
@@ -80,25 +434,100 @@ class DownloadManager:
         # Load plugins once during instantiation
         self.plugin_manager = PluginManager()
 
+        # Region decides whether every Apple endpoint is icloud.com or
+        # icloud.com.cn.  Resolved once here so a bad value fails at
+        # construction rather than mid-download.
+        self.region = resolve_region(region)
+
+        # Apple serves package bundles (.key/.pages/.numbers/...) as ZIP
+        # archives of a directory.  Expanding them is the default because the
+        # alternative is writing a ZIP to a path that claims to be a document.
+        self.expand_packages = expand_packages
+
+        self.manifest_key = manifest_key
+        self.warn_days = warn_days
+
+        # Name handling. Defaults are deliberately conservative: changing a
+        # local filename moves the file, which orphans what an earlier run
+        # wrote and forces a full re-download.
+        self.portable_names = portable_names
+        self.normalize_names = normalize_names
+
+        # An explicit password, usually produced by --password-command. When
+        # None, pyicloud falls back to the system keyring as before.
+        self._password = password
+
+        # Bandwidth ceiling for the whole worker pool. Parsed here so a bad
+        # --bwlimit fails at startup rather than at 3am, three hours in. The
+        # default allocates nothing at all: with no limit there is no limiter,
+        # no lock and no clock read on the byte path.
+        self.bwlimit = bwlimit if isinstance(bwlimit, str) else None
+        self.limiter: Optional[BandwidthLimiter] = create_limiter(bwlimit)
+        if self.limiter is not None and self.bwlimit is None:
+            self.bwlimit = self.limiter.schedule.source
+
         # Will be set when download() is invoked
         self.root_path: Optional[Path] = None
         self.version_manager: Optional[VersionManager] = None
+        self.manifest: Optional[Manifest] = None
+        self.index: Optional[Any] = None
+        # A disabled journal until download() opens an index. Every call on it
+        # is a no-op, so download_drive_item needs no conditionals and a
+        # downloader driven directly (tests, plugins) behaves exactly as before.
+        self.journal = TransferJournal(None)
 
-    def authenticate(self) -> None:
-        """Handle iCloud authentication including 2FA/2SA if needed."""
+    def check_session_expiry(self) -> Optional[str]:
+        """Warn about an imminent trust-token expiry *before* running.
+
+        Apple's trust token lasts about 30 days.  Discovering that at the moment
+        a scheduled backup fails is too late; reading the stored cookie's real
+        expiry off disk costs nothing and lets the run say so while there is
+        still time to renew.  Returns the warning text (also logged), or
+        ``None`` when the session is healthy.
+        """
+        try:
+            snapshot = read_session_snapshot(self.email or "")
+            verdict = evaluate_expiry(snapshot, warn_days=self.warn_days)
+        except Exception:
+            return None  # Diagnostics must never block a download.
+
+        warning = render_expiry_warning(verdict, self.email or "")
+        if warning:
+            self.logger.warning(json.dumps({
+                "event": "session_expiry_warning",
+                "account": self.email,
+                **verdict.to_dict(),
+            }))
+        return warning
+
+    def authenticate(self, two_factor: Optional[TwoFactorResolver] = None) -> None:
+        """Authenticate, answering 2FA non-interactively when possible.
+
+        ``two_factor`` supplies a code from an argument, environment variable,
+        watched file or webhook so this works with no terminal attached.  When
+        it is absent, or yields nothing, we fall back to prompting - but only if
+        stdin is actually a TTY, because prompting a daemon just hangs it
+        forever instead of failing.
+        """
         if not self.email:
             raise ValueError("Email is required for authentication")
 
+        warning = self.check_session_expiry()
+        if warning:
+            print(warning)
+
         try:
-            params: Dict[str, Any] = {"apple_id": self.email.strip(), "password": None}
-            if os.environ.get('ICLOUD_CHINA', '').lower() == 'true':
-                params["china_mainland"] = True
+            params: Dict[str, Any] = {
+                "apple_id": self.email.strip(),
+                "password": self._password,
+            }
+            params.update(region_service_kwargs(self.region))
 
             self.api = PyiCloudService(**params)
 
             if self.api.requires_2fa:
                 print("\nTwo-factor authentication required.")
-                code = input("Enter the verification code: ")
+                code = self._obtain_2fa_code(two_factor)
                 if not self.api.validate_2fa_code(code):
                     raise Exception("Failed to verify 2FA code")
                 if not self.api.is_trusted_session:
@@ -115,23 +544,87 @@ class DownloadManager:
                     name = device.get('deviceName') or 'SMS to ' + device.get('phoneNumber', 'unknown')
                     print(f"{i}: {name}")
 
-                idx = int(input("\nChoose a device: "))
+                # Device choice is only asked interactively; headless runs take
+                # the first trusted device rather than blocking on a prompt.
+                if self._can_prompt():
+                    idx = int(input("\nChoose a device: "))
+                else:
+                    idx = 0
+                    print("No terminal attached; using the first trusted device.")
                 device = devices[idx]
                 if not self.api.send_verification_code(device):
                     raise Exception("Failed to send verification code")
-                code = input("Enter the verification code: ")
+                code = self._obtain_2fa_code(two_factor)
                 if not self.api.validate_verification_code(device, code):
                     raise Exception("Failed to verify code")
 
-        except PyiCloudFailedLoginException:
-            raise Exception("Invalid credentials")
-        except PyiCloudNoStoredPasswordAvailableException:
-            raise Exception("No stored password found. Please run 'icloud --username=you@example.com'")
+        except PyiCloudFailedLoginException as e:
+            raise Exception(self._explain(e, "Invalid credentials")) from e
+        except PyiCloudNoStoredPasswordAvailableException as e:
+            raise Exception(
+                "No stored password found. Run 'icloud auth login --username you@example.com' "
+                "(requires: pip install \"ifetch[auth]\") to store it in the system keyring."
+            ) from e
+        except TwoFactorUnavailable:
+            raise
         except Exception as e:
-            raise Exception(f"Authentication failed: {e}")
+            raise Exception(self._explain(e, f"Authentication failed: {e}")) from e
 
         # Notify plugins that authentication completed successfully
         self.plugin_manager.dispatch("on_authenticated", downloader=self)
+
+    @staticmethod
+    def _can_prompt() -> bool:
+        """True only when there is a real terminal to prompt on.
+
+        Under cron, Docker without ``-it``, or systemd, ``input()`` does not
+        prompt - it blocks or raises EOF. Checking first turns an indefinite
+        hang into an actionable error.
+        """
+        try:
+            return bool(sys.stdin) and sys.stdin.isatty()
+        except (AttributeError, ValueError, OSError):
+            return False
+
+    def _obtain_2fa_code(self, resolver: Optional[TwoFactorResolver]) -> str:
+        """Get a 2FA code from the configured sources, else prompt, else fail."""
+        if resolver is not None:
+            try:
+                code = resolver.resolve()
+                self.logger.info(json.dumps({
+                    "event": "two_factor_code_resolved",
+                    "sources": resolver.describe_sources(),
+                }))
+                return code
+            except TwoFactorUnavailable:
+                # Fall through to a prompt only if a human could answer it.
+                if not self._can_prompt():
+                    raise
+
+        if not self._can_prompt():
+            raise TwoFactorUnavailable(
+                "Apple requires a two-factor code but there is no terminal to "
+                "prompt on. Supply one with --2fa-code, $IFETCH_2FA_CODE, "
+                "--2fa-file or --2fa-webhook."
+            )
+        return input("Enter the verification code: ").strip()
+
+    def _explain(self, error: Exception, fallback: str) -> str:
+        """Attach a named cause and a remedy to an Apple authentication error.
+
+        Apple's own text ("HTTP 423 Missing PCS cookies from the request") names
+        no cause and suggests no action; this is where it becomes a sentence
+        someone can act on.
+        """
+        failure = classify_auth_error(error)
+        if failure.code == "unknown":
+            return fallback
+        self.logger.error(json.dumps({
+            "event": "authentication_failed",
+            "account": self.email,
+            **failure.to_dict(),
+        }))
+        return f"{failure.summary}\n  -> {failure.remedy}"
 
     def get_drive_item(self, path: str) -> Any:
         """Navigate to a specific path in iCloud Drive."""
@@ -183,7 +676,28 @@ class DownloadManager:
         return item
 
     def _resolve_child(self, item: Any, name: str) -> Any:
-        """Resolve a child by exact or case-insensitive name."""
+        """Resolve a child by name, ignoring case *and* Unicode normalisation.
+
+        Apple returns filenames in NFD; users type NFC. Those are different
+        strings that look identical, so an exact lookup - and even a
+        case-folded one - fails on any name with an accent in it. Comparing
+        through :func:`naming.fold` normalises both sides first, which is what
+        stops ``Café`` reporting "Path not found".
+
+        Every resolved child also inherits its parent's share context here. This
+        is the single choke point every traversal passes through, which is why
+        it is the right place: Apple omits ``shareID`` from the items it returns
+        for a folder someone else shared with you, so without this step the
+        identifier is lost one level below the share root and every request
+        underneath goes out unscoped - a 400 on the next listing, a 404 on the
+        download. See :mod:`ifetch.sharing`.
+        """
+        child = self._lookup_child(item, name)
+        sharing.inherit(item, child)
+        return child
+
+    def _lookup_child(self, item: Any, name: str) -> Any:
+        """Name resolution proper, with no share-context concerns."""
         try:
             return item[name]
         except (KeyError, TypeError, AttributeError):
@@ -191,10 +705,9 @@ class DownloadManager:
             if not child_names:
                 raise KeyError(name)
 
-            normalized = name.casefold()
-            for child_name in child_names:
-                if child_name.casefold() == normalized:
-                    return item[child_name]
+            match = find_match(name, child_names)
+            if match is not None:
+                return item[match]
 
             raise KeyError(name)
 
@@ -255,7 +768,14 @@ class DownloadManager:
                 resp = self.http.get(url, headers=headers, stream=True, timeout=30)
                 resp.raise_for_status()  # Raise error for non-200/206 status codes
                 if resp.status_code in (200, 206):
-                    return resp.content
+                    payload = resp.content
+                    # Charged on what actually arrived, not on what was asked
+                    # for, and after the read rather than before it: a range is
+                    # fetched in one call, so the throttle can only put the
+                    # pause between chunks. That is the granularity of the
+                    # guarantee - an average across chunks, not within one.
+                    self._throttle(len(payload))
+                    return payload
             except requests.HTTPError as e:
                 last_error = e
                 status = e.response.status_code if e.response is not None else None
@@ -306,19 +826,72 @@ class DownloadManager:
         docwsid = data.get('docwsid')
         drivewsid = data.get('drivewsid')
         zone = data.get('zone', 'com.apple.CloudDocs')
-        share_id = data.get('shareID')
+
+        # Read the identifier through ifetch.sharing rather than off this node's
+        # own payload. Apple puts shareID on the share root and omits it from
+        # every descendant, so `data.get('shareID')` is None for exactly the
+        # files this fallback exists to rescue; traversal seeds the inherited
+        # value so it is present here. See ifetch/sharing.py.
+        share_context = sharing.carried_context(item)
+        share_id = share_context.share_id if share_context else None
+
+        attempts: List[Dict[str, Any]] = []
+
+        def note(strategy: str, outcome: str, detail: str = "") -> None:
+            """Record what a strategy did.
+
+            Every strategy below used to fail into ``except Exception: pass``,
+            which meant a user reporting "still 404" gave us nothing to work
+            with: no way to know which strategies ran, which were skipped for
+            want of a precondition, or how each one failed. The same silence
+            also violates this codebase's rule that anything which could not be
+            examined is named rather than dropped.
+            """
+            entry = {"strategy": strategy, "outcome": outcome}
+            if detail:
+                entry["detail"] = detail
+            attempts.append(entry)
+
+        def give_up() -> None:
+            payload: Dict[str, Any] = {
+                "event": "shared_open_exhausted",
+                "docwsid": docwsid,
+                "zone": zone,
+                "share_id_present": share_id is not None,
+                "attempts": attempts,
+            }
+            if share_context is not None:
+                payload["share_evidence"] = share_context.describe()
+            if share_id is None:
+                payload["likely_cause"] = (
+                    "No shareID reached this item. If it lives inside a folder "
+                    "shared by another Apple ID, the identifier should have been "
+                    "inherited during traversal; that it was not means either the "
+                    "share root was never walked or Apple returned no shareID on it."
+                )
+            self.logger.warning(json.dumps(payload))
 
         if not self.api or not hasattr(self.api, 'drive'):
+            note("preconditions", "skipped", "no authenticated drive service")
+            give_up()
             return None
 
         drive = self.api.drive
 
         # Strategy 1: replay the download/by_id request with shareID in params.
         # This is the missing piece in pyicloud v2.5 — get_file() never sends it.
-        if (share_id and docwsid
-                and hasattr(drive, 'params')
-                and hasattr(drive, '_document_root')
-                and hasattr(drive, 'session')):
+        missing = [
+            label for label, present in (
+                ("shareID", bool(share_id)),
+                ("docwsid", bool(docwsid)),
+                ("drive.params", hasattr(drive, 'params')),
+                ("drive._document_root", hasattr(drive, '_document_root')),
+                ("drive.session", hasattr(drive, 'session')),
+            ) if not present
+        ]
+        if missing:
+            note("by_id_with_share", "skipped", f"missing: {', '.join(missing)}")
+        else:
             try:
                 file_params: Dict[str, Any] = dict(drive.params)
                 file_params.update({"document_id": docwsid, "shareID": share_id})
@@ -326,31 +899,39 @@ class DownloadManager:
                     drive._document_root + f"/ws/{zone}/download/by_id",
                     params=file_params,
                 )
-                if resp.ok:
+                if not getattr(resp, "ok", False):
+                    note("by_id_with_share", "rejected",
+                         f"HTTP {getattr(resp, 'status_code', 'unknown')}")
+                else:
                     resp_json = resp.json()
                     data_token = resp_json.get("data_token")
                     package_token = resp_json.get("package_token")
-                    if data_token and data_token.get("url"):
+                    token = data_token or package_token
+                    if token and token.get("url"):
                         return drive.session.get(
-                            data_token["url"], params=drive.params, stream=True
+                            token["url"], params=drive.params, stream=True
                         )
-                    if package_token and package_token.get("url"):
-                        return drive.session.get(
-                            package_token["url"], params=drive.params, stream=True
-                        )
-            except Exception:
-                pass
+                    note("by_id_with_share", "no_url",
+                         "response carried neither data_token.url nor package_token.url")
+            except Exception as exc:
+                note("by_id_with_share", "error", self._brief(exc))
 
         # Strategy 2: try drivewsid as document_id
-        if drivewsid and drivewsid != docwsid and hasattr(drive, 'get_file'):
+        if not (drivewsid and drivewsid != docwsid and hasattr(drive, 'get_file')):
+            note("drivewsid_as_document_id", "skipped",
+                 "no distinct drivewsid, or drive.get_file unavailable")
+        else:
             try:
                 return drive.get_file(drivewsid, zone=zone, stream=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                note("drivewsid_as_document_id", "error", self._brief(exc))
 
         # Strategy 3: refresh node metadata (passing shareID if available);
         # Apple may embed a direct download URL in the response.
-        if drivewsid and hasattr(drive, 'get_node_data'):
+        if not (drivewsid and hasattr(drive, 'get_node_data')):
+            note("refresh_node_metadata", "skipped",
+                 "no drivewsid, or drive.get_node_data unavailable")
+        else:
             try:
                 import inspect
                 gnd_sig = inspect.signature(drive.get_node_data)
@@ -362,10 +943,23 @@ class DownloadManager:
                     url = fresh.get(key)
                     if url:
                         return self.http.get(url, stream=True, timeout=30)
-            except Exception:
-                pass
+                note("refresh_node_metadata", "no_url",
+                     "response carried no downloadURL/url/contentURL")
+            except Exception as exc:
+                note("refresh_node_metadata", "error", self._brief(exc))
 
+        give_up()
         return None
+
+    @staticmethod
+    def _brief(exc: Exception) -> str:
+        """A one-line rendering of an exception for a diagnostic record.
+
+        Truncated because Apple's error bodies are multi-line JSON and the point
+        of the record is that a whole run's worth of them stays readable.
+        """
+        text = f"{type(exc).__name__}: {exc}".replace("\n", " ")
+        return text[:200]
 
     def _open_with_retry(
         self,
@@ -453,6 +1047,526 @@ class DownloadManager:
                 raise  # Non-retryable error
         raise last_error  # All retries exhausted
 
+    def _can_fast_skip(self, item: Any, local_path: Path) -> bool:
+        """Decide, using zero network I/O, whether a file is provably unchanged.
+
+        Every one of the following must hold, otherwise we fall through to the
+        normal open-and-check path:
+
+        1. the fast path is enabled (``--no-fast-scan`` off) and ``--force`` off;
+        2. a sync-state file was loaded for this destination root;
+        3. the remote node exposes BOTH a size and a modified timestamp;
+        4. a previous run recorded this path with ``status == "completed"``;
+        5. the recorded remote size and remote modified token match exactly;
+        6. the local file still exists with exactly the recorded size, which
+           equals the remote size;
+        7. no resume artefacts (``*.temp`` / ``*.download``) are lying around.
+        """
+        if not self.fast_scan or self.force or self.sync_state is None:
+            return False
+
+        remote_size, remote_token = remote_metadata(item)
+        if remote_size is None or not remote_token:
+            return False
+
+        # A leftover partial download means the local file may be stale even if
+        # its size looks right; never trust the fast path in that case.
+        try:
+            suffix = local_path.suffix
+            if (local_path.with_suffix(suffix + '.temp').exists()
+                    or local_path.with_suffix(suffix + '.download').exists()):
+                return False
+        except (OSError, ValueError):
+            return False
+
+        return self.sync_state.is_unchanged(local_path, remote_size, remote_token)
+
+    # ------------------------------------------------------------------
+    # Transfer journal
+    # ------------------------------------------------------------------
+    def _open_journal(self, root: Path) -> None:
+        """Attach a durable transfer journal for this destination.
+
+        Failing to open the index is logged and otherwise ignored. The journal
+        buys resumability; it is not a precondition for downloading, and a
+        read-only or full destination should still be able to try.
+        """
+        try:
+            from .index import open_index
+
+            self.index = open_index(root)
+            self.journal = TransferJournal(self.index, root)
+        except Exception as exc:
+            self.index = None
+            self.journal = TransferJournal(None)
+            self.logger.warning(json.dumps({
+                "event": "transfer_journal_unavailable",
+                "path": str(root),
+                "error": str(exc),
+                "consequence": "this run will not be resumable without a rescan",
+            }))
+
+    def _close_journal(self) -> None:
+        """Drop finished rows and close the index."""
+        try:
+            pruned = self.journal.prune_completed()
+            outstanding = len(self.journal.incomplete())
+            if outstanding:
+                self.logger.warning(json.dumps({
+                    "event": "transfers_outstanding",
+                    "count": outstanding,
+                    "hint": "run 'ifetch resume' to finish them without a rescan",
+                }))
+            else:
+                del pruned
+        except Exception:
+            pass
+        try:
+            if self.index is not None:
+                self.index.close()
+        except Exception:
+            pass
+        finally:
+            self.index = None
+            self.journal = TransferJournal(None)
+
+    def _record_sync_state(
+        self, item: Any, local_path: Path, expanded: bool = False
+    ) -> None:
+        """Persist the metadata that lets the next run fast-skip this item."""
+        if self.sync_state is None:
+            return
+        remote_size, remote_token = remote_metadata(item)
+        try:
+            if expanded:
+                self.sync_state.record_completed_package(
+                    local_path, remote_size, remote_token
+                )
+            else:
+                self.sync_state.record_completed(local_path, remote_size, remote_token)
+        except Exception:
+            # State bookkeeping must never break a successful download.
+            pass
+
+    # ------------------------------------------------------------------
+    # Package bundles
+    # ------------------------------------------------------------------
+    def _finalize_payload(
+        self, item: Any, local_path: Path, temp_path: Path
+    ) -> Tuple[str, bool]:
+        """Move a completed temp file into place, expanding packages en route.
+
+        Returns ``(checksum, expanded)``.  When the payload is an Apple package
+        archive and expansion is enabled, ``local_path`` becomes a real
+        directory and the checksum covers the whole tree; otherwise the file is
+        renamed into place exactly as before.
+
+        An expansion failure is never allowed to lose the download: the raw
+        archive is written to ``local_path`` instead and the reason is logged,
+        so the user ends up with the same (imperfect) result other tools give
+        rather than nothing at all.
+        """
+        name = local_path.name
+
+        if not (self.expand_packages and should_expand(name, temp_path)):
+            checksum = self.calculate_checksum(temp_path)
+            temp_path.replace(local_path)
+            return checksum, False
+
+        try:
+            result = expand_package(temp_path, local_path)
+        except PackageExpansionError as exc:
+            self.logger.warning(json.dumps({
+                "event": "package_expansion_failed",
+                "file": name,
+                "path": str(local_path),
+                "error": str(exc),
+                "action": "stored_archive_verbatim",
+            }))
+            checksum = self.calculate_checksum(temp_path)
+            temp_path.replace(local_path)
+            return checksum, False
+
+        self._discard_temp(temp_path)
+        self.logger.info(json.dumps({
+            "event": "package_expanded",
+            "file": name,
+            **result.to_dict(),
+        }))
+        if result.skipped:
+            self.logger.warning(json.dumps({
+                "event": "package_entries_skipped",
+                "file": name,
+                "skipped": result.skipped,
+            }))
+
+        from .manifest import sha256_directory
+
+        return sha256_directory(local_path), True
+
+    def _record_manifest(
+        self,
+        item: Any,
+        local_path: Path,
+        checksum: str,
+        expanded: bool,
+    ) -> None:
+        """Record this download's digest in the signed manifest, if enabled."""
+        if self.manifest is None:
+            return
+        remote_size, remote_token = remote_metadata(item)
+        try:
+            if expanded:
+                self.manifest.record_package(
+                    local_path,
+                    remote_size=remote_size,
+                    remote_modified=remote_token,
+                )
+            else:
+                self.manifest.record_file(
+                    local_path,
+                    sha256=checksum or None,
+                    remote_size=remote_size,
+                    remote_modified=remote_token,
+                )
+        except Exception:
+            # The manifest is evidence, not a prerequisite; never fail a
+            # download because bookkeeping failed.
+            pass
+
+    # ------------------------------------------------------------------
+    # Local-file invariant helpers
+    # ------------------------------------------------------------------
+    def _local_target_exists(self, local_path: Path) -> bool:
+        """True when the thing a previous run wrote is still there.
+
+        For an ordinary file that means a regular file.  For an expanded package
+        it means a directory, and only when the sync state actually recorded it
+        as a package - otherwise a stray directory sitting where a file belongs
+        would be mistaken for a completed download.
+        """
+        if self._local_file_exists(local_path):
+            return True
+
+        if not (self.expand_packages and local_path.is_dir()):
+            return False
+        if self.sync_state is None:
+            return False
+        entry = self.sync_state._data.get(self.sync_state.key_for(local_path))
+        return isinstance(entry, dict) and entry.get("status") == SyncState.STATUS_PACKAGE
+
+    @staticmethod
+    def _local_file_exists(local_path: Path) -> bool:
+        """True only when a *regular file* is really present at ``local_path``.
+
+        The core invariant of this downloader is: **never report success for a
+        file that is not on disk afterwards.**  Every "unchanged"/"skipped"
+        verdict is gated on this check.
+        """
+        try:
+            return Path(local_path).is_file()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _discard_temp(temp_path: Optional[Path]) -> None:
+        """Remove a partial temp file so no half-written data survives."""
+        try:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+
+    def _materialize_empty_file(
+        self,
+        item: Any,
+        local_path: Path,
+        temp_path: Path,
+        tracker: DownloadTracker,
+    ) -> bool:
+        """Create a genuinely empty local file for a zero-byte remote file.
+
+        ``content-length: 0`` means the remote file really is empty; an empty
+        file in iCloud must produce an empty file locally, not nothing at all.
+        """
+        if self.sync_state is not None:
+            self.sync_state.invalidate(local_path)
+
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with temp_path.open('wb'):
+            pass
+        temp_path.replace(local_path)
+        tracker.cleanup()
+
+        self.logger.info(json.dumps({
+            "event": "empty_file_created",
+            "file": getattr(item, 'name', 'unknown'),
+            "path": str(local_path),
+        }))
+        self.download_results.append(DownloadStatus(
+            path=str(local_path),
+            size=0,
+            downloaded=0,
+            checksum=self.calculate_checksum(local_path),
+            status="completed",
+            changes=1,
+        ))
+        self.journal.complete(local_path, 0)
+        self._record_sync_state(item, local_path)
+        self.plugin_manager.dispatch(
+            "after_download", remote_item=item, local_path=local_path, success=True
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Bandwidth limiting
+    # ------------------------------------------------------------------
+    def _throttle(self, nbytes: int) -> None:
+        """Charge ``nbytes`` against the shared bandwidth limit, if there is one.
+
+        Called from every path that actually consumes bytes, always with the
+        count that really arrived, so the limit applies to the run as a whole
+        rather than to each worker separately.
+
+        This is optional machinery and is treated as such: if the limiter ever
+        raises, the limit is dropped for the rest of the run and said so out
+        loud.  A download must not fail because throttling failed - but a limit
+        that stops being enforced must never do so quietly.
+        """
+        limiter = self.limiter
+        if limiter is None or nbytes <= 0:
+            return
+        try:
+            limiter.consume(nbytes)
+        except Exception as exc:
+            self.limiter = None
+            self.logger.warning(json.dumps({
+                "event": "bandwidth_limit_disabled",
+                "bwlimit": self.bwlimit,
+                "error": str(exc),
+                "consequence": "the rest of this run is not rate limited",
+            }))
+
+    def _stream_body_to_temp(
+        self,
+        response: Any,
+        temp_path: Path,
+        item: Any,
+        local_path: Path,
+    ) -> int:
+        """Write a whole response body to ``temp_path``; return bytes written."""
+        iter_content = getattr(response, 'iter_content', None)
+        if iter_content is None:
+            raise Exception(
+                "download stream does not support iter_content(); cannot fetch "
+                "a file whose length the server did not report"
+            )
+
+        written = 0
+        with temp_path.open('wb') as out_file:
+            for chunk in iter_content(chunk_size=self.chunker.chunk_size):
+                if not chunk:
+                    continue
+                # Charged before the next block is pulled off the socket: the
+                # pause lands between reads, which is the only place this
+                # process can apply back-pressure at all.
+                self._throttle(len(chunk))
+                out_file.write(chunk)
+                written += len(chunk)
+                self.plugin_manager.dispatch(
+                    "on_event",
+                    name="download_progress",
+                    remote_item=item,
+                    local_path=local_path,
+                    downloaded=written,
+                    total_size=None,
+                )
+            out_file.flush()
+            try:
+                os.fsync(out_file.fileno())
+            except (OSError, AttributeError, ValueError):
+                pass
+        return written
+
+    def _download_unknown_length(
+        self,
+        item: Any,
+        response: Any,
+        local_path: Path,
+        temp_path: Path,
+        tracker: DownloadTracker,
+        remote_path: Optional[str] = None,
+    ) -> bool:
+        """Sequentially stream a response that carries no ``content-length``.
+
+        Apple serves macOS package bundles (``*.app``, ``*.logicx``, ...) with
+        chunked transfer-encoding and no ``content-length`` header even though
+        the Drive listing reports a correct non-zero size.  Without a total
+        size, ``Range`` requests cannot be constructed at all, so the only
+        correct strategy is to stream the entire body into the temp file and
+        then move it into place atomically — reusing the same temp-file,
+        version-archiving, tracker and sync-state machinery as the ranged path.
+
+        RESUME IS NOT POSSIBLE in this mode.  There is no way to know the total
+        size or to ask the server for a suffix of an unknown-length body, so a
+        failure restarts the transfer from byte 0.  Any stale range checkpoint
+        is deleted up front so it can never be misapplied to a sequential
+        stream.
+        """
+        remote_size, _ = remote_metadata(item)
+        name = getattr(item, 'name', 'unknown')
+
+        # The local copy is now known-unverifiable; drop any recorded state so
+        # an interrupted run cannot leave behind a false "unchanged" entry.
+        if self.sync_state is not None:
+            self.sync_state.invalidate(local_path)
+
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        tracker.current_position = 0
+        tracker.cleanup()
+
+        self.logger.info(json.dumps({
+            "event": "unknown_length_stream",
+            "file": name,
+            "path": str(local_path),
+            "listed_size": remote_size,
+            "resume": False,
+        }))
+
+        # resume_from=0 is not a formality here: this mode genuinely cannot
+        # resume, so a journal row claiming partial progress would send a later
+        # run looking for a tail that can never be requested.
+        self.journal.begin(
+            local_path, total_bytes=remote_size, remote_path=remote_path,
+            resume_from=0,
+        )
+
+        attempts = max(1, self.max_retries)
+        written = 0
+        last_error: Optional[Exception] = None
+
+        for attempt in range(attempts):
+            try:
+                if attempt == 0:
+                    written = self._stream_body_to_temp(
+                        response, temp_path, item, local_path
+                    )
+                else:
+                    # The original body is already partially consumed and is not
+                    # seekable, so a retry must open a brand-new stream.
+                    with self._open_with_retry(
+                        item, remote_path=remote_path
+                    ) as retry_response:
+                        written = self._stream_body_to_temp(
+                            retry_response, temp_path, item, local_path
+                        )
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                # Never leave a partial body behind; the destination file is
+                # untouched until the atomic replace below.
+                self._discard_temp(temp_path)
+                if attempt >= attempts - 1:
+                    break
+                self.logger.warning(json.dumps({
+                    "event": "unknown_length_retry",
+                    "file": name,
+                    "attempt": attempt + 1,
+                    "error": str(exc),
+                }))
+                time.sleep(2 ** (attempt + 1))
+
+        if last_error is not None:
+            # Reported as a failure by download_drive_item's handler.
+            raise last_error
+
+        if written == 0 and remote_size:
+            # The listing promised bytes but the body was empty: that is a
+            # broken transfer, never a successful (empty) backup.
+            self._discard_temp(temp_path)
+            if self.sync_state is not None:
+                self.sync_state.invalidate(local_path)
+            error = (
+                "remote listing reported "
+                f"{remote_size} bytes but the download stream was empty"
+            )
+            self.logger.error(json.dumps({
+                "event": "unknown_length_empty_body",
+                "file": name,
+                "path": str(local_path),
+                "listed_size": remote_size,
+            }))
+            self.download_results.append(DownloadStatus(
+                path=str(local_path),
+                size=remote_size,
+                downloaded=0,
+                checksum="",
+                status="failed",
+                error=error,
+            ))
+            self.journal.fail(local_path, error)
+            return False
+
+        if remote_size and written != remote_size:
+            # Package bundles are re-archived server-side, so the streamed byte
+            # count legitimately differs from the listed size.  Worth recording,
+            # but not an error.
+            self.logger.warning(json.dumps({
+                "event": "unknown_length_size_differs_from_listing",
+                "file": name,
+                "path": str(local_path),
+                "listed_size": remote_size,
+                "downloaded": written,
+            }))
+
+        # Archive the copy we are about to overwrite.
+        if local_path.exists() and self.version_manager:
+            try:
+                old_checksum = self.calculate_checksum(local_path)
+                rel_path = (
+                    local_path.relative_to(self.root_path)
+                    if self.root_path else local_path.name
+                )
+                self.version_manager.record_version(rel_path, old_checksum, local_path)
+            except Exception:
+                pass  # Non-fatal; continue with the download
+
+        checksum, expanded = self._finalize_payload(item, local_path, temp_path)
+        tracker.cleanup()
+
+        self.download_results.append(DownloadStatus(
+            path=str(local_path),
+            size=written,
+            downloaded=written,
+            checksum=checksum,
+            status="completed",
+            changes=1,
+        ))
+        self.journal.complete(local_path, written)
+        self._record_sync_state(item, local_path, expanded=expanded)
+        self._record_manifest(item, local_path, checksum, expanded)
+
+        if self.version_manager:
+            rel_path2 = (
+                local_path.relative_to(self.root_path)
+                if self.root_path else local_path.name
+            )
+            with self.version_manager._lock:
+                if str(rel_path2) not in self.version_manager._data:
+                    self.version_manager._data[str(rel_path2)] = [{
+                        "version": 0,
+                        "checksum": checksum,
+                        "archived_path": str(local_path),
+                        "timestamp": time.strftime("%Y%m%dT%H%M%S"),
+                    }]
+            self.version_manager._save()
+
+        self.plugin_manager.dispatch(
+            "after_download", remote_item=item, local_path=local_path, success=True
+        )
+        return True
+
     def download_drive_item(
         self,
         item: Any,
@@ -485,16 +1599,63 @@ class DownloadManager:
             ))
             return True
 
+        # ---- Metadata fast path: no HTTPS stream is opened at all ----------
+        # The invariant guard is redundant with SyncState.is_unchanged (which
+        # already stats the file) but stated explicitly here: a fast skip is
+        # only ever allowed when the file demonstrably exists on disk.
+        if self._can_fast_skip(item, local_path) and self._local_target_exists(local_path):
+            remote_size, _ = remote_metadata(item)
+            self.logger.info(json.dumps({
+                "event": "file_skipped_fast_path",
+                "file": item.name,
+                "path": str(local_path),
+            }))
+            self.download_results.append(DownloadStatus(
+                path=str(local_path),
+                size=remote_size or 0,
+                downloaded=0,
+                checksum="",
+                status="skipped",
+                changes=0,
+            ))
+            # A skip is recorded as settled, not ignored. A file left 'active'
+            # or 'failed' by an earlier run and since verified fine must stop
+            # appearing in the work list, or every resume re-fetches it forever.
+            self.journal.complete(local_path, remote_size)
+            return True
+
         tracker = DownloadTracker(local_path)
         temp_path: Optional[Path] = None
         total_size = 0
 
         try:
             with self._open_with_retry(item, remote_path=remote_path) as response:
-                total_size = int(response.headers.get('content-length', 0))
+                # None (header absent) and 0 (genuinely empty) are different
+                # situations and must never be conflated.
+                remote_length = self.chunker.remote_content_length(response)
+                total_size = remote_length if remote_length is not None else 0
                 temp_path = local_path.with_suffix(local_path.suffix + '.temp')
-                existing_chunks = self.chunker.get_file_chunks(local_path)
-                changed_ranges = self.chunker.find_changed_chunks(response, existing_chunks, local_path)
+
+                # A directory sitting at local_path is a previously expanded
+                # package that the fast path has already judged stale.  It
+                # cannot be diffed against or copied into a temp file, so this
+                # download is unconditionally a full one; the finished payload
+                # replaces the directory atomically in _finalize_payload.
+                stale_package_dir = local_path.is_dir()
+
+                changed_ranges = self.chunker.compute_download_ranges(
+                    response, local_path, force=self.force or stale_package_dir
+                )
+
+                if changed_ranges is None:
+                    # Unknown remote length -> ranged requests are impossible.
+                    # Stream the whole body sequentially instead of silently
+                    # concluding "nothing to do".
+                    return self._download_unknown_length(
+                        item, response, local_path, temp_path, tracker,
+                        remote_path=remote_path,
+                    )
+
                 changed_ranges = self._merge_ranges(changed_ranges)
 
                 if tracker.current_position > 0:
@@ -505,22 +1666,75 @@ class DownloadManager:
                         resumed_ranges.append((max(start, tracker.current_position), end))
                     changed_ranges = resumed_ranges
 
+                if not changed_ranges and not self._local_file_exists(local_path):
+                    # INVARIANT: "nothing to download" may only be reported as a
+                    # success when the file is actually on disk.  It is not, so
+                    # this verdict is wrong; download instead of lying.
+                    if total_size <= 0:
+                        return self._materialize_empty_file(
+                            item, local_path, temp_path, tracker
+                        )
+                    self.logger.warning(json.dumps({
+                        "event": "unchanged_verdict_without_local_file",
+                        "file": getattr(item, 'name', 'unknown'),
+                        "path": str(local_path),
+                        "total_size": total_size,
+                        "action": "forcing_full_download",
+                    }))
+                    tracker.current_position = 0
+                    tracker.cleanup()
+                    changed_ranges = self._merge_ranges(
+                        self.chunker._build_ranges(total_size)
+                    )
+
                 if not changed_ranges:
+                    if total_size == 0 and local_path.stat().st_size != 0:
+                        # Remote says empty, local is not.  Never destroy local
+                        # data on this signal alone, but do not hide it either.
+                        self.logger.warning(json.dumps({
+                            "event": "remote_empty_local_not_empty",
+                            "file": getattr(item, 'name', 'unknown'),
+                            "path": str(local_path),
+                        }))
                     self.logger.info(json.dumps({
                         "event": "file_unchanged",
                         "file": item.name,
                         "path": str(local_path)
                     }))
+                    self._record_sync_state(item, local_path)
+                    self.download_results.append(DownloadStatus(
+                        path=str(local_path),
+                        size=total_size,
+                        downloaded=0,
+                        checksum="",
+                        status="skipped",
+                        changes=0,
+                    ))
+                    self.journal.complete(local_path, total_size)
                     return True
 
+                # From here on the local copy is known-stale (or absent).  Drop
+                # any recorded state immediately so an interrupted run cannot
+                # leave behind an entry that would trigger a false skip later.
+                if self.sync_state is not None:
+                    self.sync_state.invalidate(local_path)
+
                 bytes_to_download = sum(end - start + 1 for start, end in changed_ranges)
+
+                # Journalled *before* the first byte is requested: a process
+                # killed mid-transfer never reaches any later line, and an
+                # attempt that left no record is the one worth counting.
+                self.journal.begin(
+                    local_path, total_bytes=total_size, remote_path=remote_path,
+                    resume_from=tracker.current_position,
+                )
 
                 # Create parent directories if they don't exist
                 local_path.parent.mkdir(parents=True, exist_ok=True)
 
                 if temp_path.exists():
                     pass  # Reuse existing temp file for resumed download
-                elif local_path.exists():
+                elif local_path.exists() and not stale_package_dir:
                     shutil.copy2(local_path, temp_path)
                 else:
                     # Initialize the temp file with zeros
@@ -543,6 +1757,9 @@ class DownloadManager:
                         out_file.seek(start)
                         out_file.write(chunk)
                         tracker.save_status(end + 1)
+                        # Same durable write point the tracker already uses, so
+                        # the journal costs no extra fsync boundary.
+                        self.journal.progress(local_path, end + 1)
 
                         # Streaming progress event (generic)
                         self.plugin_manager.dispatch(
@@ -556,14 +1773,22 @@ class DownloadManager:
 
                 # Only calculate checksum if temp_path exists and has content
                 if temp_path.exists() and temp_path.stat().st_size > 0:
-                    temp_checksum = self.calculate_checksum(temp_path)
-                    temp_path.replace(local_path)
+                    temp_checksum, expanded = self._finalize_payload(
+                        item, local_path, temp_path
+                    )
                 else:
                     self.logger.error(json.dumps({
                         "event": "invalid_temp_file",
                         "file": item.name,
                         "error": "Temporary file is empty or doesn't exist"
                     }))
+                    if self.sync_state is not None:
+                        self.sync_state.invalidate(local_path)
+                    self.journal.fail(
+                        local_path,
+                        "the temporary file was empty or missing after the transfer",
+                        bytes_done=tracker.current_position,
+                    )
                     return False
 
                 self.download_results.append(DownloadStatus(
@@ -575,6 +1800,9 @@ class DownloadManager:
                     changes=len(changed_ranges)
                 ))
                 tracker.cleanup()
+                self.journal.complete(local_path, total_size)
+                self._record_sync_state(item, local_path, expanded=expanded)
+                self._record_manifest(item, local_path, temp_checksum, expanded)
                 # Update version metadata with new checksum
                 if self.version_manager:
                     new_checksum = temp_checksum
@@ -602,6 +1830,14 @@ class DownloadManager:
                 return True
 
         except Exception as e:
+            if self.sync_state is not None:
+                self.sync_state.invalidate(local_path)
+            # Durable, unlike download_results: the summary report is only
+            # written if this run finishes, so a killed run would otherwise
+            # take every record of what failed with it.
+            self.journal.fail(
+                local_path, str(e), bytes_done=tracker.current_position,
+            )
             error_str = str(e)
             is_shared_file_error = any(x in error_str.lower() for x in [
                 'wsobjectnotfound', 'objectnotfoundexception',
@@ -739,10 +1975,40 @@ class DownloadManager:
                     # cache as items are lazily resolved), then submit each child
                     # to the shared pool.
                     content_names = list(contents.keys()) if hasattr(contents, 'keys') else list(contents)
+                    # Apple names are not always legal filenames here. Sanitising
+                    # per directory (rather than globally) is what lets two
+                    # different remote names that map to the same local name be
+                    # detected and separated instead of overwriting each other.
+                    sanitizer = DirectorySanitizer(
+                        portable=self.portable_names, normalize=self.normalize_names
+                    )
                     local_path.mkdir(parents=True, exist_ok=True)
                     for name in content_names:
+                        local_name, changed = sanitizer.assign(name)
+                        if changed:
+                            self.logger.warning(json.dumps({
+                                "event": "name_sanitized",
+                                "remote": name,
+                                "local": local_name,
+                                "parent": str(local_path),
+                            }))
                         child_remote_path = name if not remote_path else f"{remote_path.rstrip('/')}/{name}"
-                        self._submit(item[name], local_path / name, child_remote_path)
+                        child = item[name]
+                        # The recursive descent resolves children directly rather
+                        # than through _resolve_child, so the share context has
+                        # to be carried here too. Missing it is what makes every
+                        # file inside a folder shared by another Apple ID 404.
+                        sharing.inherit(item, child)
+                        # Submit onto the single shared bounded pool (origin/main's
+                        # concurrency model, which fixed the progressive slowdown on
+                        # large trees) using the sanitized local name.
+                        self._submit(child, local_path / local_name, child_remote_path)
+                    for collision in sanitizer.collisions:
+                        self.logger.warning(json.dumps({
+                            "event": "name_collision",
+                            "parent": str(local_path),
+                            **collision,
+                        }))
 
                     # after_download hook (directory-level event, parity with prior behaviour)
                     self.plugin_manager.dispatch(
@@ -824,6 +2090,8 @@ class DownloadManager:
         total_files = len(self.download_results)
         successful = sum(1 for r in self.download_results if r.status == "completed")
         failed = sum(1 for r in self.download_results if r.status == "failed")
+        # Files proven unchanged (metadata fast path or size match) are neither
+        # downloads nor failures; they get their own bucket.
         skipped = sum(1 for r in self.download_results if r.status == "skipped")
         total_bytes = sum(r.downloaded for r in self.download_results)
         total_changes = sum(getattr(r, 'changes', 0) for r in self.download_results)
@@ -865,6 +2133,17 @@ class DownloadManager:
         # Initialise version manager for this download session
         self.root_path = local_path_obj
         self.version_manager = VersionManager(local_path_obj)
+        # Sync state lives in the destination root; a missing or corrupt file
+        # simply yields an empty state, i.e. first-run behaviour.
+        self.sync_state = SyncState(local_path_obj)
+        # The manifest is loaded (not created fresh) so digests recorded by
+        # earlier runs survive a partial sync; entries are only ever replaced by
+        # a newer download of the same path.
+        self.manifest = Manifest.load(local_path_obj, key=self.manifest_key)
+        # The transfer journal makes an interrupted run resumable without
+        # re-listing the drive. It is best-effort: a destination whose index
+        # cannot be opened downloads exactly as it always did.
+        self._open_journal(local_path_obj)
 
         item = self.get_drive_item(icloud_path)
 
@@ -873,27 +2152,49 @@ class DownloadManager:
             "icloud_path": icloud_path,
             "local_path": str(local_path_obj),
             "max_workers": self.max_workers,
-            "chunk_size": self.chunker.chunk_size
+            "chunk_size": self.chunker.chunk_size,
+            "fast_scan": self.fast_scan,
+            "force": self.force,
+            "region": self.region,
+            "expand_packages": self.expand_packages,
+            "manifest_signed": bool(self.manifest_key),
+            "bwlimit": self.limiter.describe() if self.limiter else "unlimited",
         }))
 
         remote_path = icloud_path.strip("/") or None
-
-        # Single shared pool for the whole traversal. The root item is submitted
-        # onto it; directory workers submit their children onto the same pool.
-        # We wait on _traversal_done (set when the last outstanding item drains)
-        # rather than blocking pool workers on each other.
+        # Single shared pool for the whole traversal (origin/main's bounded
+        # concurrency). The root item is submitted onto it; directory workers
+        # submit their children onto the same pool. We wait on _traversal_done
+        # (set when the last outstanding item drains) rather than blocking pool
+        # workers on each other. The finally still runs on interruption so the
+        # transfer journal, sync state and manifest survive a killed run.
         self._pending = 0
         self._traversal_done = threading.Event()
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            self._executor = executor
-            self._submit(item, local_path_obj, remote_path=remote_path)
-            self._traversal_done.wait()
-        self._executor = None
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                self._executor = executor
+                self._submit(item, local_path_obj, remote_path=remote_path)
+                self._traversal_done.wait()
+            self._executor = None
 
-        # Flush version metadata once, after the whole traversal, instead of
-        # rewriting it per-file (which was O(n^2) and the main slowdown cause).
-        if self.version_manager:
-            self.version_manager._save()
+            # Flush version metadata once, after the whole traversal, instead of
+            # rewriting it per-file (which was O(n^2) and the main slowdown cause).
+            if self.version_manager:
+                self.version_manager._save()
+        finally:
+            # Persist whatever we learned even if the run was interrupted.
+            self.sync_state.save()
+            try:
+                self.manifest.save()
+            except OSError as exc:
+                self.logger.warning(json.dumps({
+                    "event": "manifest_save_failed",
+                    "error": str(exc),
+                }))
+            # Completed rows are dropped so the journal stays a work list
+            # rather than a history: what is left in it is what is still owed.
+            # Anything unfinished survives, which is the entire point.
+            self._close_journal()
 
         report = self.generate_summary_report()
         self.logger.info(json.dumps({"event": "download_completed", "summary": report}))

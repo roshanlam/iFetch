@@ -121,8 +121,8 @@ Examples:
     )
     parser.add_argument(
         '--token',
-        default='.gdrive_token.pickle',
-        help='Path to store Google Drive authentication token (default: .gdrive_token.pickle)'
+        default='.gdrive_token.json',
+        help='Path to store Google Drive authentication token (default: .gdrive_token.json)'
     )
 
     return parser.parse_args(argv)

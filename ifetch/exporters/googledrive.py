@@ -25,8 +25,34 @@ from googleapiclient.errors import HttpError
 
 from .index_manager import UploadIndexManager
 
-# If modifying these scopes, delete the token.pickle file.
+# If modifying these scopes, delete the token file.
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
+
+# Default (JSON) location for the cached OAuth token.
+DEFAULT_TOKEN_FILE = '.gdrive_token.json'
+
+# Result codes returned by the internal upload helper.
+UPLOAD_UPLOADED = 'uploaded'
+UPLOAD_SKIPPED = 'skipped'
+UPLOAD_FAILED = 'failed'
+UPLOAD_IGNORED = 'ignored'
+
+
+def escape_query_value(value: str) -> str:
+    """Escape a value for interpolation into a Google Drive API query string.
+
+    Drive's query language uses single-quoted string literals in which a
+    backslash escapes the following character.  Names containing ``'`` (very
+    common, e.g. "Roshan's Files") or ``\\`` would otherwise break or distort
+    the query.
+
+    Args:
+        value: Raw, user-controlled value (file name, folder name, file ID...)
+
+    Returns:
+        The value with ``\\`` and ``'`` backslash-escaped.
+    """
+    return str(value).replace('\\', '\\\\').replace("'", "\\'")
 
 
 class GoogleDriveExporter:
@@ -35,7 +61,7 @@ class GoogleDriveExporter:
     def __init__(
         self,
         credentials_file: str = 'credentials.json',
-        token_file: str = '.gdrive_token.pickle',
+        token_file: str = DEFAULT_TOKEN_FILE,
         root_folder_name: str = 'MacOS Data',
         chunk_size: int = 10 * 1024 * 1024,  # 10 MB chunks for resumable uploads
         ignore_file: Optional[str] = '.gdriveexportignore',
@@ -48,7 +74,9 @@ class GoogleDriveExporter:
 
         Args:
             credentials_file: Path to Google OAuth2 credentials JSON file
-            token_file: Path to store authentication token
+            token_file: Path to the cached authentication token.  Tokens are
+                stored as JSON; a legacy ``.pickle`` token (from older iFetch
+                releases) is read once and migrated to the JSON format.
             root_folder_name: Name of the root folder in Google Drive to store exports
             chunk_size: Chunk size for resumable uploads (default: 10 MB)
             ignore_file: Path to ignore file (like .gitignore) for excluding files/folders
@@ -58,6 +86,7 @@ class GoogleDriveExporter:
         """
         self.credentials_file = credentials_file
         self.token_file = token_file
+        self.json_token_file, self.legacy_token_file = self._resolve_token_paths(token_file)
         self.root_folder_name = root_folder_name
         self.chunk_size = chunk_size
         self.ignore_file = ignore_file
@@ -87,14 +116,75 @@ class GoogleDriveExporter:
         self._total_uploaded_bytes = 0
         self._bytes_lock = threading.Lock()
 
+    @staticmethod
+    def _resolve_token_paths(token_file: str):
+        """Work out the JSON token path and the legacy pickle path.
+
+        Passing an explicit ``*.pickle`` path (older CLI defaults) still works:
+        the pickle is read, then transparently migrated to a sibling ``.json``
+        file which is used from then on.
+
+        Returns:
+            Tuple of ``(json_token_path, legacy_pickle_path)``
+        """
+        path = Path(token_file)
+        if path.suffix == '.pickle':
+            return str(path.with_suffix('.json')), str(path)
+        return str(path), str(path.with_suffix('.pickle'))
+
+    def _load_legacy_pickle_token(self, path: Path):
+        """Read a legacy pickled credential, tolerating any failure."""
+        try:
+            with open(path, 'rb') as token:
+                return pickle.load(token)
+        except Exception as error:  # noqa: BLE001 - never let a bad file abort auth
+            print(f"Warning: could not read legacy token '{path}': {error}")
+            return None
+
+    def _save_token(self, creds) -> None:
+        """Persist credentials as JSON with 0600 permissions."""
+        path = Path(self.json_token_file)
+        payload = creds.to_json()
+
+        parent = path.parent
+        if str(parent) and not parent.exists():
+            parent.mkdir(parents=True, exist_ok=True)
+
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as token:
+            token.write(payload)
+
+        # Enforce restrictive permissions even if the file already existed.
+        try:
+            os.chmod(str(path), 0o600)
+        except OSError:
+            pass
+
+    def _load_token(self):
+        """Load cached credentials, migrating a legacy pickle token if needed."""
+        json_path = Path(self.json_token_file)
+        if json_path.exists():
+            try:
+                return Credentials.from_authorized_user_file(str(json_path), SCOPES)
+            except Exception as error:  # noqa: BLE001 - fall back to re-auth
+                print(f"Warning: could not read token '{json_path}': {error}")
+
+        legacy_path = Path(self.legacy_token_file)
+        if legacy_path.exists():
+            creds = self._load_legacy_pickle_token(legacy_path)
+            if creds is not None:
+                print(f"Migrating legacy token '{legacy_path}' to '{json_path}'...")
+                try:
+                    self._save_token(creds)
+                except Exception as error:  # noqa: BLE001 - migration is best-effort
+                    print(f"Warning: could not migrate token to '{json_path}': {error}")
+                return creds
+
+        return None
+
     def authenticate(self) -> None:
         """Authenticate with Google Drive API."""
-        creds = None
-
-        # Load token from file if it exists
-        if os.path.exists(self.token_file):
-            with open(self.token_file, 'rb') as token:
-                creds = pickle.load(token)
+        creds = self._load_token()
 
         # If no valid credentials, let user log in
         if not creds or not creds.valid:
@@ -118,9 +208,8 @@ class GoogleDriveExporter:
                 )
                 creds = flow.run_local_server(port=0)
 
-            # Save credentials for future use
-            with open(self.token_file, 'wb') as token:
-                pickle.dump(creds, token)
+            # Save credentials for future use (JSON, owner-readable only)
+            self._save_token(creds)
             print("Authentication successful!")
 
         # Store credentials for thread-local services
@@ -307,10 +396,13 @@ class GoogleDriveExporter:
         # Get thread-local service
         service = self._get_thread_local_service()
 
-        # Search for existing folder
-        query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        # Search for existing folder (values escaped for Drive query syntax)
+        query = (
+            f"name='{escape_query_value(folder_name)}' "
+            "and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        )
         if parent_id:
-            query += f" and '{parent_id}' in parents"
+            query += f" and '{escape_query_value(parent_id)}' in parents"
         else:
             query += " and 'root' in parents"
 
@@ -396,7 +488,10 @@ class GoogleDriveExporter:
         # Get thread-local service
         service = self._get_thread_local_service()
 
-        query = f"name='{file_name}' and '{parent_id}' in parents and trashed=false"
+        query = (
+            f"name='{escape_query_value(file_name)}' "
+            f"and '{escape_query_value(parent_id)}' in parents and trashed=false"
+        )
 
         try:
             results = service.files().list(
@@ -438,18 +533,38 @@ class GoogleDriveExporter:
             base_path: Base path for calculating relative paths (for ignore patterns)
 
         Returns:
-            File ID if uploaded, None if skipped
+            File ID if uploaded or already present, None if skipped/failed
+        """
+        return self._upload_file_with_status(
+            file_path, gdrive_parent_id, force, base_path
+        )[1]
+
+    def _upload_file_with_status(
+        self,
+        file_path: Path,
+        gdrive_parent_id: str,
+        force: bool = False,
+        base_path: Optional[Path] = None
+    ):
+        """
+        Upload a file and report what actually happened.
+
+        Identical to :meth:`upload_file` but returns a
+        ``(status, file_id)`` tuple where *status* is one of
+        ``uploaded`` / ``skipped`` / ``failed`` / ``ignored``.  Callers use
+        this to keep accurate statistics without re-hashing the file or
+        issuing extra Drive API calls.
         """
         if not file_path.exists() or not file_path.is_file():
             with self._print_lock:
                 print(f"Skipping: {file_path} (not a file)")
-            return None
+            return UPLOAD_FAILED, None
 
         # Check if file should be ignored
         if self._should_ignore(file_path, base_path):
             with self._print_lock:
                 print(f"Ignored: {file_path}")
-            return None
+            return UPLOAD_IGNORED, None
 
         file_name = file_path.name
         file_info = self._get_file_info(file_path)
@@ -478,7 +593,7 @@ class GoogleDriveExporter:
                     gdrive_file_id = self.index_manager.get_gdrive_file_id(rel_path)
                     with self._print_lock:
                         print(f"Skipped: {file_path} (unchanged since last upload)")
-                    return gdrive_file_id
+                    return UPLOAD_SKIPPED, gdrive_file_id
 
         # Only check Google Drive if index says file needs upload OR force=True
         # This dramatically reduces API calls!
@@ -501,7 +616,7 @@ class GoogleDriveExporter:
                             file_info['md5'],
                             existing_file_id
                         )
-                return existing_file_id
+                return UPLOAD_SKIPPED, existing_file_id
 
         # Prepare file metadata
         file_metadata = {
@@ -563,12 +678,12 @@ class GoogleDriveExporter:
                         response['id']
                     )
 
-            return response['id']
+            return UPLOAD_UPLOADED, response['id']
 
         except HttpError as error:
             with self._print_lock:
                 print(f"✗ Error uploading {file_path}: {error}")
-            return None
+            return UPLOAD_FAILED, None
 
     def upload_directory(
         self,
@@ -647,22 +762,24 @@ class GoogleDriveExporter:
             with ThreadPoolExecutor(max_workers=self.upload_workers) as executor:
                 # Submit all upload tasks
                 future_to_file = {
-                    executor.submit(self.upload_file, file_path, current_folder_id, force, base_path): file_path
+                    executor.submit(
+                        self._upload_file_with_status,
+                        file_path,
+                        current_folder_id,
+                        force,
+                        base_path,
+                    ): file_path
                     for file_path in files_to_upload
                 }
 
-                # Process completed uploads
+                # Process completed uploads - the worker reports what it did,
+                # so no re-hashing or extra API calls are needed here.
                 for future in as_completed(future_to_file):
                     file_path = future_to_file[future]
                     try:
-                        file_id = future.result()
-                        if file_id:
-                            # Check if it was skipped or uploaded
-                            file_info = self._get_file_info(file_path)
-                            if self._file_exists_in_drive(file_path.name, current_folder_id, file_info['md5']) == file_id:
-                                stats['skipped'] += 1
-                            else:
-                                stats['uploaded'] += 1
+                        status, _file_id = future.result()
+                        if status in (UPLOAD_UPLOADED, UPLOAD_SKIPPED, UPLOAD_IGNORED):
+                            stats[status] += 1
                         else:
                             stats['failed'] += 1
                     except Exception as e:

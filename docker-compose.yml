@@ -1,0 +1,95 @@
+# iFetch in a container. Copy this file, change the four values marked CHANGE
+# ME, and read docs/docker.md before the first run - the first run has to be
+# interactive so Apple can trust the session. Every run after that is
+# unattended.
+#
+# Two volumes, and both matter:
+#   ./icloud -> /data     your files. Point this wherever the mirror should live.
+#   ./config -> /config   the trusted iCloud session. Lose this and the
+#                         container asks for a 2FA code it cannot get.
+
+services:
+  ifetch:
+    image: ghcr.io/roshanlam/ifetch:latest
+    container_name: ifetch
+    # `ifetch` is the entrypoint, so this is just its arguments:
+    # <remote path> <local path> [flags]
+    command:
+      - "Documents"          # CHANGE ME: the iCloud Drive folder to mirror
+      - "/data"
+      - "--log-file"
+      - "/config/ifetch.log"
+
+    environment:
+      # --- account ---------------------------------------------------------
+      ICLOUD_EMAIL: "you@example.com"      # CHANGE ME
+      # There is no keyring in a container, so the password comes from a
+      # command that prints it. Anything that prints to stdout works: `pass`,
+      # a mounted Docker secret, `age -d`, an op-cli call.
+      IFETCH_PASSWORD_COMMAND: "cat /run/secrets/icloud_password"
+
+      # --- session persistence (do not change) -----------------------------
+      # pyicloud stores the trusted session under $TMPDIR/pyicloud/$USER.
+      # Pointing TMPDIR at the /config volume is what keeps the session across
+      # container restarts; USER keeps the path stable.
+      TMPDIR: "/config"
+      USER: "ifetch"
+
+      # --- two-factor, for the day the session expires ---------------------
+      # Not needed for normal runs. When the trusted session does expire (~2
+      # months) Apple asks for a six-digit code; iFetch reads one from
+      # $IFETCH_2FA_CODE, or polls a file given with --2fa-file. See
+      # docs/docker.md#the-session-expired for the full recipe.
+      # IFETCH_2FA_CODE: "123456"           # single-use, for one run only
+
+      # --- notifications (see docs/monitoring.md) --------------------------
+      # Dead-man's switch. Uncomment one of these; the URL is a credential, so
+      # prefer an env_file or a secret over committing it.
+      # IFETCH_HEALTHCHECKS_URL: "https://hc-ping.com/<your-check-uuid>"
+      # Self-hosted Healthchecks works exactly the same way:
+      # IFETCH_HEALTHCHECKS_URL: "https://hc.lan.example.org/ping/<uuid>"
+      # Post anomalies (a run that finished with failed files) as a check
+      # failure instead of a log entry against the check:
+      # IFETCH_HEALTHCHECKS_ANOMALY_FAILS: "1"
+      #
+      # Push to a phone. ntfy.sh or your own server:
+      # IFETCH_NTFY_URL: "https://ntfy.sh/my-private-ifetch-topic"
+      # IFETCH_NTFY_TOKEN: "tk_..."         # only for protected topics
+      # IFETCH_NTFY_TAGS: "nas,backup"
+      #
+      # Anything else that accepts a JSON POST:
+      # IFETCH_WEBHOOK_URL: "https://automation.lan/hooks/ifetch"
+      # IFETCH_WEBHOOK_HEADERS: '{"X-Api-Key": "..."}'
+      #
+      # IFETCH_NOTIFY_TIMEOUT: "5"          # seconds per request
+      # IFETCH_NOTIFY_RETRIES: "2"          # retries after the first attempt
+
+    volumes:
+      - ./icloud:/data       # CHANGE ME: where the mirror lives
+      - ./config:/config     # trusted session, log file - keep this
+
+    secrets:
+      - icloud_password
+
+    # The container runs one download and exits. Restarting it on a schedule is
+    # the host's job (cron, systemd timer, your NAS task scheduler):
+    #   docker compose run --rm ifetch
+    # "no" is correct here: a restart loop would hammer Apple's rate limits.
+    restart: "no"
+
+    # Drop everything the process does not need. iFetch writes files and makes
+    # outbound HTTPS connections; that is the whole of its privilege.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # Matches the image's built-in user. Set this to your host UID/GID if the
+    # bind-mounted directories are owned by a different user - and see
+    # docs/docker.md#permission-denied-writing-to-data.
+    # user: "1000:1000"
+
+secrets:
+  icloud_password:
+    # CHANGE ME: a file containing nothing but the Apple ID password.
+    file: ./secrets/icloud_password

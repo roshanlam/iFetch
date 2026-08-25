@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ifetch"
-version = "1.0.0"
+version = "1.1.0"
 description = "Bulk download, back up, and mirror your iCloud Drive from the command line"
 readme = "ReadMe.md"
 license = { text = "MIT" }
@@ -45,6 +45,10 @@ gdrive = [
     "google-auth-httplib2",
     "google-api-python-client",
 ]
+# The `icloud` CLI (used once to store your password in the OS keyring)
+auth = [
+    "pyicloud[cli]>=2.5.0",
+]
 dev = [
     "pytest",
     "pytest-cov",
@@ -59,7 +63,29 @@ Repository = "https://github.com/roshanlam/iFetch"
 ifetch = "ifetch.cli:main"
 ifetch-export = "ifetch.export_cli:main"
 ifetch-mirror = "ifetch.mirror_cli:main"
+ifetch-verify = "ifetch.verify:main"
+ifetch-restore = "ifetch.restore:main"
+ifetch-photos = "ifetch.photos_cli:main"
+ifetch-auth = "ifetch.auth_cli:main"
+ifetch-plan = "ifetch.plan_cli:main"
+ifetch-audit = "ifetch.plan_cli:audit_main"
+ifetch-recover = "ifetch.recover_cli:main"
+ifetch-snapshot = "ifetch.snapshot_cli:main"
+ifetch-conflicts = "ifetch.conflict_cli:main"
+ifetch-guard = "ifetch.guard_cli:main"
+ifetch-vanish = "ifetch.vanish_cli:main"
+ifetch-sharecheck = "ifetch.sharecheck_cli:main"
+ifetch-uplink = "ifetch.uplink_cli:main"
+ifetch-serve = "ifetch.serve_cli:main"
+ifetch-repair = "ifetch.repair_cli:main"
+ifetch-resume = "ifetch.repair_cli:resume_main"
 
 [tool.setuptools.packages.find]
-include = ["ifetch", "ifetch.exporters"]
+include = ["ifetch", "ifetch.exporters", "ifetch.webui"]
 exclude = ["tests*", "plugins*"]
+
+# The web UI is a data file, not a module, so it needs saying explicitly.
+# Without this the wheel installs a `serve` command that starts a server with
+# no page to serve.
+[tool.setuptools.package-data]
+"ifetch.webui" = ["static/*"]

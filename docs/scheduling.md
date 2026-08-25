@@ -5,7 +5,7 @@ iFetch is a one-shot CLI, which makes it easy to schedule with whatever your pla
 ## Before you schedule anything
 
 1. **Do one interactive run first.** The first `ifetch` run prompts for a 2FA code and trusts the session. Scheduled runs cannot answer that prompt — they reuse the trusted session established interactively. When the session eventually expires (typically after a couple of months), run `ifetch` once by hand to re-authenticate. See [troubleshooting](troubleshooting.md#session-expiry).
-2. **Store the password in the keyring**: `icloud --username you@example.com`. Scheduled jobs read it from there; nothing is stored in plain text.
+2. **Store the password in the keyring**: `icloud auth login --username you@example.com`. Scheduled jobs read it from there; nothing is stored in plain text.
 3. **Set `ICLOUD_EMAIL`** in the job's environment so you don't need `--email` on every invocation.
 4. **Log to a file** with `--log-file` so failures in unattended runs are diagnosable.
 
@@ -152,7 +152,7 @@ ifetch-mirror Documents /mnt/nas/icloud-mirror \
   --watch 900        # repeat every 15 minutes
 ```
 
-This keeps a single process running that repeats the full iCloud → local → Google Drive pipeline on the given interval. Both hops are delta-aware, so an interval pass where nothing changed transfers (almost) nothing. Pair it with a process supervisor for resilience — e.g. a systemd service with `Restart=on-failure` (no timer needed):
+This keeps a single process running that repeats the full iCloud → local → Google Drive pipeline on the given interval. Both hops skip files that haven't changed, so an interval pass where nothing changed transfers (almost) nothing. Pair it with a process supervisor for resilience — e.g. a systemd service with `Restart=on-failure` (no timer needed):
 
 ```ini
 [Service]

@@ -87,7 +87,7 @@ class MirrorPipeline:
         exclude_patterns: Optional[List[str]] = None,
         log_file: Optional[str] = None,
         credentials_file: str = 'credentials.json',
-        token_file: str = '.gdrive_token.pickle',
+        token_file: str = '.gdrive_token.json',
         dry_run: bool = False,
     ):
         self.icloud_path = icloud_path

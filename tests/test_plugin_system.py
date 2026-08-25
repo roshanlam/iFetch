@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from ifetch.downloader import DownloadManager  # noqa: E402
+from ifetch.plugin import BasePlugin, PluginManager  # noqa: E402
 
 
 def create_test_plugin(tmp_path: Path):
@@ -108,4 +110,103 @@ def test_plugin_hooks(tmp_path, monkeypatch):
         "before_download",
         "after_download_True",
     }
-    assert set(events_mod.events) >= expected 
+    assert set(events_mod.events) >= expected
+
+
+def test_plugins_discovered_by_default(tmp_path, monkeypatch):
+    create_test_plugin(tmp_path)
+    monkeypatch.setenv("IFETCH_PLUGIN_PATH", str(tmp_path))
+    monkeypatch.delenv("IFETCH_NO_PLUGINS", raising=False)
+
+    manager = PluginManager()
+
+    assert manager.enabled is True
+    assert manager.plugins
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_env_var_disables_plugin_discovery(tmp_path, monkeypatch, value):
+    create_test_plugin(tmp_path)
+    monkeypatch.setenv("IFETCH_PLUGIN_PATH", str(tmp_path))
+    monkeypatch.setenv("IFETCH_NO_PLUGINS", value)
+
+    manager = PluginManager()
+
+    assert manager.enabled is False
+    assert manager.plugins == []
+    # Explicitly asking for plugins does not override the environment opt-out
+    assert PluginManager(enabled=True).plugins == []
+
+
+def test_env_var_falsy_value_keeps_plugins(tmp_path, monkeypatch):
+    create_test_plugin(tmp_path)
+    monkeypatch.setenv("IFETCH_PLUGIN_PATH", str(tmp_path))
+    monkeypatch.setenv("IFETCH_NO_PLUGINS", "0")
+
+    assert PluginManager().plugins
+
+
+def test_enabled_false_disables_plugin_discovery(tmp_path, monkeypatch):
+    create_test_plugin(tmp_path)
+    monkeypatch.setenv("IFETCH_PLUGIN_PATH", str(tmp_path))
+    monkeypatch.delenv("IFETCH_NO_PLUGINS", raising=False)
+
+    manager = PluginManager(search_paths=[tmp_path], enabled=False)
+
+    assert manager.enabled is False
+    assert manager.plugins == []
+
+
+def test_failing_hook_is_logged_and_contained(caplog):
+    class BoomPlugin(BasePlugin):
+        def after_download(self, remote_item, local_path, success, **kwargs):
+            raise RuntimeError("plugin exploded")
+
+    class GoodPlugin(BasePlugin):
+        def __init__(self):
+            self.calls = []
+
+        def after_download(self, remote_item, local_path, success, **kwargs):
+            self.calls.append(success)
+
+    manager = PluginManager(enabled=False)
+    good = GoodPlugin()
+    manager._plugins = [BoomPlugin(), good]
+
+    with caplog.at_level(logging.WARNING, logger="ifetch.plugin"):
+        manager.dispatch("after_download", remote_item=None, local_path="x", success=True)
+
+    assert "plugin exploded" in caplog.text
+    assert "BoomPlugin" in caplog.text
+    assert "after_download" in caplog.text
+    # The failure did not stop the remaining plugins
+    assert good.calls == [True]
+
+
+def test_broken_plugin_module_is_logged(tmp_path, monkeypatch, caplog):
+    (tmp_path / "broken_plugin.py").write_text("raise RuntimeError('bad import')\n")
+    monkeypatch.delenv("IFETCH_NO_PLUGINS", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="ifetch.plugin"):
+        manager = PluginManager(search_paths=[tmp_path])
+
+    assert manager.plugins == []
+    assert "broken_plugin.py" in caplog.text
+    assert "bad import" in caplog.text
+
+
+def test_plugin_constructor_failure_is_logged(tmp_path, monkeypatch, caplog):
+    (tmp_path / "bad_init_plugin.py").write_text(
+        "from ifetch.plugin import BasePlugin\n"
+        "class BadInit(BasePlugin):\n"
+        "    def __init__(self):\n"
+        "        raise ValueError('no init for you')\n"
+    )
+    monkeypatch.delenv("IFETCH_NO_PLUGINS", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="ifetch.plugin"):
+        manager = PluginManager(search_paths=[tmp_path])
+
+    assert manager.plugins == []
+    assert "BadInit" in caplog.text
+    assert "no init for you" in caplog.text
