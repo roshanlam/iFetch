@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Prefix resume requires provenance.** A shorter local file is no longer
+  assumed to be a trusted interrupted download. Resume only when a `.download`
+  tracker or transfer-journal row agrees on the prefix length and remote size;
+  otherwise iFetch full-fetches so a corrupt prefix cannot finish green.
+
 - **Same-size + changed `remote_modified` no longer silent-skips or poisons SyncState.**
   When local and remote sizes match but `.ifetch_state.json` does not prove the
   modified token is unchanged (token mismatch or missing entry), iFetch now

@@ -15,6 +15,7 @@ import pytest
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from ifetch.downloader import DownloadManager, SyncState, remote_metadata  # noqa: E402
+from ifetch.tracker import DownloadTracker  # noqa: E402
 
 
 MTIME_A = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -460,9 +461,11 @@ def test_download_path_never_hashes_the_local_file(tmp_path, monkeypatch):
 
 
 def test_prefix_resume_downloads_only_the_missing_tail(tmp_path, monkeypatch):
+    """Proven interrupted download (tracker) may resume the missing tail."""
     node = FakeNode("file.bin")
     local_path = tmp_path / "file.bin"
     local_path.write_bytes(b"01234")
+    DownloadTracker(local_path).save_status(5)
 
     dm = _manager(tmp_path, monkeypatch)
     calls = []
@@ -476,6 +479,29 @@ def test_prefix_resume_downloads_only_the_missing_tail(tmp_path, monkeypatch):
     assert dm.download_drive_item(node, local_path) is True
     assert calls == [(5, 9)]
     assert local_path.read_bytes() == b"0123456789"
+
+
+def test_corrupt_prefix_without_provenance_full_fetches(tmp_path, monkeypatch):
+    """Ticket #2: shorter local file, no journal/tracker => full fetch, not resume."""
+    node = FakeNode("file.bin", content=b"0123456789")
+    local_path = tmp_path / "file.bin"
+    local_path.write_bytes(b"XXXXX")  # same length as a 5-byte prefix, wrong bytes
+
+    dm = _manager(tmp_path, monkeypatch)
+    calls = []
+
+    def _download_chunk(url, start, end, item=None):
+        calls.append((start, end))
+        return node._content[start:end + 1]
+
+    monkeypatch.setattr(dm, "download_chunk", _download_chunk)
+
+    assert dm.download_drive_item(node, local_path) is True
+    assert calls == [(0, 9)]  # full file, not (5, 9)
+    assert local_path.read_bytes() == b"0123456789"
+    report = dm.generate_summary_report()["summary"]
+    assert report["successful"] == 1
+    assert report["skipped"] == 0
 
 
 def test_no_sync_state_same_size_must_full_fetch(tmp_path, monkeypatch):
