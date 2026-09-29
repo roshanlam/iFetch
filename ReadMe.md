@@ -30,7 +30,7 @@ Apple gives you two ways to get your data out of iCloud Drive: drag files around
 | China Mainland (GCBD) accounts | **Yes** — `--region china` | Not supported; [#8257](https://github.com/rclone/rclone/issues/8257) open since Dec 2024 with two unmerged PRs |
 | Folders shared by another Apple ID | Best-effort (see caveats below) | Share root only; operations inside fail ([#9477](https://github.com/rclone/rclone/issues/9477), fix unmerged) |
 | Content hashes from Apple | None available (Apple exposes none) | None — so `--checksum` silently degrades to size-only |
-| Advanced Data Protection | **Yes** — PCS-cookie flow with bounded, headless-safe approval polling; `auth doctor` names *which* ADP precondition failed. Validated against recorded responses, not a live ADP account | **Yes**, since v1.74.3 (June 2026) |
+| Advanced Data Protection | **Replay-proven** — PCS-cookie flow with bounded, headless-safe approval polling; `auth doctor` names *which* ADP precondition failed. **Not yet live-validated** against a real ADP Apple ID (see caveat below) | **Yes**, since v1.74.3 (June 2026) |
 | Files evicted by "Optimize Mac Storage" | **`ifetch guard`** — reports the bytes that exist only on Apple's servers and are therefore missing from every Time Machine / Backblaze / Arq / rsync backup, and downloads them back | Not addressed — rclone does not inspect local FileProvider state |
 | Noticing files deleted *in iCloud* before Trash purges them | **`ifetch vanish`** — classifies what went missing, bounds the ~30-day purge deadline, and refuses to call a broken scan a mass deletion | No — `sync` propagates the deletion to your local copy |
 | Graphical interface | **Yes** — `ifetch serve`, a local web UI, no extra dependencies | No — third-party GUIs only; a GUI is the [most-discussed request](https://forum.rclone.org/top?period=yearly) on their forum |
@@ -47,39 +47,88 @@ Two honest caveats about the columns above:
 
 For **photos**, use [icloudpd](https://github.com/icloud-photos-downloader/icloud_photos_downloader) — it is far more mature than iFetch's own brand-new `ifetch-photos`, which has not yet been validated against a live account.
 
-## 60-second quickstart
+## First successful run
+
+Goal: install → store credentials → pass 2FA once → download something small. About two minutes if Apple's prompt arrives promptly.
+
+### 1. Install
 
 ```sh
-# 1. Install
-pip install "ifetch[gdrive,auth]"   # core + Google Drive export + auth CLI (or: pip install ifetch)
-
-# 2. Store your iCloud password in the system keyring (one time)
-icloud auth login --username you@example.com
-
-# 3. Download a folder (you'll be prompted for a 2FA code on first run)
-ifetch Documents ~/icloud-backup
+pip install "ifetch[auth]"
+# Optional extras later: [gdrive] for Google Drive export/mirror
 ```
 
-**Prefer not to use a terminal?** `ifetch serve` opens a small web UI instead:
-
-```sh
-ifetch serve
-#   iFetch web UI: http://127.0.0.1:8765/?t=<token>
-```
-
-Open that link and everything below happens in a browser — signing in (2FA included), picking a folder, watching the download, and reading the two reports. It binds to localhost only, needs no new dependencies, and works fine on a headless NAS over an SSH tunnel. See [docs/webui.md](https://github.com/roshanlam/iFetch/blob/main/docs/webui.md).
-
-That's it. Run the same command tomorrow and iFetch skips every file that hasn't changed — on an untouched folder that means zero bytes transferred and, thanks to the metadata fast path, zero network round-trips per file.
-
-To work from source instead:
+Or from a clone:
 
 ```sh
 git clone https://github.com/roshanlam/iFetch.git
 cd iFetch
-pip install -e ".[gdrive]"
+python3 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -e ".[auth]"
 ```
 
-> **Note on pyicloud:** iFetch is built on [pyicloud](https://github.com/timlaing/pyicloud), which is actively maintained again on PyPI (v2.5.0+ adds the shared-drive support iFetch relies on). It is installed automatically.
+`[auth]` pulls the `icloud` CLI used in the next step. Without it you will get “No stored password found” (or a missing `icloud` command) on first run.
+
+### 2. Tell iFetch which Apple ID to use
+
+Every command needs an account. Set it once in your shell profile, or pass `--email` every time:
+
+```sh
+export ICLOUD_EMAIL=you@example.com
+```
+
+China Mainland Apple IDs also need `export ICLOUD_REGION=china` (or `--region china` on each command).
+
+### 3. Store the password in the OS keyring (one time)
+
+```sh
+icloud auth login --username "$ICLOUD_EMAIL"
+```
+
+iFetch never prompts for your Apple ID password itself — it reads what pyicloud stored in the keyring (or what you supply later with `--password-command` / `$IFETCH_PASSWORD_COMMAND` on boxes with no keyring, e.g. Docker).
+
+**Linux desktop:** you need a Secret Service backend (`gnome-keyring` or KWallet). **Headless / NAS / Docker:** skip the keyring and use a password command — see [docs/docker.md](docs/docker.md) and [docs/troubleshooting.md](docs/troubleshooting.md#keyring-issues-per-os).
+
+If `icloud auth login` fails at the 2FA step but the password was already saved, skip to step 4 — `ifetch` uses a simpler 2FA path and will ask for the code itself.
+
+### 4. Prove auth works (interactive — enter the 2FA code when asked)
+
+```sh
+ifetch Documents --list
+# or: ifetch auth doctor --online
+```
+
+Apple sends a six-digit code to your trusted devices. After a valid code, iFetch asks Apple to **trust the session** so later runs (and cron/Docker) skip 2FA until the trust token expires — on the order of **~30 days**, not forever. Renew ahead of time with `ifetch auth status` / `ifetch auth renew` (see [Authentication that survives a headless box](#authentication-that-survives-a-headless-box) and [docs/troubleshooting.md](docs/troubleshooting.md)).
+
+Headless boxes cannot answer a prompt: supply the code with `--2fa-code`, `$IFETCH_2FA_CODE`, `--2fa-file`, or `--2fa-webhook` instead.
+
+### 5. Download a folder
+
+```sh
+ifetch Documents ~/icloud-backup
+```
+
+Re-run the same command tomorrow: unchanged files are skipped (metadata fast path — see [How re-runs decide what to download](#how-re-runs-decide-what-to-download)).
+
+**Prefer a browser?** After install + keyring + `ICLOUD_EMAIL`:
+
+```sh
+ifetch serve
+# open the printed http://127.0.0.1:8765/?t=… URL
+```
+
+See [docs/webui.md](docs/webui.md).
+
+### Before you blame an empty listing
+
+| Situation | What to do |
+|-----------|------------|
+| **Advanced Data Protection (ADP)** enabled | Apple's web/API path needs "Access iCloud Data on the Web" on, and a PCS approval on a trusted device. Run `ifetch auth doctor --online` (add `--adp` if needed). **Honest caveat:** ADP support is implemented and pinned by [replay contract tests](tests/test_adp.py), **not** yet validated against a live ADP Apple ID — treat it as replay-proven, not field-proven. |
+| Want **iCloud Photos**, not Drive | Prefer [icloudpd](https://github.com/icloud-photos-downloader/icloud_photos_downloader). `ifetch-photos` exists but is **not production-polished** and has not been validated against a live library at scale. |
+| Running in **Docker / cron / a NAS** | Do the interactive first run (or `--2fa-file` renew) and persist the session volume — [docs/docker.md](docs/docker.md), [docs/scheduling.md](docs/scheduling.md). |
+
+> **Note on pyicloud:** iFetch is built on [timlaing/pyicloud](https://github.com/timlaing/pyicloud) (`pyicloud>=2.5.0` on PyPI). It is installed automatically with iFetch.
+
 
 ## Three commands to know
 
@@ -171,12 +220,12 @@ Honest caveats:
 
 ### Step 2: the network check (size comparison + prefix resume)
 
-When a file does not qualify for the fast path, iFetch opens the remote file and compares `content-length` against the local file — and consults SyncState before trusting a same-size match:
+When a file does not qualify for the fast path, iFetch opens the remote file and compares `content-length` against the local file. **Same size alone is never enough to skip** — SyncState must also prove the modified token still matches:
 
 | Situation | What happens |
 |---|---|
-| Remote size == local size **and** SyncState already proves the modified token matches | **Skipped.** Zero bytes transferred (this is the uncommon `--no-fast-scan` path; the fast path usually catches it first). |
-| Remote size == local size **but** SyncState token differs, or there is no SyncState proof yet | **The entire file is re-downloaded.** Same-size + token change never silent-skips and never rewrites SyncState until that fetch succeeds. |
+| Remote size == local size **and** SyncState proves the modified token matches | **Skipped.** Zero bytes transferred (uncommon when the fast path is on; `--no-fast-scan` usually hits this). |
+| Remote size == local size **but** the token changed, or SyncState has no proof yet | **Full re-download.** Never silent-skips; SyncState is rewritten only after that fetch succeeds. Content-based chunk diffing is still a [roadmap](#roadmap) item — this gate only catches same-size edits when Apple bumps the token. |
 | Local file is a shorter prefix (an interrupted download) | **Resumed** from that offset — only the missing tail is fetched. |
 | Local file is absent, empty, or any other size | **The entire file is re-downloaded.** |
 | `--skip-existing` and the path already exists on disk | **Skipped** before any network open (opt-in; leaves local bytes untouched). |
@@ -778,7 +827,7 @@ Common issues — the 2FA flow, expired sessions, per-OS keyring problems, rate 
 
 ## Roadmap
 
-**1.1 — content-based chunk diffing.** Today a changed file is re-downloaded in full, and a same-size edit is not detected at all (see [How re-runs decide what to download](#how-re-runs-decide-what-to-download)). Real content diffing — rolling-hash chunk boundaries, per-chunk digests, fetching only the ranges that actually differ — is the planned fix. It is genuinely hard here: Apple publishes no per-chunk digests and the download stream is not seekable, so iFetch has to derive and store its own chunk index locally. That work is scoped for 1.1 rather than claimed today.
+**1.1 — content-based chunk diffing.** Today a changed file is re-downloaded in full. A same-size edit is re-downloaded when Apple bumps the modified token (or SyncState is missing); if Apple does not bump it, size comparison alone still cannot see the edit (see [How re-runs decide what to download](#how-re-runs-decide-what-to-download)). Real content diffing — rolling-hash chunk boundaries, per-chunk digests, fetching only the ranges that actually differ — is the planned fix. It is genuinely hard here: Apple publishes no per-chunk digests and the download stream is not seekable, so iFetch has to derive and store its own chunk index locally. That work is scoped for 1.1 rather than claimed today.
 
 **Two-way sync — still deliberately not implemented.** Safe bidirectional sync needs conflict-resolution and delete-propagation semantics: what happens when both copies changed, and how do you distinguish "the user deleted this" from "this file failed to list this run"? Getting that wrong destroys the cloud copy, which is the one thing a backup tool must never do. If you need two-way sync today, use a tool built for it.
 
