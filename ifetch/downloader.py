@@ -1047,6 +1047,22 @@ class DownloadManager:
                 raise  # Non-retryable error
         raise last_error  # All retries exhausted
 
+
+    def _sync_state_proves_unchanged(self, item: Any, local_path: Path) -> bool:
+        """True only when SyncState already proves size+token+local size agree.
+
+        Used to decide whether a same-size network check may skip. Without this
+        proof, equal sizes must still fetch — otherwise a changed
+        ``remote_modified`` (or missing state) would silent-skip and
+        ``_record_sync_state`` would rewrite the token without downloading.
+        """
+        if self.sync_state is None:
+            return False
+        remote_size, remote_token = remote_metadata(item)
+        if remote_size is None or not remote_token:
+            return False
+        return self.sync_state.is_unchanged(local_path, remote_size, remote_token)
+
     def _can_fast_skip(self, item: Any, local_path: Path) -> bool:
         """Decide, using zero network I/O, whether a file is provably unchanged.
 
@@ -1643,8 +1659,15 @@ class DownloadManager:
                 # replaces the directory atomically in _finalize_payload.
                 stale_package_dir = local_path.is_dir()
 
+                # Same-size is only trustworthy when SyncState already proves
+                # the modified token matches. Token mismatch / missing state
+                # must full-fetch and must not _record_sync_state early.
+                trust_same_size = self._sync_state_proves_unchanged(item, local_path)
                 changed_ranges = self.chunker.compute_download_ranges(
-                    response, local_path, force=self.force or stale_package_dir
+                    response,
+                    local_path,
+                    force=self.force or stale_package_dir,
+                    trust_same_size=trust_same_size,
                 )
 
                 if changed_ranges is None:
