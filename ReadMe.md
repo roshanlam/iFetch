@@ -165,26 +165,28 @@ Turn it off with `--no-fast-scan` (forces a network check per file) or bypass al
 
 Honest caveats:
 
-- It trusts Apple to update `dateModified` when a file changes. If Apple doesn't, iFetch won't notice — though note the size comparison in step 2 would not have noticed a same-size edit either.
+- It trusts Apple to update `dateModified` when a file changes. If Apple doesn't, iFetch won't notice a same-size edit (step 2 only re-downloads same-size files when the token changed or SyncState is missing).
 - **Local** corruption at the same file size is not detected. That is what [`ifetch-verify`](#ifetch-verify--read-only-integrity-checking) is for.
 - Two concurrent `ifetch` runs against the same destination can clobber each other's state file. The consequence is extra network checks on the next run — never a false skip.
 
 ### Step 2: the network check (size comparison + prefix resume)
 
-When a file does not qualify for the fast path, iFetch opens the remote file and compares `content-length` against the local file:
+When a file does not qualify for the fast path, iFetch opens the remote file and compares `content-length` against the local file — and consults SyncState before trusting a same-size match:
 
 | Situation | What happens |
 |---|---|
-| Remote size == local size | **Skipped.** Assumed unchanged; zero bytes transferred. |
+| Remote size == local size **and** SyncState already proves the modified token matches | **Skipped.** Zero bytes transferred (this is the uncommon `--no-fast-scan` path; the fast path usually catches it first). |
+| Remote size == local size **but** SyncState token differs, or there is no SyncState proof yet | **The entire file is re-downloaded.** Same-size + token change never silent-skips and never rewrites SyncState until that fetch succeeds. |
 | Local file is a shorter prefix (an interrupted download) | **Resumed** from that offset — only the missing tail is fetched. |
 | Local file is absent, empty, or any other size | **The entire file is re-downloaded.** |
+| `--skip-existing` and the path already exists on disk | **Skipped** before any network open (opt-in; leaves local bytes untouched). |
 
 ### What iFetch does *not* do
 
 iFetch does **not** perform content-based chunk diffing. There is no rolling hash, and no per-chunk digests are compared against iCloud — Apple exposes none, and the download stream is not seekable. Two consequences you should know about before trusting it with your data:
 
 - **Editing one byte in the middle of a 2 GB file re-downloads all 2 GB.** The size changed (or didn't), so the whole file is re-fetched; there is no byte-range delta.
-- **A modification that leaves the file size unchanged is not detected.** Size comparison cannot see it, and the fast path only catches it if Apple bumped the modified timestamp. If you need certainty, run [`ifetch-verify`](#ifetch-verify--read-only-integrity-checking) at `--level redownload`.
+- **A modification that leaves the file size unchanged is only caught when Apple bumps the modified timestamp** (fast path + the same-size token gate above). If Apple does not bump it, size comparison alone cannot see the edit. If you need certainty, run [`ifetch-verify`](#ifetch-verify--read-only-integrity-checking) at `--level redownload`.
 
 Genuine content-based chunk diffing is a [roadmap](#roadmap) item for 1.1.
 

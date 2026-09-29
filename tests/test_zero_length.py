@@ -351,7 +351,7 @@ def test_unchanged_verdict_without_local_file_downloads_instead(tmp_path, monkey
 
     monkeypatch.setattr(
         dm.chunker, "compute_download_ranges",
-        lambda resp, local_path=None, force=False: []
+        lambda resp, local_path=None, force=False, **kwargs: []
     )
     monkeypatch.setattr(
         dm, "download_chunk",
@@ -375,7 +375,7 @@ def test_unchanged_verdict_without_local_file_reports_failure_if_undownloadable(
 
     monkeypatch.setattr(
         dm.chunker, "compute_download_ranges",
-        lambda resp, local_path=None, force=False: []
+        lambda resp, local_path=None, force=False, **kwargs: []
     )
 
     def _boom(url, start, end, item=None):
@@ -503,28 +503,36 @@ def test_state_ignores_bundles_whose_stream_size_differs_from_the_listing(tmp_pa
 # ---------------------------------------------------------------------------
 # 6. Run report arithmetic
 # ---------------------------------------------------------------------------
-def test_run_report_counts_the_mixed_case(tmp_path):
+def test_run_report_counts_the_mixed_case(tmp_path, monkeypatch):
     dm = _manager(tmp_path)
+    # Ranged fetches (same.bin under AC3) need a local chunk stub; unknown-length
+    # streams still use iter_content on the open() response.
+    monkeypatch.setattr(
+        dm, "download_chunk",
+        lambda url, start, end, item=None: item._content[start:end + 1],
+    )
 
     bundle = StreamNode(name="setup.app", content=b"0123456789abcdef")
     empty = SizedNode(name="empty.txt", content=b"")
     broken = StreamNode(name="broken.app", content=b"abcdefgh", fail_after=4)
-    unchanged = SizedNode(name="same.bin", content=b"0123456789")
+    # Same size on disk, no SyncState proof → AC3: must full-fetch (not skip).
+    same = SizedNode(name="same.bin", content=b"0123456789")
     (tmp_path / "same.bin").write_bytes(b"0123456789")
 
     assert dm.download_drive_item(bundle, tmp_path / "setup.app") is True
     assert dm.download_drive_item(empty, tmp_path / "empty.txt") is True
     assert dm.download_drive_item(broken, tmp_path / "broken.app") is False
-    assert dm.download_drive_item(unchanged, tmp_path / "same.bin") is True
+    assert dm.download_drive_item(same, tmp_path / "same.bin") is True
 
     report = _summary(dm)
     assert report["total_files"] == 4
-    assert report["successful"] == 2
+    assert report["successful"] == 3  # bundle + empty + same (full fetch)
     assert report["failed"] == 1
-    assert report["skipped"] == 1
+    assert report["skipped"] == 0
 
     on_disk = {p.name for p in tmp_path.iterdir() if p.is_file()}
     # Every result reported as success or skip has a real file behind it.
     for result in dm.download_results:
         if result.status in ("completed", "skipped"):
             assert Path(result.path).name in on_disk
+
