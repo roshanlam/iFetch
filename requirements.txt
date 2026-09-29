@@ -1,6 +1,8 @@
 # pyicloud on PyPI is now the actively maintained timlaing/pyicloud fork
 # (>=2.5.0 has shared-drive shareID propagation for folder traversal).
 pyicloud>=2.5.0
+# Required at import time by pyicloud>=2.7 NotesService (not in base deps)
+rich>=15.0.0
 requests
 tqdm
 keyring

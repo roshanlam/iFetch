@@ -32,6 +32,9 @@ classifiers = [
 # >=2.5.0 is required for shared-drive (shareID) folder traversal.
 dependencies = [
     "pyicloud>=2.5.0",
+    # pyicloud>=2.7 imports rich unconditionally via NotesService, but only
+    # declares it under the optional [cli]/[dev] extras — pull it in ourselves.
+    "rich>=15.0.0",
     "requests",
     "tqdm",
     "keyring",
@@ -75,17 +78,11 @@ ifetch-conflicts = "ifetch.conflict_cli:main"
 ifetch-guard = "ifetch.guard_cli:main"
 ifetch-vanish = "ifetch.vanish_cli:main"
 ifetch-sharecheck = "ifetch.sharecheck_cli:main"
-ifetch-uplink = "ifetch.uplink_cli:main"
-ifetch-serve = "ifetch.serve_cli:main"
-ifetch-repair = "ifetch.repair_cli:main"
-ifetch-resume = "ifetch.repair_cli:resume_main"
+ifetch-serve = "ifetch.webui:main"
+ifetch-uplink = "ifetch.uplink:main"
 
 [tool.setuptools.packages.find]
-include = ["ifetch", "ifetch.exporters", "ifetch.webui"]
-exclude = ["tests*", "plugins*"]
+include = ["ifetch*"]
 
-# The web UI is a data file, not a module, so it needs saying explicitly.
-# Without this the wheel installs a `serve` command that starts a server with
-# no page to serve.
 [tool.setuptools.package-data]
-"ifetch.webui" = ["static/*"]
+ifetch = ["web/static/*"]
