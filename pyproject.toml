@@ -78,11 +78,17 @@ ifetch-conflicts = "ifetch.conflict_cli:main"
 ifetch-guard = "ifetch.guard_cli:main"
 ifetch-vanish = "ifetch.vanish_cli:main"
 ifetch-sharecheck = "ifetch.sharecheck_cli:main"
-ifetch-serve = "ifetch.webui:main"
-ifetch-uplink = "ifetch.uplink:main"
+ifetch-uplink = "ifetch.uplink_cli:main"
+ifetch-serve = "ifetch.serve_cli:main"
+ifetch-repair = "ifetch.repair_cli:main"
+ifetch-resume = "ifetch.repair_cli:resume_main"
 
 [tool.setuptools.packages.find]
-include = ["ifetch*"]
+include = ["ifetch", "ifetch.exporters", "ifetch.webui"]
+exclude = ["tests*", "plugins*"]
 
+# The web UI is a data file, not a module, so it needs saying explicitly.
+# Without this the wheel installs a `serve` command that starts a server with
+# no page to serve.
 [tool.setuptools.package-data]
-ifetch = ["web/static/*"]
+"ifetch.webui" = ["static/*"]
