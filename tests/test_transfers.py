@@ -226,7 +226,7 @@ class TestDownloaderWiring:
         dm = make_downloader(store, mirror, monkeypatch)
         monkeypatch.setattr(
             dm.chunker, "compute_download_ranges",
-            lambda resp, local_path=None, force=False: [(0, 9)],
+            lambda resp, local_path=None, force=False, **kwargs: [(0, 9)],
         )
 
         assert dm.download_drive_item(DummyItem(), mirror / "test.txt") is True
@@ -238,7 +238,7 @@ class TestDownloaderWiring:
         dm = make_downloader(store, mirror, monkeypatch)
         monkeypatch.setattr(
             dm.chunker, "compute_download_ranges",
-            lambda resp, local_path=None, force=False: [(0, 9)],
+            lambda resp, local_path=None, force=False, **kwargs: [(0, 9)],
         )
         monkeypatch.setattr(
             dm, "download_chunk",
@@ -257,7 +257,7 @@ class TestDownloaderWiring:
         dm = make_downloader(store, mirror, monkeypatch)
         monkeypatch.setattr(
             dm.chunker, "compute_download_ranges",
-            lambda resp, local_path=None, force=False: [(0, 9)],
+            lambda resp, local_path=None, force=False, **kwargs: [(0, 9)],
         )
         monkeypatch.setattr(
             dm, "download_chunk",
@@ -273,7 +273,7 @@ class TestDownloaderWiring:
         dm = make_downloader(store, mirror, monkeypatch, chunk=b"01234")
         monkeypatch.setattr(
             dm.chunker, "compute_download_ranges",
-            lambda resp, local_path=None, force=False: [(0, 4), (5, 9)],
+            lambda resp, local_path=None, force=False, **kwargs: [(0, 4), (5, 9)],
         )
         seen = []
         real = dm.journal.progress
@@ -297,7 +297,7 @@ class TestDownloaderWiring:
         dm = make_downloader(store, mirror, monkeypatch)
         monkeypatch.setattr(
             dm.chunker, "compute_download_ranges",
-            lambda resp, local_path=None, force=False: [],
+            lambda resp, local_path=None, force=False, **kwargs: [],
         )
 
         assert dm.download_drive_item(DummyItem(), mirror / "test.txt") is True
@@ -309,7 +309,7 @@ class TestDownloaderWiring:
         dm = DownloadManager(email="user@example.com", max_retries=1)
         monkeypatch.setattr(
             dm.chunker, "compute_download_ranges",
-            lambda resp, local_path=None, force=False: [(0, 9)],
+            lambda resp, local_path=None, force=False, **kwargs: [(0, 9)],
         )
         monkeypatch.setattr(dm, "download_chunk", lambda *a, **k: b"0123456789")
         monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
