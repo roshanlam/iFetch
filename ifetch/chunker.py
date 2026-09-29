@@ -12,7 +12,9 @@ class FileChunker:
     seekable, so the only cheap evidence available is the total size.  What this
     class actually implements is:
 
-    * size-based change detection (same size -> assume unchanged), and
+    * size-based change detection (same size -> assume unchanged **only when
+      the caller sets** ``trust_same_size=True``; DownloadManager passes False
+      unless SyncState already proves size+modified-token match), and
     * prefix resume (shorter local file -> fetch only the missing tail).
 
     Real content-based chunk diffing is deliberately deferred to 1.1.
@@ -113,6 +115,7 @@ class FileChunker:
         response: Any,
         local_path: Optional[Path] = None,
         force: bool = False,
+        trust_same_size: bool = True,
     ) -> Optional[List[Tuple[int, int]]]:
         """
         Decide which byte ranges of the remote file still have to be fetched.
@@ -127,7 +130,11 @@ class FileChunker:
         * remote ``content-length`` is 0            -> nothing to download
         * ``force`` is set                          -> download everything
         * no local file (or an empty one)           -> download everything
-        * local size == remote size                 -> assume UNCHANGED, skip
+        * local size == remote size and
+          ``trust_same_size`` is True               -> assume UNCHANGED, skip
+        * local size == remote size and
+          ``trust_same_size`` is False              -> download everything
+          (caller could not prove the modified token is unchanged)
         * 0 < local size < remote size              -> resume from the prefix
         * local size > remote size                  -> download everything
 
@@ -135,14 +142,20 @@ class FileChunker:
         answer, the total size is unknown" — these are NOT interchangeable and
         the caller must branch on ``None`` explicitly.
 
-        The "same size means unchanged" assumption is the known accuracy limit
-        of this strategy; a same-size in-place edit is invisible to it.  Real
-        content diffing is deferred to 1.1.
+        The "same size means unchanged" assumption is only safe when the caller
+        has independently proven the remote modified token still matches
+        SyncState (``trust_same_size=True``).  DownloadManager sets it False
+        on token mismatch or missing state so a same-size edit cannot silent-
+        skip or rewrite SyncState without a fetch.  Real content diffing is
+        deferred to 1.1.
 
         Args:
             response: The file download response (only ``headers`` are read)
             local_path: Path to the local file used for the size comparison
             force: Ignore the local file and re-fetch the whole thing
+            trust_same_size: When False, equal local/remote sizes still fetch
+                the whole file. Callers that lack SyncState proof of an
+                unchanged modified token must pass False.
 
         Returns:
             List of (start, end) inclusive byte ranges that need downloading,
@@ -169,8 +182,12 @@ class FileChunker:
         if local_size == 0:
             return self._build_ranges(total_size)
         if local_size == total_size:
-            # Sizes match - assume unchanged.
-            return []
+            # Sizes match. Only treat as unchanged when the caller has proven
+            # the remote modified token (via SyncState); otherwise a same-size
+            # edit would be invisible and SyncState could be poisoned.
+            if trust_same_size:
+                return []
+            return self._build_ranges(total_size)
         if local_size < total_size:
             # Resume from the already-downloaded prefix.
             return self._build_ranges(total_size, start_offset=local_size)
