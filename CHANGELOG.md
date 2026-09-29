@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Same-size + changed `remote_modified` no longer silent-skips or poisons SyncState.**
+  When local and remote sizes match but `.ifetch_state.json` does not prove the
+  modified token is unchanged (token mismatch or missing entry), iFetch now
+  re-downloads the file and only records SyncState after a successful fetch.
+  The metadata fast path is unchanged when size + token + local size already
+  agree. `--skip-existing` still skips before any network open.
+
 ## [1.1.0] - 2026-08-23
 
 ### Fixed
