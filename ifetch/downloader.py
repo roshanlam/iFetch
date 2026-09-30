@@ -38,6 +38,7 @@ from .manifest import Manifest
 from . import sharing
 from .ratelimit import BandwidthLimiter, create_limiter
 from .transfers import TransferJournal
+from .index import TRANSFER_ACTIVE, TRANSFER_FAILED, TRANSFER_PENDING
 from .naming import (
     NORMALIZE_PRESERVE,
     DirectorySanitizer,
@@ -1048,6 +1049,75 @@ class DownloadManager:
         raise last_error  # All retries exhausted
 
 
+
+    def _prefix_resume_is_proven(
+        self, local_path: Path, remote_size: Optional[int]
+    ) -> bool:
+        """True only when durable evidence says the local prefix is ours.
+
+        Prefix resume trusts local bytes blindly unless we can show this path
+        was our interrupted transfer for the same remote size. Evidence is:
+
+        * a ``.download`` tracker whose position matches the on-disk prefix
+          (``.temp`` if present, else the local file), or
+        * a journal row (active/failed/pending) whose ``total_bytes`` matches
+          the remote size and ``bytes_done`` matches that prefix length.
+
+        SyncState cannot prove a *partial* prefix (it only records completed
+        files). A shorter file with a completed SyncState entry is treated as
+        truncated/unknown and must full-fetch. Missing provenance → False.
+        """
+        if remote_size is None or remote_size <= 0:
+            return False
+        if not local_path.exists() or local_path.is_dir():
+            return False
+        try:
+            local_size = local_path.stat().st_size
+        except OSError:
+            return False
+        if local_size <= 0 or local_size >= remote_size:
+            return False
+
+        temp_path = local_path.with_suffix(local_path.suffix + ".temp")
+        try:
+            temp_size = temp_path.stat().st_size if temp_path.is_file() else None
+        except OSError:
+            temp_size = None
+        prefix_len = temp_size if temp_size is not None else local_size
+        if prefix_len <= 0 or prefix_len >= remote_size:
+            return False
+
+        # Tracker checkpoint from our own download of this path.
+        tracker = DownloadTracker(local_path)
+        tracker_ok = (
+            tracker.current_position > 0
+            and tracker.current_position == prefix_len
+        )
+
+        journal_ok = False
+        if self.journal is not None and self.journal.enabled and self.journal.store is not None:
+            try:
+                row = self.journal.store.get_transfer(self.journal.key_for(local_path))
+            except Exception:
+                row = None
+            if isinstance(row, dict):
+                state = row.get("state")
+                total = row.get("total_bytes")
+                done = row.get("bytes_done")
+                journal_ok = (
+                    state in (TRANSFER_ACTIVE, TRANSFER_FAILED, TRANSFER_PENDING)
+                    and total == remote_size
+                    and isinstance(done, int)
+                    and done == prefix_len
+                    and 0 < done < remote_size
+                )
+
+        # Prefer journal when present; tracker alone is enough when journal is off
+        # or has no row yet (crash before begin flushed). Either is provenance.
+        if journal_ok or tracker_ok:
+            return True
+        return False
+
     def _sync_state_proves_unchanged(self, item: Any, local_path: Path) -> bool:
         """True only when SyncState already proves size+token+local size agree.
 
@@ -1663,12 +1733,40 @@ class DownloadManager:
                 # the modified token matches. Token mismatch / missing state
                 # must full-fetch and must not _record_sync_state early.
                 trust_same_size = self._sync_state_proves_unchanged(item, local_path)
+                # Listing size is the best remote length we have before ranges
+                # are computed; content-length below must agree for resume.
+                listed_size, _ = remote_metadata(item)
+                trust_prefix = self._prefix_resume_is_proven(
+                    local_path,
+                    remote_length if remote_length is not None else listed_size,
+                )
+                if (
+                    not trust_prefix
+                    and local_path.is_file()
+                    and remote_length is not None
+                    and 0 < local_path.stat().st_size < remote_length
+                ):
+                    self.logger.info(json.dumps({
+                        "event": "prefix_resume_unproven",
+                        "file": getattr(item, "name", "unknown"),
+                        "path": str(local_path),
+                        "local_size": local_path.stat().st_size,
+                        "remote_size": remote_length,
+                        "action": "forcing_full_download",
+                    }))
                 changed_ranges = self.chunker.compute_download_ranges(
                     response,
                     local_path,
                     force=self.force or stale_package_dir,
                     trust_same_size=trust_same_size,
+                    trust_prefix_resume=trust_prefix,
                 )
+
+                if not trust_prefix:
+                    # Stale .download positions must not trim a forced full fetch
+                    # back into an unproven prefix resume.
+                    tracker.current_position = 0
+                    tracker.cleanup()
 
                 if changed_ranges is None:
                     # Unknown remote length -> ranged requests are impossible.

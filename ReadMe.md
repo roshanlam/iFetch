@@ -224,9 +224,10 @@ When a file does not qualify for the fast path, iFetch opens the remote file and
 
 | Situation | What happens |
 |---|---|
-| Remote size == local size **and** SyncState proves the modified token matches | **Skipped.** Zero bytes transferred (uncommon when the fast path is on; `--no-fast-scan` usually hits this). |
-| Remote size == local size **but** the token changed, or SyncState has no proof yet | **Full re-download.** Never silent-skips; SyncState is rewritten only after that fetch succeeds. Content-based chunk diffing is still a [roadmap](#roadmap) item — this gate only catches same-size edits when Apple bumps the token. |
-| Local file is a shorter prefix (an interrupted download) | **Resumed** from that offset — only the missing tail is fetched. |
+| Remote size == local size **and** SyncState already proves the modified token matches | **Skipped.** Zero bytes transferred (this is the uncommon `--no-fast-scan` path; the fast path usually catches it first). |
+| Remote size == local size **but** SyncState token differs, or there is no SyncState proof yet | **The entire file is re-downloaded.** Same-size + token change never silent-skips and never rewrites SyncState until that fetch succeeds. Content-based chunk diffing is still a [roadmap](#roadmap) item — this gate only catches same-size edits when Apple bumps the token. |
+| Local file is a shorter prefix **and** a `.download` tracker / transfer journal proves it is our interrupted transfer for this remote size | **Resumed** from that offset — only the missing tail is fetched. |
+| Local file is shorter **without** that provenance (e.g. a truncated or foreign file) | **The entire file is re-downloaded.** Corrupt prefixes must not finish “green”. |
 | Local file is absent, empty, or any other size | **The entire file is re-downloaded.** |
 | `--skip-existing` and the path already exists on disk | **Skipped** before any network open (opt-in; leaves local bytes untouched). |
 

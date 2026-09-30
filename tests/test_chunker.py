@@ -100,6 +100,19 @@ def test_compute_download_ranges_resume_from_local_size(tmp_path):
     assert ranges == [(5, 9)]
 
 
+def test_compute_download_ranges_untrusted_prefix_refetches(tmp_path):
+    """Without trust_prefix_resume, a shorter local file is not a safe prefix."""
+    file_path = tmp_path / "partial.bin"
+    file_path.write_bytes(b"XXXXX")
+    chunker = FileChunker(chunk_size=5)
+    response = _make_response(b"abcdefghij")
+
+    ranges = chunker.compute_download_ranges(
+        response, file_path, trust_prefix_resume=False
+    )
+    assert ranges == [(0, 4), (5, 9)]
+
+
 def test_compute_download_ranges_force_refetches_everything(sample_file):
     file_path, content = sample_file
     chunker = FileChunker(chunk_size=5)

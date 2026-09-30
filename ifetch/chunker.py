@@ -116,6 +116,7 @@ class FileChunker:
         local_path: Optional[Path] = None,
         force: bool = False,
         trust_same_size: bool = True,
+        trust_prefix_resume: bool = True,
     ) -> Optional[List[Tuple[int, int]]]:
         """
         Decide which byte ranges of the remote file still have to be fetched.
@@ -135,7 +136,11 @@ class FileChunker:
         * local size == remote size and
           ``trust_same_size`` is False              -> download everything
           (caller could not prove the modified token is unchanged)
-        * 0 < local size < remote size              -> resume from the prefix
+        * 0 < local size < remote size and
+          ``trust_prefix_resume`` is True           -> resume from the prefix
+        * 0 < local size < remote size and
+          ``trust_prefix_resume`` is False          -> download everything
+          (caller could not prove the local prefix is from our own transfer)
         * local size > remote size                  -> download everything
 
         An empty list means "nothing needs fetching".  ``None`` means "I cannot
@@ -156,6 +161,9 @@ class FileChunker:
             trust_same_size: When False, equal local/remote sizes still fetch
                 the whole file. Callers that lack SyncState proof of an
                 unchanged modified token must pass False.
+            trust_prefix_resume: When False, a shorter local file is not
+                treated as a trusted prefix — the whole file is fetched.
+                Callers that lack journal/tracker provenance must pass False.
 
         Returns:
             List of (start, end) inclusive byte ranges that need downloading,
@@ -189,8 +197,11 @@ class FileChunker:
                 return []
             return self._build_ranges(total_size)
         if local_size < total_size:
-            # Resume from the already-downloaded prefix.
-            return self._build_ranges(total_size, start_offset=local_size)
+            # Resume only when the caller proved the local bytes are our own
+            # interrupted transfer. A random shorter file may be corrupt.
+            if trust_prefix_resume:
+                return self._build_ranges(total_size, start_offset=local_size)
+            return self._build_ranges(total_size)
 
         # Local file is longer than remote: it definitely differs, refetch all.
         return self._build_ranges(total_size)
