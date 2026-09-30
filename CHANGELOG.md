@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-29
+
 ### Fixed
 
 - **Compose / Docker docs no longer point at a missing `:latest` tag.**
@@ -29,10 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-downloads the file and only records SyncState after a successful fetch.
   The metadata fast path is unchanged when size + token + local size already
   agree. `--skip-existing` still skips before any network open.
-
-## [1.1.0] - 2026-08-23
-
-### Fixed
 
 - **Large folders no longer slow down as they go.** Downloads now run on a
   single bounded worker pool instead of nesting a new pool per directory, and
