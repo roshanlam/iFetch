@@ -12,19 +12,19 @@ want the old ZIP behavior.
 ## The headline changes
 
 - **Crash-safe resume and repair.** A download cut off by a closed laptop, a
- dropped connection or a power cut can be finished without starting over.
- `ifetch resume` fetches only the unfinished files, without re-listing your
- whole drive; `ifetch repair` reports what was left behind and, with
- `--check-digests`, files that no longer match the checksum recorded when they
- were downloaded.
+  dropped connection or a power cut can be finished without starting over.
+  `ifetch resume` fetches only the unfinished files, without re-listing your
+  whole drive; `ifetch repair` reports what was left behind and, with
+  `--check-digests`, files that no longer match the checksum recorded when they
+  were downloaded.
 - **A recovery toolkit, not just a downloader.** `ifetch plan` dry-runs a sync
- before it touches anything, `ifetch audit` reconciles iCloud against your
- disk, `ifetch recover` finds what is missing or evicted, `ifetch snapshot`
- keeps dated states you can diff and restore, and `ifetch conflicts` spots
- renamed, moved or duplicated files instead of downloading them again.
-- **Advanced Data Protection and shared folders.** ADP-enabled accounts can now
- reach iCloud Drive, and files inside a folder shared by another Apple ID
- download correctly instead of failing with 404.
+  before it touches anything, `ifetch audit` reconciles iCloud against your
+  disk, `ifetch recover` finds what is missing or evicted, `ifetch snapshot`
+  keeps dated states you can diff and restore, and `ifetch conflicts` spots
+  renamed, moved or duplicated files instead of downloading them again.
+- **Advanced Data Protection and shared folders.** ADP is replay-proven / not
+  live-validated; shared folders are pinned by a contract-test harness, not a
+  live cross-account run. #31 and #32 are still open.
 
 ## Also new
 
