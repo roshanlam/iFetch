@@ -22,9 +22,9 @@ want the old ZIP behavior.
   disk, `ifetch recover` finds what is missing or evicted, `ifetch snapshot`
   keeps dated states you can diff and restore, and `ifetch conflicts` spots
   renamed, moved or duplicated files instead of downloading them again.
-- **Advanced Data Protection and shared folders.** ADP-enabled accounts can now
-  reach iCloud Drive, and files inside a folder shared by another Apple ID
-  download correctly instead of failing with 404.
+- **Advanced Data Protection and shared folders.** ADP is replay-proven / not
+  live-validated; shared folders are pinned by a contract-test harness, not a
+  live cross-account run. #31 and #32 are still open.
 
 ## Also new
 
@@ -34,5 +34,6 @@ want the old ZIP behavior.
 - **Ops** — `--bwlimit` (rclone-style bandwidth timetables), run-outcome notifications (Healthchecks.io / ntfy / webhooks), and an official Docker image.
 - **Faster on large drives** — big folders no longer slow down as the run goes on.
 - **From the community** — `--skip-existing` and `--retry-failed`, with thanks to external contributors.
+- **Demo GIF and Try it CTA** — first successful run (auth → package expand → fast-path re-run) in the README, plus an above-fold Try it CTA.
 
 Full details are in the [CHANGELOG](https://github.com/roshanlam/iFetch/blob/main/CHANGELOG.md).
