@@ -5,7 +5,7 @@ the image name is ordinary iFetch arguments and every flag in the
 [README](../ReadMe.md) works unchanged.
 
 ```
-ghcr.io/roshanlam/ifetch:latest
+ghcr.io/roshanlam/ifetch:edge
 ```
 
 Built for `linux/amd64` and `linux/arm64`, so it runs on a Raspberry Pi and on
@@ -120,7 +120,7 @@ docker run --rm -it \
   -v ~/ifetch/icloud:/data \
   -v ~/ifetch/config:/config \
   -v ~/ifetch/secrets/icloud_password:/run/secrets/icloud_password:ro \
-  ghcr.io/roshanlam/ifetch:latest \
+  ghcr.io/roshanlam/ifetch:edge \
   Documents /data --log-file /config/ifetch.log
 ```
 
@@ -301,9 +301,10 @@ you are looking at, then see
   files and makes outbound HTTPS connections; that is the whole of its
   privilege.
 
-Images are published on every `v*` tag as `:X.Y.Z`, `:X.Y`, `:X` and `:latest`,
-and on every push to `main` as `:edge`. Pin a version in production —
-`:latest` moving under a scheduled job is not a surprise you want at 02:30.
+Images are published on every push to `main` as `:edge` (plus a short
+`:sha-*` tag), and on every `v*` tag as `:X.Y.Z`, `:X.Y`, and `:X`.
+Compose defaults to `:edge` so anonymous pulls work today; pin a semver
+tag in production once a release is cut.
 
 ## Related
 

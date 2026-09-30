@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Compose / Docker docs no longer point at a missing `:latest` tag.**
+  `docker-compose.yml` and `docs/docker.md` now use `ghcr.io/roshanlam/ifetch:edge`,
+  which is what the GHCR workflow actually publishes from `main`. Semver tags
+  remain the right pin once a release is cut.
+
 - **Prefix resume requires provenance.** A shorter local file is no longer
   assumed to be a trusted interrupted download. Resume only when a `.download`
   tracker or transfer-journal row agrees on the prefix length and remote size;
