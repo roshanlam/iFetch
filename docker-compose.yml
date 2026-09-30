@@ -10,7 +10,7 @@
 
 services:
   ifetch:
-    image: ghcr.io/roshanlam/ifetch:latest
+    image: ghcr.io/roshanlam/ifetch:edge
     container_name: ifetch
     # `ifetch` is the entrypoint, so this is just its arguments:
     # <remote path> <local path> [flags]
