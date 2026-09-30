@@ -8,8 +8,6 @@
 
 Apple gives you two ways to get your data out of iCloud Drive: drag files around in Finder, or wait days for a privacy export. iFetch gives you a third: a scriptable CLI that downloads exactly what you want, skips files that haven't changed since the last run, resumes interrupted transfers, and keeps a local version history so an accidental overwrite in the cloud never costs you a file.
 
-> **📹 Demo GIF coming soon** — a ~20-second `ifetch Documents ~/icloud-backup` run showing the skip-unchanged fast path and the summary report. *(placeholder — to be recorded)*
-
 ## Why iFetch?
 
 **[rclone](https://rclone.org/iclouddrive/) is the serious alternative, and for many people the better choice.** It gained an iCloud Drive backend in v1.69.0 (January 2025), it uploads as well as downloads, and it reaches 70+ other clouds. If you want one tool for everything, use rclone. iFetch is deliberately narrow — download-only, iCloud-first — which is what lets it do a few things rclone's iCloud backend doesn't.
@@ -50,6 +48,10 @@ For **photos**, use [icloudpd](https://github.com/icloud-photos-downloader/iclou
 ## First successful run
 
 Goal: install → store credentials → pass 2FA once → download something small. About two minutes if Apple's prompt arrives promptly.
+
+![iFetch first-run demo](docs/assets/ifetch-demo.gif)
+
+*Auth-ready `ifetch Documents ~/icloud-backup`: a `.key` package expands to a usable directory, then an unchanged re-run skips on the metadata fast path (0 bytes). On a 2.8 GiB folder the same re-run measured 4.4s / 0 bytes — see [Benchmarks](#benchmarks).*
 
 ### 1. Install
 
