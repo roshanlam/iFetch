@@ -478,19 +478,80 @@ def test_prefix_resume_downloads_only_the_missing_tail(tmp_path, monkeypatch):
     assert local_path.read_bytes() == b"0123456789"
 
 
-def test_unchanged_via_network_is_reported_as_skipped(tmp_path, monkeypatch):
-    """No state file, but sizes match -> counted as skipped, not failed."""
-    node = FakeNode("file.bin")
+def test_no_sync_state_same_size_must_full_fetch(tmp_path, monkeypatch):
+    """AC3: no SyncState + same size + existing local => download, not silent-skip."""
+    node = FakeNode("file.bin", content=b"ABCDEFGHIJ")
     local_path = tmp_path / "file.bin"
-    local_path.write_bytes(node._content)
+    local_path.write_bytes(b"0123456789")  # same size, different bytes
 
     dm = _manager(tmp_path, monkeypatch)
     assert dm.download_drive_item(node, local_path) is True
+    assert local_path.read_bytes() == b"ABCDEFGHIJ"
 
     report = dm.generate_summary_report()["summary"]
-    assert report["skipped"] == 1
+    assert report["successful"] == 1
+    assert report["skipped"] == 0
     assert report["failed"] == 0
-    # ...and it seeds the state so the *next* run needs no network at all.
+
+    # After a successful fetch, SyncState is seeded so the next run can fast-skip.
+    node.open_calls = 0
+    dm.sync_state.save()
+    dm2 = _manager(tmp_path, monkeypatch)
+    dm2.sync_state = SyncState(tmp_path)
+    assert dm2.download_drive_item(node, local_path) is True
+    assert node.open_calls == 0
+
+
+def test_same_size_token_change_forces_redownload_and_delays_state(tmp_path, monkeypatch):
+    """AC1: same size but SyncState token != current remote_metadata => full fetch;
+    SyncState must not carry the new token until that fetch succeeds.
+    """
+    node = FakeNode("file.bin", content=b"0123456789", date_modified=MTIME_A)
+    dm, local_path = _seed(tmp_path, monkeypatch, node)
+
+    # Remote: same length, new modified token, new bytes.
+    node2 = FakeNode("file.bin", content=b"ABCDEFGHIJ", date_modified=MTIME_B)
+    assert local_path.read_bytes() == b"0123456789"
+
+    dm2 = _manager(tmp_path, monkeypatch)
+    dm.sync_state.save()
+    dm2.sync_state = SyncState(tmp_path)
+
+    # Prove the stale entry would *not* fast-skip (token mismatch).
+    size2, token2 = remote_metadata(node2)
+    assert dm2.sync_state.is_unchanged(local_path, size2, token2) is False
+
+    assert dm2.download_drive_item(node2, local_path) is True
+    assert node2.open_calls >= 1
+    assert local_path.read_bytes() == b"ABCDEFGHIJ"
+
+    report = dm2.generate_summary_report()["summary"]
+    assert report["successful"] == 1
+    assert report["skipped"] == 0
+
+    # Only after success may SyncState claim the new token.
+    assert dm2.sync_state.is_unchanged(local_path, size2, token2) is True
+
+
+def test_skip_existing_still_allows_same_size_skip_without_state(tmp_path, monkeypatch):
+    """AC3 exception: --skip-existing may leave same-size locals untouched."""
+    node = FakeNode("file.bin", content=b"ABCDEFGHIJ")
+    local_path = tmp_path / "file.bin"
+    local_path.write_bytes(b"0123456789")
+
+    dm = _manager(tmp_path, monkeypatch, skip_existing=True)
+    node.open_calls = 0
+    assert dm.download_drive_item(node, local_path) is True
+    assert node.open_calls == 0
+    assert local_path.read_bytes() == b"0123456789"
+    report = dm.generate_summary_report()["summary"]
+    assert report["skipped"] == 1
+
+
+def test_fast_path_still_skips_when_sync_state_proves_unchanged(tmp_path, monkeypatch):
+    """AC2: size+token+local prove unchanged => zero HTTPS open."""
+    node = FakeNode("file.bin")
+    dm, local_path = _seed(tmp_path, monkeypatch, node)
     node.open_calls = 0
     dm2 = _manager(tmp_path, monkeypatch)
     dm.sync_state.save()

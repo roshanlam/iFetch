@@ -47,7 +47,7 @@ def _make_response(data: bytes):
 
 
 def test_compute_download_ranges_same_size_is_treated_as_unchanged(sample_file):
-    """Documented limitation: equal size => assumed unchanged, content ignored."""
+    """Default trust_same_size=True: equal size => assumed unchanged."""
     file_path, content = sample_file
     chunker = FileChunker(chunk_size=5)
 
@@ -58,6 +58,19 @@ def test_compute_download_ranges_same_size_is_treated_as_unchanged(sample_file):
     ranges = chunker.compute_download_ranges(response, file_path)
 
     assert ranges == []
+
+
+def test_compute_download_ranges_same_size_untrusted_refetches(sample_file):
+    """Without trust_same_size, equal sizes must still fetch everything."""
+    file_path, content = sample_file
+    chunker = FileChunker(chunk_size=5)
+    remote_content = content[:-4] + b"XXXX"
+    response = _make_response(remote_content)
+    ranges = chunker.compute_download_ranges(
+        response, file_path, trust_same_size=False
+    )
+    assert ranges == [(0, 4), (5, 9), (10, 13)]
+
 
 
 def test_compute_download_ranges_all_new(tmp_path):

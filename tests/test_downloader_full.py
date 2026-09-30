@@ -42,7 +42,7 @@ def test_download_drive_item_success(tmp_path, monkeypatch):
     dm = DownloadManager(email="user@example.com", max_retries=1)
 
     # Patch helpers to simplify logic
-    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False: [(0, 4), (5, 9)])
+    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False, **kwargs: [(0, 4), (5, 9)])
     monkeypatch.setattr(dm, "download_chunk", lambda url, start, end, item=None: b"0123456789")
     monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
 
@@ -57,7 +57,7 @@ def test_download_drive_item_success(tmp_path, monkeypatch):
 
 def test_download_drive_item_merges_contiguous_ranges(tmp_path, monkeypatch):
     dm = DownloadManager(email="user@example.com", max_retries=1)
-    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False: [(0, 4), (5, 9)])
+    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False, **kwargs: [(0, 4), (5, 9)])
     monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
 
     calls = []
@@ -77,7 +77,7 @@ def test_download_drive_item_merges_contiguous_ranges(tmp_path, monkeypatch):
 
 def test_download_drive_item_recovers_from_initial_open_404(tmp_path, monkeypatch):
     dm = DownloadManager(email="user@example.com", max_retries=2)
-    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False: [(0, 9)])
+    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False, **kwargs: [(0, 9)])
     monkeypatch.setattr(dm, "download_chunk", lambda url, start, end, item=None: b"0123456789")
     monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
 
@@ -141,7 +141,7 @@ def test_download_drive_item_preserves_resumed_prefix_with_versioning(tmp_path, 
     local_path = tmp_path / "test.txt"
     local_path.write_bytes(b"abcde")
 
-    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False: [(5, 9)])
+    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False, **kwargs: [(5, 9)])
     monkeypatch.setattr(dm, "download_chunk", lambda url, start, end, item=None: b"fghij")
     monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
 
@@ -185,8 +185,8 @@ def test_download_drive_item_skip_existing_still_downloads_new_files(tmp_path, m
     dm = DownloadManager(email="user@example.com", max_retries=1, skip_existing=True)
     monkeypatch.setattr(dm.chunker, "get_file_chunks", lambda p: {})
     # Merged chunker API: our branch replaced find_changed_chunks with
-    # compute_download_ranges(response, local_path=None, force=False).
-    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False: [(0, 9)])
+    # compute_download_ranges(response, local_path=None, force=False, trust_same_size=...).
+    monkeypatch.setattr(dm.chunker, "compute_download_ranges", lambda resp, local_path=None, force=False, **kwargs: [(0, 9)])
     monkeypatch.setattr(dm, "download_chunk", lambda url, start, end, item=None: b"0123456789")
     monkeypatch.setattr(dm, "calculate_checksum", lambda p: "dummy")
 

@@ -32,6 +32,9 @@ classifiers = [
 # >=2.5.0 is required for shared-drive (shareID) folder traversal.
 dependencies = [
     "pyicloud>=2.5.0",
+    # pyicloud>=2.7 imports rich unconditionally via NotesService, but only
+    # declares it under the optional [cli]/[dev] extras — pull it in ourselves.
+    "rich>=15.0.0",
     "requests",
     "tqdm",
     "keyring",
