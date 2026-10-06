@@ -11,3 +11,5 @@ build/
 .coverage
 # Vendored upstream checkout used for research only
 /learn/
+# Offline compare.sh worktrees
+.bench-worktrees/
