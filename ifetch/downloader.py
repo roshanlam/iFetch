@@ -27,10 +27,13 @@ from .auth import (
     DEFAULT_WARN_DAYS,
     TwoFactorResolver,
     TwoFactorUnavailable,
+    TwoFactorRouteUnsupported,
     AuthFailure,
     PyiCloudPCSTransport,
     classify_auth_error,
     classify_session_death,
+    describe_delivery,
+    request_two_factor_code,
     ensure_pcs_cookies,
     evaluate_expiry,
     read_session_snapshot,
@@ -569,6 +572,11 @@ class DownloadManager:
 
             if self.api.requires_2fa:
                 print("\nTwo-factor authentication required.")
+                # Before collecting the code: this is what starts Apple's
+                # trusted-device flow, without which a correct code is refused.
+                notice = describe_delivery(request_two_factor_code(self.api))
+                if notice:
+                    print(notice)
                 code = self._obtain_2fa_code(two_factor)
                 if not self.api.validate_2fa_code(code):
                     raise Exception("Failed to verify 2FA code")
@@ -607,7 +615,7 @@ class DownloadManager:
                 "No stored password found. Run 'icloud auth login --username you@example.com' "
                 "(requires: pip install \"ifetch[auth]\") to store it in the system keyring."
             ) from e
-        except TwoFactorUnavailable:
+        except (TwoFactorUnavailable, TwoFactorRouteUnsupported):
             raise
         except Exception as e:
             raise Exception(self._explain(e, f"Authentication failed: {e}")) from e

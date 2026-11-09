@@ -473,7 +473,9 @@ def classify_auth_error(error: Any) -> AuthFailure:
             raw=text,
         )
 
-    if "409" in low and ("edp" in low or "valid" in low):
+    if re.search(r"\b409\b", low) and (
+        re.search(r"\bedp\b", low) or re.search(r"(?<!in)\bvalid\b", low)
+    ):
         return AuthFailure(
             code="code_accepted_but_rejected",
             summary=(
@@ -499,13 +501,23 @@ def classify_auth_error(error: Any) -> AuthFailure:
             raw=text,
         )
 
-    if "no stored password" in low or "nostoredpassword" in low:
+    if ("no stored password" in low or "nostoredpassword" in low
+            or "no password set" in low):
+        # "No password set" is pyicloud's text when the stored session has
+        # expired and a full sign-in needs a password the keyring lacks. The
+        # session hid the gap until then, so this often appears out of nowhere.
         return AuthFailure(
             code="no_stored_password",
-            summary="No password is stored in the system keyring for this Apple ID.",
+            summary=(
+                "A full sign-in is needed (the stored session is no longer "
+                "accepted) and no password is stored in the system keyring for "
+                "this Apple ID."
+            ),
             remedy=(
-                "Run 'icloud auth login --username you@example.com' "
-                '(requires: pip install "ifetch[auth]") to store it.'
+                "Run 'icloud auth login --username you@example.com' and answer "
+                "yes to 'Save password in keyring?'. It also completes 2FA and "
+                "saves a session iFetch reuses. On a machine with no keyring, "
+                "pass --password-command instead."
             ),
             raw=text,
         )
@@ -1148,6 +1160,83 @@ PCS_ACQUIRED = "acquired"
 PCS_ALREADY_PRESENT = "already_present"
 PCS_NOT_REQUIRED = "not_required"
 PCS_UNDETERMINED = "undetermined"
+
+
+class TwoFactorRouteUnsupported(Exception):
+    """Apple wants a second factor iFetch cannot supply (a security key)."""
+
+    def __init__(self) -> None:
+        self.failure = AuthFailure(
+            code="security_key_required",
+            summary=(
+                "This Apple ID signs in with a hardware security key, which "
+                "iFetch cannot use yet."
+            ),
+            remedy=(
+                "Sign in once with pyicloud's own CLI, which supports FIDO2 keys "
+                "('icloud --username you@example.com'), then run iFetch: it reuses "
+                "the stored session. Or remove the security key from the Apple ID "
+                "to use device codes instead."
+            ),
+        )
+        super().__init__(f"{self.failure.summary} {self.failure.remedy}")
+
+
+def request_two_factor_code(service: Any) -> str:
+    """Ask Apple to deliver a 2FA code, and say where it was sent.
+
+    Must run *before* the code is collected. pyicloud 2.6+ starts Apple's
+    trusted-device bridge (the HSA2 flow that current accounts use) here, and
+    without it ``validate_2fa_code`` silently falls back to the legacy endpoint,
+    which rejects even a correct code. Returns ``"trusted_device"``, ``"sms"``
+    or ``""`` (unknown, or an older pyicloud that has no such call, where Apple
+    pushes the code by itself at sign-in).
+
+    Raises :class:`TwoFactorRouteUnsupported` for a security-key challenge.
+    """
+    request = getattr(service, "request_2fa_code", None)
+    if not callable(request):
+        return ""
+    delivered = request()
+    method = getattr(service, "two_factor_delivery_method", "") or ""
+    if not delivered and method == "security_key":
+        raise TwoFactorRouteUnsupported()
+    return method if method in ("trusted_device", "sms") else ""
+
+
+def describe_delivery(method: str) -> str:
+    """The line to show once a code has been requested."""
+    if method == "trusted_device":
+        return "Requested a code on your trusted Apple devices: tap Allow, then read the code."
+    if method == "sms":
+        return "Requested a code by SMS."
+    return ""
+
+
+class TwoFactorCodeRejected(Exception):
+    """Apple refused the submitted two-factor code.
+
+    Carries its :class:`AuthFailure` so it is never re-classified from its own
+    text - which is exactly how a plain rejection once came out as "Apple
+    confirmed the code is valid but returned 409".
+    """
+
+    def __init__(self, delivery: str = ""):
+        how = f" (sent via {delivery})" if delivery else ""
+        self.failure = AuthFailure(
+            code="two_factor_code_rejected",
+            summary=f"Apple did not accept that two-factor code{how}.",
+            remedy=(
+                "Codes expire after a few minutes, and a code from an earlier "
+                "attempt will not work: every run asks Apple for a new one. "
+                "Re-run and type only the newest code, promptly. If fresh codes "
+                "keep being refused, generate one on a trusted device instead "
+                "(Settings > [your name] > Sign-In & Security > Two-Factor "
+                "Authentication > Get Verification Code) and pass it with "
+                "--2fa-code."
+            ),
+        )
+        super().__init__(f"{self.failure.summary} {self.failure.remedy}")
 
 
 class ADPError(Exception):

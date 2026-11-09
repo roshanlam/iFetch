@@ -286,7 +286,12 @@ class TestRenewCommand:
             factory=lambda **kw: FakeService(requires_2fa=True, validate=False),
         )
         assert code == 2
-        assert "rejected" in out.lower() or "409" in out
+        assert "did not accept that two-factor code" in out
+        # Our own message must never be re-read as Apple's 409 quirk: that is
+        # how a plain wrong/old code was once reported as "valid but 409".
+        assert "409" not in out
+        assert "confirmed the 2FA code is valid" not in out
+        assert "newest code" in out
 
     def test_an_apple_error_is_classified_not_relayed_raw(self, tmp_path):
         snapshot_expiring_in(tmp_path, 20)
@@ -492,3 +497,128 @@ class TestOfflineVerify:
     def test_online_mode_still_requires_an_icloud_path(self, signed_mirror):
         with pytest.raises(SystemExit):
             verify_main([])
+
+
+class FakeTerminal:
+    """A stdin that is a TTY and answers with the given lines."""
+
+    def __init__(self, *lines, tty=True):
+        self.lines = list(lines)
+        self.tty = tty
+
+    def isatty(self):
+        return self.tty
+
+    def readline(self):
+        return self.lines.pop(0) if self.lines else ""
+
+    def read(self, *a):
+        if self.tty:
+            raise AssertionError("a TTY must never be slurped as piped input")
+        data, self.lines = "".join(self.lines), []
+        return data
+
+
+class TestRenewPromptsOnATerminal:
+    """With no configured code source, a person at a terminal is asked.
+
+    Previously renew failed with "No two-factor code available" even when run
+    by hand in a terminal, so the documented first step of every setup guide
+    (`ifetch auth renew`) could not be completed without --2fa-file tricks.
+    """
+
+    def _renew(self, tmp_path, monkeypatch, terminal, *extra):
+        snapshot_expiring_in(tmp_path, 20)
+        monkeypatch.setattr(sys, "stdin", terminal)
+        service = FakeService(requires_2fa=True)
+        code, out = run_renew(
+            ["--email", ACCOUNT, "--cookie-directory", str(tmp_path), *extra],
+            factory=lambda **kw: service,
+        )
+        return code, out, service
+
+    def test_a_typed_code_is_submitted(self, tmp_path, monkeypatch):
+        code, out, service = self._renew(tmp_path, monkeypatch, FakeTerminal("123456\n"))
+        assert code == 0
+        assert service.validated_with == "123456"
+        assert "Enter the 6-digit code" in out
+
+    def test_a_typo_is_asked_again(self, tmp_path, monkeypatch):
+        code, out, service = self._renew(
+            tmp_path, monkeypatch, FakeTerminal("12345\n", "654321\n"))
+        assert code == 0
+        assert service.validated_with == "654321"
+        assert "not a 6-digit code" in out
+
+    def test_eof_at_the_prompt_fails_cleanly(self, tmp_path, monkeypatch):
+        code, out, service = self._renew(tmp_path, monkeypatch, FakeTerminal())
+        assert code == 2
+        assert service.validated_with is None
+        assert "--2fa-code" in out
+
+    def test_non_interactive_never_prompts(self, tmp_path, monkeypatch):
+        code, out, service = self._renew(
+            tmp_path, monkeypatch, FakeTerminal("123456\n"), "--non-interactive")
+        assert code == 2
+        assert service.validated_with is None
+        assert "Enter the 6-digit code" not in out
+
+    def test_no_stdin_never_prompts(self, tmp_path, monkeypatch):
+        code, _, service = self._renew(
+            tmp_path, monkeypatch, FakeTerminal("123456\n"), "--no-stdin")
+        assert code == 2
+        assert service.validated_with is None
+
+    def test_no_terminal_never_prompts(self, tmp_path, monkeypatch):
+        """cron / Docker without -it: fail fast rather than block on a read."""
+        code, out, service = self._renew(tmp_path, monkeypatch, FakeTerminal(tty=False))
+        assert code == 2
+        assert service.validated_with is None
+        assert "Enter the 6-digit code" not in out
+
+    def test_piped_code_still_works_without_a_terminal(self, tmp_path, monkeypatch):
+        code, out, service = self._renew(
+            tmp_path, monkeypatch, FakeTerminal("777777\n", tty=False))
+        assert code == 0
+        assert service.validated_with == "777777"
+        assert "Enter the 6-digit code" not in out
+
+    def test_a_configured_source_wins_over_the_prompt(self, tmp_path, monkeypatch):
+        terminal = FakeTerminal("999999\n")
+        code, out, service = self._renew(
+            tmp_path, monkeypatch, terminal, "--2fa-code", "111111")
+        assert code == 0
+        assert service.validated_with == "111111"
+        assert terminal.lines == ["999999\n"]  # never asked
+
+    def test_json_keeps_the_prompt_off_stdout(self, tmp_path, monkeypatch, capsys):
+        code, out, _ = self._renew(
+            tmp_path, monkeypatch, FakeTerminal("123456\n"), "--json")
+        assert code == 0
+        assert json.loads(out)["renewed"] is True  # stdout is pure JSON
+        err = capsys.readouterr().err
+        assert "Enter the 6-digit code" in err
+        assert "Apple requires a two-factor code" in err
+
+
+class TestRejectedCodeIsNotMisclassified:
+    def test_json_names_the_rejection(self, tmp_path):
+        snapshot_expiring_in(tmp_path, 20)
+        code, out = run_renew(
+            ["--email", ACCOUNT, "--cookie-directory", str(tmp_path),
+             "--2fa-code", "000000", "--no-stdin", "--json"],
+            factory=lambda **kw: FakeService(requires_2fa=True, validate=False),
+        )
+        assert code == 2
+        assert json.loads(out)["code"] == "two_factor_code_rejected"
+
+    def test_delivery_method_is_named(self, tmp_path):
+        snapshot_expiring_in(tmp_path, 20)
+        service = FakeService(requires_2fa=True, validate=False)
+        service.two_factor_delivery_method = "sms"
+        _, out = run_renew(
+            ["--email", ACCOUNT, "--cookie-directory", str(tmp_path),
+             "--2fa-code", "000000", "--no-stdin"],
+            factory=lambda **kw: service,
+        )
+        assert "sent via SMS" in out

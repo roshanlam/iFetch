@@ -709,3 +709,35 @@ class TestAuthDoctor:
         for check in diagnosis.checks:
             assert check.name in text
         assert "Overall:" in text
+
+
+class TestConflict409Rule:
+    """The 409 rule must match Apple's quirk and nothing that merely mentions
+    'invalid' or a number containing 409."""
+
+    def test_apple_valid_but_409_still_matches(self):
+        from ifetch.auth import classify_auth_error
+
+        failure = classify_auth_error(Exception("Code is valid but Apple returned 409 Conflict"))
+        assert failure.code == "code_accepted_but_rejected"
+
+    def test_invalid_code_with_409_does_not_match(self):
+        from ifetch.auth import classify_auth_error
+
+        failure = classify_auth_error(Exception("Invalid verification code (409)"))
+        assert failure.code != "code_accepted_but_rejected"
+
+    def test_carried_rejection_passes_through(self):
+        from ifetch.auth import TwoFactorCodeRejected, classify_auth_error
+
+        failure = classify_auth_error(TwoFactorCodeRejected("SMS"))
+        assert failure.code == "two_factor_code_rejected"
+
+
+def test_pyicloud_no_password_set_is_named():
+    """pyicloud's text when the session expired and the keyring has no password."""
+    from ifetch.auth import classify_auth_error
+
+    failure = classify_auth_error(Exception("No password set"))
+    assert failure.code == "no_stored_password"
+    assert "Save password in keyring" in failure.remedy
