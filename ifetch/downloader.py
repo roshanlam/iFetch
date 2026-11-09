@@ -7,7 +7,7 @@ import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Set, Dict, Any, Union, Tuple
+from typing import Callable, Optional, List, Set, Dict, Any, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
@@ -27,7 +27,11 @@ from .auth import (
     DEFAULT_WARN_DAYS,
     TwoFactorResolver,
     TwoFactorUnavailable,
+    AuthFailure,
+    PyiCloudPCSTransport,
     classify_auth_error,
+    classify_session_death,
+    ensure_pcs_cookies,
     evaluate_expiry,
     read_session_snapshot,
     region_service_kwargs,
@@ -363,6 +367,15 @@ class SyncState:
                 self._dirty += 1
 
 
+class SessionRenewalError(Exception):
+    """The run's session died and could not be renewed mid-run.
+
+    Its message is the same cause-plus-remedy text :meth:`authenticate` gives,
+    so a run that dies at hour three reads exactly like one that failed at
+    sign-in.
+    """
+
+
 class DownloadManager:
     """Enhanced iCloud file downloader with differential updates support."""
     def __init__(
@@ -384,6 +397,8 @@ class DownloadManager:
         password: Optional[str] = None,
         bwlimit: Optional[Union[str, BandwidthLimiter]] = None,
         skip_existing: bool = False,
+        session_renewer: Optional[Callable[[AuthFailure], None]] = None,
+        max_session_renewals: int = 3,
     ):
         self.email = email or os.environ.get('ICLOUD_EMAIL')
         if not self.email:
@@ -419,6 +434,17 @@ class DownloadManager:
         )
         self.http.mount("http://", adapter)
         self.http.mount("https://", adapter)
+
+        # Mid-run session renewal (single-flight). ``_auth_generation`` counts
+        # successful renewals; a worker records it before each open so that,
+        # after a failure, it can tell whether somebody else has already
+        # renewed in the meantime and it only needs to retry.
+        self.session_renewer = session_renewer
+        self.max_session_renewals = max(0, int(max_session_renewals))
+        self._auth_lock = threading.Lock()
+        self._auth_generation = 0
+        self._session_renewals = 0
+        self._renew_failure: Optional[str] = None
 
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
@@ -763,8 +789,9 @@ class DownloadManager:
         """Download one inclusive byte range, retrying with jittered backoff.
 
         Throttles (429/503) and connection errors are retried; a server-supplied ``Retry-After`` replaces the computed
-        wait. 404/410 usually mean the signed URL aged out, so the item is
-        re-opened for a fresh one.
+        wait. 401/403/404/410 usually mean the signed URL aged out, so the item
+        is re-opened for a fresh one - which is also where a dead session gets
+        renewed.
         """
         headers = {'Range': f'bytes={start}-{end}'}
         attempts = max(1, self.max_retries)
@@ -788,11 +815,13 @@ class DownloadManager:
             except requests.HTTPError as e:
                 last_error = e
                 status = status_from_error(e)
-                if status in (404, 410) and item is not None:
+                if status in (401, 403, 404, 410) and item is not None:
                     # Signed URL likely expired; refresh and retry.
                     try:
                         with self._open_with_retry(item, max_retries=1) as refreshed:
                             url = refreshed.url
+                    except SessionRenewalError:
+                        raise
                     except Exception:
                         pass
             except requests.RequestException as e:
@@ -972,17 +1001,102 @@ class DownloadManager:
         text = f"{type(exc).__name__}: {exc}".replace("\n", " ")
         return text[:200]
 
+    # -- mid-run session renewal ----------------------------------------
+    def renew_session(self, observed_generation: int, cause: AuthFailure) -> None:
+        """Renew the shared session once, however many workers hit its death.
+
+        ``observed_generation`` is the value of ``_auth_generation`` the caller
+        read *before* the request that failed. The first worker through the
+        lock renews; everyone queued behind it finds the generation moved on
+        and simply retries on the renewed session. If the renewal failed, they
+        get the same failure immediately rather than each trying again - a
+        stampede of sign-ins is exactly what gets an account throttled.
+
+        Raises :class:`SessionRenewalError` (carrying the usual
+        cause-plus-remedy text) when the session cannot be renewed.
+        """
+        with self._auth_lock:
+            if self._auth_generation != observed_generation:
+                return  # Renewed by another worker while we were failing.
+            if self._renew_failure is not None:
+                raise SessionRenewalError(self._renew_failure)
+            if self._session_renewals >= self.max_session_renewals:
+                self._renew_failure = (
+                    f"{cause.summary}\n  -> {cause.remedy}\n"
+                    f"  (gave up after {self._session_renewals} mid-run renewals)"
+                )
+                raise SessionRenewalError(self._renew_failure)
+
+            self._session_renewals += 1
+            self.logger.warning(json.dumps({
+                "event": "session_renew_started",
+                "account": self.email,
+                "cause": cause.code,
+                "renewal": self._session_renewals,
+            }))
+            try:
+                renewer = self.session_renewer or self._default_session_renew
+                renewer(cause)
+            except Exception as exc:
+                failure = classify_auth_error(exc)
+                if failure.code == "unknown":
+                    failure = cause
+                message = (
+                    f"{failure.summary}\n  -> {failure.remedy}\n"
+                    f"  (mid-run session renewal failed: {self._brief(exc)})"
+                )
+                self._renew_failure = message
+                self.logger.error(json.dumps({
+                    "event": "session_renew_failed",
+                    "account": self.email,
+                    "cause": cause.code,
+                    **failure.to_dict(),
+                }))
+                raise SessionRenewalError(message) from exc
+
+            self._auth_generation += 1
+            self.logger.warning(json.dumps({
+                "event": "session_renewed",
+                "account": self.email,
+                "cause": cause.code,
+                "generation": self._auth_generation,
+            }))
+
+    def _default_session_renew(self, cause: AuthFailure) -> None:
+        """Re-validate the stored session in place, without any prompt.
+
+        ``authenticate(force_refresh=True)`` rebuilds the session from the
+        stored trust token on the *same* requests session, so every DriveNode
+        already in hand keeps working. A mid-run renew can never answer 2FA:
+        if Apple wants a code, that is a failure to report, not a prompt.
+        """
+        api = self.api
+        if api is None:
+            raise Exception("No authenticated session to renew")
+        api.authenticate(force_refresh=True)
+        if getattr(api, "requires_2fa", False) or getattr(api, "requires_2sa", False):
+            raise Exception(
+                "Invalid session token: Apple requires a fresh two-factor sign-in, "
+                "which an unattended run cannot provide"
+            )
+        if cause.code.startswith("adp_"):
+            # Raises ADPError (already classified) if the cookies cannot be had.
+            ensure_pcs_cookies(PyiCloudPCSTransport(api), timeout=120.0)
+
     def _open_with_retry(
         self,
         item: Any,
         max_retries: Optional[int] = None,
         remote_path: Optional[str] = None,
     ) -> Any:
-        """Open an item, retrying transient failures.
+        """Open an item, retrying transient failures and renewing a dead session.
 
-        Throttles (429/503) and connection errors back off with full jitter,
-        honouring ``Retry-After`` from the response or Apple's JSON body;
-        anything else (auth, permissions, not-found) is raised at once.
+        * throttles (429/503) and connection errors back off with full jitter,
+          honouring ``Retry-After`` from the response or Apple's JSON body;
+        * a session-death error (401 / invalid session token / 423 PCS) triggers
+          one single-flight renew, after which the open is retried once without
+          spending an attempt; a second death on the same open is final;
+        * anything else (auth, permissions, not-found) is raised at once.
         """
         if max_retries is None:
             max_retries = self.max_retries
@@ -990,8 +1104,10 @@ class DownloadManager:
 
         last_error: Optional[Exception] = None
         current_item = item
+        renewed = False
         attempt = 0
         while attempt < max_retries:
+            generation = self._auth_generation
             try:
                 return current_item.open(stream=True)
             except Exception as e:
@@ -1025,6 +1141,14 @@ class DownloadManager:
                         ),
                     }))
                     raise
+
+                death = None if is_generic_404 else classify_session_death(e)
+                if death is not None:
+                    if renewed:
+                        raise  # Renewed already and still refused: final.
+                    self.renew_session(generation, death)
+                    renewed = True
+                    continue  # The retry after a renew does not use an attempt.
 
                 if is_generic_404 and remote_path and attempt < max_retries - 1:
                     try:

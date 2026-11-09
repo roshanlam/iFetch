@@ -537,6 +537,99 @@ def classify_auth_error(error: Any) -> AuthFailure:
     )
 
 
+#: Classifications that mean "the session this run started with has died" -
+#: the conditions a mid-run renew can plausibly cure.  Credential, region and
+#: 2FA failures are deliberately absent: renewing cannot fix any of them.
+SESSION_DEATH_CODES = frozenset({
+    "invalid_session_token",
+    "adp_pcs_cookies",
+    "adp_webauth_token_missing",
+    "session_expired",
+})
+
+#: HTTP statuses Apple answers a dead or under-privileged session with.
+SESSION_DEATH_STATUSES = frozenset({401, 421, 423})
+
+# Only a status number in an HTTP-shaped context counts: pyicloud renders
+# "reason (423)", requests renders "401 Client Error: Unauthorized", and our own
+# text says "HTTP 423". A bare 423 could just as well be part of a file name.
+_SESSION_STATUS_TEXT = re.compile(
+    r"\((401|421|423)\)"
+    r"|\b(401|421|423)\s+(?:client error|unauthori[sz]ed|locked|misdirected)"
+    r"|\b(?:http|status|code)[\s:=]*(401|421|423)\b"
+)
+
+
+def _error_status(error: Any) -> Optional[int]:
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None) if response is not None else None
+    if isinstance(status, int):
+        return status
+    code = getattr(error, "code", None)
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    if isinstance(code, str) and code.isdigit():
+        return int(code)
+    return None
+
+
+def classify_session_death(error: Any) -> Optional[AuthFailure]:
+    """Name ``error`` if it means the run's session died, else ``None``.
+
+    Used mid-run, where a 401 cannot be a wrong password (the run already
+    signed in with it) and is instead an expired or revoked session.  Status
+    numbers are only matched as whole numbers so a file called ``IMG_4012``
+    is never mistaken for an authentication failure.
+    """
+    if error is None:
+        return None
+    failure = classify_auth_error(error)
+    if failure.code in SESSION_DEATH_CODES:
+        return failure
+
+    text = redact_secrets(str(error))
+    low = text.lower()
+    structured = _error_status(error)
+    if structured is not None:
+        # A real status code outranks anything the message text suggests.
+        status = structured if structured in SESSION_DEATH_STATUSES else None
+        if status is None:
+            return None
+    else:
+        match = _SESSION_STATUS_TEXT.search(low)
+        status = int(next(g for g in match.groups() if g)) if match else None
+    expired_webauth = "webauth" in low and "expired" in low
+    if status is None and not expired_webauth and "missing pcs" not in low:
+        return None
+
+    if status == 423 or "missing pcs" in low:
+        return AuthFailure(
+            code="adp_pcs_cookies",
+            summary=(
+                "Apple stopped accepting this run's session for lack of PCS "
+                "cookies (HTTP 423) part-way through the run."
+            ),
+            remedy=(
+                "Run 'ifetch auth renew --adp' and approve the prompt on a "
+                "trusted device, then re-run; completed files are not fetched "
+                "again."
+            ),
+            raw=text,
+        )
+    return AuthFailure(
+        code="session_expired",
+        summary=(
+            "Apple stopped accepting this run's session part-way through "
+            f"(HTTP {status or 401}): it expired or was signed out remotely."
+        ),
+        remedy=(
+            "Run 'ifetch auth renew' (add --reset if it keeps failing), then "
+            "re-run; completed files are not fetched again."
+        ),
+        raw=text,
+    )
+
+
 # ---------------------------------------------------------------------------
 # On-disk session inspection
 # ---------------------------------------------------------------------------

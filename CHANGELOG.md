@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sleep. `429` is retried like `503` on both paths, and `Retry-After` is
   honoured from response headers, Apple's JSON body or the error text (capped
   at 60 s).
+- **Session death mid-run is renewed once, not fatal** (#44). A `401`,
+  `Invalid Session Token`, or `423` / missing PCS during a download triggers a
+  single process-wide session renew; other workers wait for its result and
+  retry rather than each signing in again. A renew that fails (for example
+  because Apple now wants a 2FA code) fails every affected file with the usual
+  cause-and-remedy message, and later files fail fast without retrying it.
 
 ## [1.1.0] - 2026-09-29
 
