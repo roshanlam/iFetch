@@ -82,6 +82,18 @@ def main(argv=None):
         help='Maximum number of concurrent downloads (default: 4)'
     )
     parser.add_argument(
+        '--range-concurrency',
+        type=int,
+        default=None,
+        metavar='N',
+        help=(
+            'Fetch up to N byte ranges of one large file at once (default: '
+            'same as --max-workers; 1 turns intra-file parallelism off). '
+            'Total in-flight requests across all files stay capped at '
+            '--max-workers either way.'
+        )
+    )
+    parser.add_argument(
         '--max-retries',
         type=int,
         default=3,
@@ -354,6 +366,7 @@ def main(argv=None):
             password=password,
             bwlimit=args.bwlimit,
             skip_existing=args.skip_existing,
+            range_concurrency=args.range_concurrency,
         )
 
         two_factor = TwoFactorResolver(
