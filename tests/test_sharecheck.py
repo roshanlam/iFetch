@@ -480,3 +480,45 @@ class TestCli:
             sc_cli._authenticate = original
         assert code == sc_cli.EXIT_ERROR
         assert "auth doctor" in capsys.readouterr().err
+
+
+class TestRerunCountsOnlyItself:
+    """The real DownloadManager keeps every call's results in one list, so its
+    summary after the re-run still includes step 3's bytes. Step 7 must count
+    only what the re-run itself transferred."""
+
+    class AccumulatingDownloader(FakeDownloader):
+        def __init__(self, *a, rerun_bytes=0, **kw):
+            super().__init__(*a, **kw)
+            self.download_results = []
+            self.rerun_bytes = rerun_bytes
+
+        def download(self, remote, local, **kwargs):
+            from ifetch.models import DownloadStatus
+
+            first = remote not in self.downloads
+            super().download(remote, local, **kwargs)
+            self.download_results.append(DownloadStatus(
+                path=remote, size=100,
+                downloaded=100 if first else self.rerun_bytes,
+                status="completed" if first else "skipped",
+            ))
+
+        def generate_summary_report(self):
+            return {"summary": {"total_bytes_transferred":
+                                sum(r.downloaded for r in self.download_results)}}
+
+    def _run(self, tmp_path, rerun_bytes):
+        downloader = self.AccumulatingDownloader(
+            working_layout(), inherited_nodes(), rerun_bytes=rerun_bytes)
+        checker = sc.ShareChecker(downloader=downloader, share_path="SharedTest",
+                                  workdir=tmp_path, keep=True)
+        report = checker.run()
+        return next(s for s in report.steps if s.number == 7)
+
+    def test_cumulative_results_do_not_fail_a_clean_rerun(self, tmp_path):
+        assert self._run(tmp_path, rerun_bytes=0).status == sc.PASS
+
+    def test_a_rerun_that_transfers_still_fails(self, tmp_path):
+        seven = self._run(tmp_path, rerun_bytes=7)
+        assert seven.status == sc.FAIL and "7 bytes" in seven.detail
