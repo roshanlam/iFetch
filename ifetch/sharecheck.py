@@ -401,9 +401,19 @@ class ShareChecker:
     def step_rerun_skips(self, step: StepResult) -> None:
         """A second run transfers nothing, which is the incremental promise."""
         target = self.workdir / "root"
+        # DownloadManager.download_results accumulates across calls, so the
+        # summary report would still count step 3's bytes. Count only what this
+        # call appended; fall back to the summary for downloaders without it.
+        results = getattr(self.downloader, "download_results", None)
+        before = len(results) if isinstance(results, list) else None
         self.downloader.download(self.share_path, str(target))
-        summary = self.downloader.generate_summary_report().get("summary", {})
-        transferred = summary.get("total_bytes_transferred", 0)
+        results = getattr(self.downloader, "download_results", None)
+        if before is not None and isinstance(results, list):
+            transferred = sum(int(getattr(r, "downloaded", 0) or 0)
+                              for r in results[before:])
+        else:
+            summary = self.downloader.generate_summary_report().get("summary", {})
+            transferred = summary.get("total_bytes_transferred", 0)
         if transferred:
             step.status = FAIL
             step.detail = f"re-run transferred {transferred:,} bytes; expected 0"

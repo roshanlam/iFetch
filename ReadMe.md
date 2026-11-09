@@ -336,6 +336,7 @@ The core downloader is `ifetch`. Around it is a family of focused tools that sha
 |---|---|
 | `ifetch auth` | `doctor` / `renew` / `status` — diagnose, renew and inspect the session |
 | `ifetch sharecheck` | Validate iFetch against a folder shared by another Apple ID (read-only) |
+| `ifetch adpcheck` | Validate iFetch against an Apple ID with Advanced Data Protection on (read-only) |
 | `ifetch serve` | Run the local web UI ([docs/webui.md](https://github.com/roshanlam/iFetch/blob/main/docs/webui.md)) |
 
 Everything shown as `ifetch <subcommand>` above is **also** installed as a hyphenated alias — `ifetch plan` and `ifetch-plan` are the same command. The five standalone tools (`ifetch-photos`, `ifetch-verify`, `ifetch-restore`, `ifetch-export`, `ifetch-mirror`) are invoked only in their hyphenated form. Full per-command references for the core downloader, verify, export and mirror follow; the recovery family is documented under [What your backups are missing](#what-your-backups-are-missing) and each command's `--help`.
@@ -547,9 +548,10 @@ ifetch uplink history Documents ~/icloud-backup
 
 Uploads only files that are **absent** from iCloud. It never overwrites, renames or deletes anything already there — the safe, narrow complement to the download-only core.
 
-### `ifetch sharecheck` / `ifetch serve`
+### `ifetch sharecheck` / `ifetch adpcheck` / `ifetch serve`
 
 - **`ifetch sharecheck <share_path>`** — validates iFetch against a folder shared by *another* Apple ID, including the nested-subdirectory case that breaks other clients. Read-only against iCloud. See [docs/shared-folder-validation.md](https://github.com/roshanlam/iFetch/blob/main/docs/shared-folder-validation.md).
+- **`ifetch adpcheck <folder>`**: validates iFetch against an Apple ID with Advanced Data Protection turned on. It runs auth doctor, list, download, offline verify and re-run, then checks that an unattended renew needs no fresh device approval. Read-only against iCloud, and the account is masked in its report. See [docs/adp-validation.md](https://github.com/roshanlam/iFetch/blob/main/docs/adp-validation.md).
 - **`ifetch serve`** — runs the local web UI, binding `127.0.0.1:8765` and printing a URL that contains a one-time access token. `--allow-path DIR` widens the download destinations it will offer. See [docs/webui.md](https://github.com/roshanlam/iFetch/blob/main/docs/webui.md) and [docs/webui-api.md](https://github.com/roshanlam/iFetch/blob/main/docs/webui-api.md).
 
 </details>
