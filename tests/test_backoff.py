@@ -191,6 +191,7 @@ def test_open_still_scrapes_retry_after_from_apple_payload(sleeps):
 
 def test_non_retryable_auth_error_is_raised_at_once(sleeps):
     dm = _manager()
+    dm.session_renewer = lambda cause: pytest.fail("credentials are not a dead session")
     node = FlakyNode([Exception("Invalid credentials")])
     with pytest.raises(Exception, match="Invalid credentials"):
         dm._open_with_retry(node)
