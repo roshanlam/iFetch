@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the prompt off, and so does having no terminal, so cron and Docker still
   fail fast. Under `--json` the prompt and progress lines go to stderr, so
   stdout stays one JSON document.
+- **A rejected 2FA code is reported as rejected.** iFetch used to run its
+  own "code rejected" message back through its error classifier. That message
+  mentioned "409" and "valid", so a plain wrong or out-of-date code came out
+  as "Apple confirmed the 2FA code is valid but still returned 409". It now
+  says Apple did not accept the code, names how the code was sent, and says to
+  use the newest one. The 409 rule also no longer matches "invalid".
 
 ## [1.1.0] - 2026-11-08
 

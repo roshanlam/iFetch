@@ -46,6 +46,7 @@ from .auth import (
     PyiCloudPCSTransport,
     TwoFactorResolver,
     TwoFactorUnavailable,
+    TwoFactorCodeRejected,
     extract_code,
     classify_auth_error,
     ensure_pcs_cookies,
@@ -533,6 +534,21 @@ def _prompt_for_code(stream: Any) -> str:
     )
 
 
+def _delivery_method(service: Any) -> str:
+    """How Apple sent the code, for the failure message. Never raises."""
+    try:
+        method = getattr(service, "two_factor_delivery_method", None)
+        if method == "sms":
+            return "SMS"
+        if getattr(service, "_trusted_device_bridge_state", None) is not None:
+            return "a trusted-device prompt"
+        if method:
+            return "a trusted device"
+    except Exception:
+        pass
+    return ""
+
+
 def _complete_two_factor(
     service: Any,
     resolver: TwoFactorResolver,
@@ -568,11 +584,9 @@ def _complete_two_factor(
         code = _prompt_for_code(say)
     print("Submitting code...", file=say)
 
+    delivery = _delivery_method(service)
     if not service.validate_2fa_code(code):
-        raise RuntimeError(
-            "Apple rejected the two-factor code. If Apple reported it as valid "
-            "and still refused (HTTP 409), request a fresh code and retry."
-        )
+        raise TwoFactorCodeRejected(delivery)
 
     if not getattr(service, "is_trusted_session", False):
         if not service.trust_session():

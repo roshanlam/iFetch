@@ -286,7 +286,12 @@ class TestRenewCommand:
             factory=lambda **kw: FakeService(requires_2fa=True, validate=False),
         )
         assert code == 2
-        assert "rejected" in out.lower() or "409" in out
+        assert "did not accept that two-factor code" in out
+        # Our own message must never be re-read as Apple's 409 quirk: that is
+        # how a plain wrong/old code was once reported as "valid but 409".
+        assert "409" not in out
+        assert "confirmed the 2FA code is valid" not in out
+        assert "newest code" in out
 
     def test_an_apple_error_is_classified_not_relayed_raw(self, tmp_path):
         snapshot_expiring_in(tmp_path, 20)
@@ -594,3 +599,26 @@ class TestRenewPromptsOnATerminal:
         err = capsys.readouterr().err
         assert "Enter the 6-digit code" in err
         assert "Apple requires a two-factor code" in err
+
+
+class TestRejectedCodeIsNotMisclassified:
+    def test_json_names_the_rejection(self, tmp_path):
+        snapshot_expiring_in(tmp_path, 20)
+        code, out = run_renew(
+            ["--email", ACCOUNT, "--cookie-directory", str(tmp_path),
+             "--2fa-code", "000000", "--no-stdin", "--json"],
+            factory=lambda **kw: FakeService(requires_2fa=True, validate=False),
+        )
+        assert code == 2
+        assert json.loads(out)["code"] == "two_factor_code_rejected"
+
+    def test_delivery_method_is_named(self, tmp_path):
+        snapshot_expiring_in(tmp_path, 20)
+        service = FakeService(requires_2fa=True, validate=False)
+        service.two_factor_delivery_method = "sms"
+        _, out = run_renew(
+            ["--email", ACCOUNT, "--cookie-directory", str(tmp_path),
+             "--2fa-code", "000000", "--no-stdin"],
+            factory=lambda **kw: service,
+        )
+        assert "sent via SMS" in out

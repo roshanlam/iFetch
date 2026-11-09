@@ -473,7 +473,9 @@ def classify_auth_error(error: Any) -> AuthFailure:
             raw=text,
         )
 
-    if "409" in low and ("edp" in low or "valid" in low):
+    if re.search(r"\b409\b", low) and (
+        re.search(r"\bedp\b", low) or re.search(r"(?<!in)\bvalid\b", low)
+    ):
         return AuthFailure(
             code="code_accepted_but_rejected",
             summary=(
@@ -1148,6 +1150,32 @@ PCS_ACQUIRED = "acquired"
 PCS_ALREADY_PRESENT = "already_present"
 PCS_NOT_REQUIRED = "not_required"
 PCS_UNDETERMINED = "undetermined"
+
+
+class TwoFactorCodeRejected(Exception):
+    """Apple refused the submitted two-factor code.
+
+    Carries its :class:`AuthFailure` so it is never re-classified from its own
+    text - which is exactly how a plain rejection once came out as "Apple
+    confirmed the code is valid but returned 409".
+    """
+
+    def __init__(self, delivery: str = ""):
+        how = f" (sent via {delivery})" if delivery else ""
+        self.failure = AuthFailure(
+            code="two_factor_code_rejected",
+            summary=f"Apple did not accept that two-factor code{how}.",
+            remedy=(
+                "Codes expire after a few minutes, and a code from an earlier "
+                "attempt will not work: every run asks Apple for a new one. "
+                "Re-run and type only the newest code, promptly. If fresh codes "
+                "keep being refused, generate one on a trusted device instead "
+                "(Settings > [your name] > Sign-In & Security > Two-Factor "
+                "Authentication > Get Verification Code) and pass it with "
+                "--2fa-code."
+            ),
+        )
+        super().__init__(f"{self.failure.summary} {self.failure.remedy}")
 
 
 class ADPError(Exception):
