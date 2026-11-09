@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ifetch-adpcheck`: validate Advanced Data Protection in one command**
+  (#31). It runs the #31 acceptance procedure against a live ADP Apple ID:
+  `auth doctor --online --adp`, the stored PCS cookie, list, download, offline
+  manifest verify, a re-run that should transfer nothing, and an unattended
+  `auth renew --adp` that must not need a fresh device approval. It ends with
+  a verdict and a row for `docs/adp-validation.md`.
+  - An account Apple does not report as under ADP stops the run as
+    `incomplete`, because every later step would pass without exercising the
+    PCS flow. Override with `--assume-adp`.
+  - The Apple ID is masked in the report.
+
+### Fixed
+
+- **`ifetch-sharecheck` step 7 ("a re-run transfers nothing") no longer fails
+  every live run.** `DownloadManager.download_results` accumulates across
+  calls, so the summary after the re-run still counted step 3's bytes. The
+  step now counts only what the re-run itself transferred.
+
 ## [1.1.0] - 2026-11-08
 
 ### Fixed
