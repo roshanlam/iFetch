@@ -11,16 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **Parallel range GETs within one large file** (#45). A file bigger than one
-  8 MiB segment is fetched as several concurrent range requests instead of a
-  single sequential stream, so a tree of a few multi-GB files no longer leaves
-  most of `--max-workers` idle. Every range GET in the process draws from one
-  shared budget of `--max-workers` slots, so total in-flight requests never
-  exceed what they did before. The tracker and transfer journal only advance
-  over the contiguous, flushed prefix, so a crash still resumes from bytes that
-  are really on disk. Tune with `--range-concurrency N` (`1` turns it off).
+## [1.1.0] - 2026-11-08
 
 ### Fixed
 
@@ -35,10 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry rather than each signing in again. A renew that fails (for example
   because Apple now wants a 2FA code) fails every affected file with the usual
   cause-and-remedy message, and later files fail fast without retrying it.
-
-## [1.1.0] - 2026-09-29
-
-### Fixed
 
 - **Compose / Docker docs no longer point at a missing `:latest` tag.**
   `docker-compose.yml` and `docs/docker.md` now use `ghcr.io/roshanlam/ifetch:edge`,
@@ -83,6 +70,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with its result.
 
 ### Added
+
+- **Parallel range GETs within one large file** (#45). A file bigger than one
+  8 MiB segment is fetched as several concurrent range requests instead of a
+  single sequential stream, so a tree of a few multi-GB files no longer leaves
+  most of `--max-workers` idle. Every range GET in the process draws from one
+  shared budget of `--max-workers` slots, so total in-flight requests never
+  exceed what they did before. The tracker and transfer journal only advance
+  over the contiguous, flushed prefix, so a crash still resumes from bytes that
+  are really on disk. Tune with `--range-concurrency N` (`1` turns it off).
 
 - **`--skip-existing`** leaves any file already on disk untouched instead of
   updating or overwriting it, for topping up a partial copy without re-checking

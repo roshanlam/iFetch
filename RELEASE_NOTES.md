@@ -26,6 +26,14 @@ want the old ZIP behavior.
   live-validated; shared folders are pinned by a contract-test harness, not a
   live cross-account run. #31 and #32 are still open.
 
+- **Sturdier on long, unattended runs.** If Apple's session expires partway
+  through a run, iFetch now renews it once, for every worker at the same
+  time, instead of failing every remaining file. When Apple throttles,
+  retries wait a random, growing delay, and wait exactly as long as Apple
+  asks when it says so. A few large files now download over several
+  connections at once. Total requests still never exceed `--max-workers`,
+  and `--range-concurrency` tunes this per file.
+
 ## Also new
 
 - **Web UI** — `ifetch serve`, for sign-in, browsing and downloading without a terminal.
