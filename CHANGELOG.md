@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ifetch auth renew` asks for the 2FA code when run in a terminal.**
+  Before, it failed with "No two-factor code available" unless a code came
+  from `--2fa-code`, `$IFETCH_2FA_CODE`, a file, a webhook or a pipe. So the
+  first step of every setup guide could not be done by hand. With no
+  configured source it now prompts, and asks again after a typo.
+  `--non-interactive` (which was accepted but ignored) and `--no-stdin` turn
+  the prompt off, and so does having no terminal, so cron and Docker still
+  fail fast. Under `--json` the prompt and progress lines go to stderr, so
+  stdout stays one JSON document.
+
 ## [1.1.0] - 2026-11-08
 
 ### Fixed

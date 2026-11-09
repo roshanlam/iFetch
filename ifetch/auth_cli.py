@@ -46,6 +46,7 @@ from .auth import (
     PyiCloudPCSTransport,
     TwoFactorResolver,
     TwoFactorUnavailable,
+    extract_code,
     classify_auth_error,
     ensure_pcs_cookies,
     evaluate_expiry,
@@ -125,12 +126,12 @@ def _add_twofactor(parser: argparse.ArgumentParser) -> None:
         dest="allow_stdin",
         action="store_false",
         default=True,
-        help="Never read a code from stdin",
+        help="Never read a code from stdin, piped or typed at a prompt",
     )
     group.add_argument(
         "--non-interactive",
         action="store_true",
-        help="Fail instead of prompting a human for anything",
+        help="Fail instead of prompting for a code when no other source has one",
     )
 
 
@@ -496,6 +497,42 @@ def _complete_adp(
     return result
 
 
+#: How many times a mistyped code is asked for again before giving up.
+PROMPT_ATTEMPTS = 3
+
+
+def _may_prompt(args: argparse.Namespace) -> bool:
+    """True only when a human can be asked, and the user has not forbidden it."""
+    if getattr(args, "non_interactive", False) or not getattr(args, "allow_stdin", True):
+        return False
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _prompt_for_code(stream: Any) -> str:
+    """Ask for the code on the terminal; re-ask on a typo, fail on EOF.
+
+    The prompt goes to ``stream``, which is stderr under ``--json`` so the JSON
+    document on stdout stays parseable.
+    """
+    for _ in range(PROMPT_ATTEMPTS):
+        print("Enter the 6-digit code shown on your Apple device: ",
+              end="", file=stream, flush=True)
+        line = sys.stdin.readline()
+        if not line:
+            break  # EOF: nobody is there after all
+        code = extract_code(line)
+        if code:
+            return code
+        print("That is not a 6-digit code.", file=stream)
+    raise TwoFactorUnavailable(
+        "No valid two-factor code was entered. Supply one with --2fa-code, "
+        "$IFETCH_2FA_CODE, --2fa-file or --2fa-webhook."
+    )
+
+
 def _complete_two_factor(
     service: Any,
     resolver: TwoFactorResolver,
@@ -514,12 +551,22 @@ def _complete_two_factor(
                 print("Warning: session authenticated but could not be trusted.", file=stdout)
         return
 
-    print("Apple requires a two-factor code.", file=stdout)
+    # Narration goes to stderr under --json so stdout stays one JSON document.
+    say = sys.stderr if getattr(args, "as_json", False) else stdout
+    print("Apple requires a two-factor code.", file=say)
     sources = resolver.describe_sources()
-    print(f"Looking for one from: {', '.join(sources) or 'no configured source'}", file=stdout)
+    print(f"Looking for one from: {', '.join(sources) or 'no configured source'}", file=say)
 
-    code = resolver.resolve()
-    print("Submitting code...", file=stdout)
+    try:
+        code = resolver.resolve()
+    except TwoFactorUnavailable:
+        # No configured source had a code. A person at a terminal is the last
+        # resort, never the first: cron, Docker without -it and systemd have no
+        # one to ask, and --non-interactive / --no-stdin rule it out explicitly.
+        if not _may_prompt(args):
+            raise
+        code = _prompt_for_code(say)
+    print("Submitting code...", file=say)
 
     if not service.validate_2fa_code(code):
         raise RuntimeError(
