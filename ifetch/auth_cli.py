@@ -47,6 +47,9 @@ from .auth import (
     TwoFactorResolver,
     TwoFactorUnavailable,
     TwoFactorCodeRejected,
+    TwoFactorRouteUnsupported,
+    describe_delivery,
+    request_two_factor_code,
     extract_code,
     classify_auth_error,
     ensure_pcs_cookies,
@@ -570,6 +573,9 @@ def _complete_two_factor(
     # Narration goes to stderr under --json so stdout stays one JSON document.
     say = sys.stderr if getattr(args, "as_json", False) else stdout
     print("Apple requires a two-factor code.", file=say)
+    notice = describe_delivery(request_two_factor_code(service))
+    if notice:
+        print(notice, file=say)
     sources = resolver.describe_sources()
     print(f"Looking for one from: {', '.join(sources) or 'no configured source'}", file=say)
 

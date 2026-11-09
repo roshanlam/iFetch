@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Correct 2FA codes were refused on current Apple accounts.** pyicloud 2.6
+  starts Apple's trusted-device flow in `request_2fa_code()`, and iFetch never
+  called it. `validate_2fa_code()` then fell back to the legacy endpoint, which
+  refuses even a correct code. `ifetch auth renew` and the download path now
+  request the code first, then collect it. They say where it was sent
+  (trusted devices or SMS), and they name a hardware-security-key challenge
+  instead of attempting it. Older pyicloud versions without that call behave as
+  before.
 - **`ifetch auth renew` asks for the 2FA code when run in a terminal.**
   Before, it failed with "No two-factor code available" unless a code came
   from `--2fa-code`, `$IFETCH_2FA_CODE`, a file, a webhook or a pipe. So the
