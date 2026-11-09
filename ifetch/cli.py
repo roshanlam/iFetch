@@ -36,6 +36,7 @@ SUBCOMMANDS = {
     "guard": ("guard_cli", "main"),
     "vanish": ("vanish_cli", "main"),
     "sharecheck": ("sharecheck_cli", "main"),
+    "adpcheck": ("adpcheck_cli", "main"),
     "uplink": ("uplink_cli", "main"),
     "serve": ("serve_cli", "main"),
 }
