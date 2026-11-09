@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Parallel range GETs within one large file** (#45). A file bigger than one
+  8 MiB segment is fetched as several concurrent range requests instead of a
+  single sequential stream, so a tree of a few multi-GB files no longer leaves
+  most of `--max-workers` idle. Every range GET in the process draws from one
+  shared budget of `--max-workers` slots, so total in-flight requests never
+  exceed what they did before. The tracker and transfer journal only advance
+  over the contiguous, flushed prefix, so a crash still resumes from bytes that
+  are really on disk. Tune with `--range-concurrency N` (`1` turns it off).
+
 ### Fixed
 
 - **Throttle retries no longer stampede** (#46). Open and range-GET retries
