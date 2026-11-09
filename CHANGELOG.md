@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Throttle retries no longer stampede** (#46). Open and range-GET retries
+  use capped exponential backoff with full jitter instead of a fixed `2**n`
+  sleep. `429` is retried like `503` on both paths, and `Retry-After` is
+  honoured from response headers, Apple's JSON body or the error text (capped
+  at 60 s).
+
 ## [1.1.0] - 2026-09-29
 
 ### Fixed

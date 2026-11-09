@@ -37,6 +37,7 @@ from .auth import (
 from .manifest import Manifest
 from . import sharing
 from .ratelimit import BandwidthLimiter, create_limiter
+from .backoff import is_throttle, retry_wait, status_from_error
 from .transfers import TransferJournal
 from .index import TRANSFER_ACTIVE, TRANSFER_FAILED, TRANSFER_PENDING
 from .naming import (
@@ -759,16 +760,22 @@ class DownloadManager:
         return merged
 
     def download_chunk(self, url: str, start: int, end: int, item: Any = None) -> bytes:
-        """Download a specific byte range with retries and backoff."""
-        headers = {'Range': f'bytes={start}-{end}'}
-        retries = 0
-        last_error = None
+        """Download one inclusive byte range, retrying with jittered backoff.
 
-        while retries < self.max_retries:
+        Throttles (429/503) and connection errors are retried; a server-supplied ``Retry-After`` replaces the computed
+        wait. 404/410 usually mean the signed URL aged out, so the item is
+        re-opened for a fresh one.
+        """
+        headers = {'Range': f'bytes={start}-{end}'}
+        attempts = max(1, self.max_retries)
+        last_error: Optional[Exception] = None
+
+        for attempt in range(attempts):
             try:
                 resp = self.http.get(url, headers=headers, stream=True, timeout=30)
-                resp.raise_for_status()  # Raise error for non-200/206 status codes
-                if resp.status_code in (200, 206):
+                resp.raise_for_status()  # Raise error for non-2xx status codes
+                status = resp.status_code
+                if status in (200, 206):
                     payload = resp.content
                     # Charged on what actually arrived, not on what was asked
                     # for, and after the read rather than before it: a range is
@@ -777,9 +784,10 @@ class DownloadManager:
                     # guarantee - an average across chunks, not within one.
                     self._throttle(len(payload))
                     return payload
+                last_error = Exception(f"unexpected HTTP {status} for a range request")
             except requests.HTTPError as e:
                 last_error = e
-                status = e.response.status_code if e.response is not None else None
+                status = status_from_error(e)
                 if status in (404, 410) and item is not None:
                     # Signed URL likely expired; refresh and retry.
                     try:
@@ -787,18 +795,20 @@ class DownloadManager:
                             url = refreshed.url
                     except Exception:
                         pass
-                retries += 1
-                retry_after = None
-                if e.response is not None:
-                    retry_after = e.response.headers.get("Retry-After")
-                if retry_after and retry_after.isdigit():
-                    time.sleep(min(int(retry_after), 60))
-                else:
-                    time.sleep(2 ** retries)  # Exponential backoff
             except requests.RequestException as e:
                 last_error = e
-                retries += 1
-                time.sleep(2 ** retries)  # Exponential backoff
+
+            if attempt < attempts - 1:
+                wait_time = retry_wait(attempt, last_error)
+                self.logger.warning(json.dumps({
+                    "event": "range_retry",
+                    "range": [start, end],
+                    "attempt": attempt + 1,
+                    "throttled": is_throttle(last_error),
+                    "wait_seconds": round(wait_time, 3),
+                    "error": str(last_error),
+                }))
+                time.sleep(wait_time)
 
         raise Exception(f"Failed to download chunk {start}-{end} after {self.max_retries} retries: {last_error}")
 
@@ -968,13 +978,20 @@ class DownloadManager:
         max_retries: Optional[int] = None,
         remote_path: Optional[str] = None,
     ) -> Any:
-        """Open item with retry logic for transient connection errors."""
+        """Open an item, retrying transient failures.
+
+        Throttles (429/503) and connection errors back off with full jitter,
+        honouring ``Retry-After`` from the response or Apple's JSON body;
+        anything else (auth, permissions, not-found) is raised at once.
+        """
         if max_retries is None:
             max_retries = self.max_retries
+        max_retries = max(1, max_retries)
 
-        last_error = None
+        last_error: Optional[Exception] = None
         current_item = item
-        for attempt in range(max_retries):
+        attempt = 0
+        while attempt < max_retries:
             try:
                 return current_item.open(stream=True)
             except Exception as e:
@@ -1018,37 +1035,33 @@ class DownloadManager:
                             "remote_path": remote_path,
                             "attempt": attempt + 1,
                         }))
+                        attempt += 1
                         continue
                     except Exception as refresh_error:
                         last_error = refresh_error
                         raise
 
-                # Retry on connection errors and server errors, not on auth or other permanent errors
-                retryable = any(x in error_str for x in [
+                # Retry on throttles, connection and server errors - never on
+                # auth or other permanent errors.
+                retryable = is_throttle(e) or any(x in error_str for x in [
                     'connection', 'remote', 'timeout', 'reset',
-                    '503', 'service unavailable', 'retry_needed', 'internal_failure'
+                    'retry_needed', 'internal_failure',
                 ])
                 if retryable and attempt < max_retries - 1:
-                    # Check if server specified retryAfter
-                    wait_time = 2 ** (attempt + 1)  # Default: 2, 4, 8 seconds
-                    if 'retryafter' in error_str:
-                        import re
-                        match = re.search(r'retryafter["\s:]+(\d+)', error_str)
-                        if match:
-                            wait_time = min(int(match.group(1)), 60)
+                    wait_time = retry_wait(attempt + 1, e)
                     self.logger.warning(json.dumps({
                         "event": "connection_retry",
                         "file": getattr(current_item, 'name', 'unknown'),
                         "attempt": attempt + 1,
-                        "wait_seconds": wait_time,
+                        "throttled": is_throttle(e),
+                        "wait_seconds": round(wait_time, 3),
                         "error": str(e)
                     }))
                     time.sleep(wait_time)
+                    attempt += 1
                     continue
                 raise  # Non-retryable error
         raise last_error  # All retries exhausted
-
-
 
     def _prefix_resume_is_proven(
         self, local_path: Path, remote_size: Optional[int]
@@ -1561,7 +1574,7 @@ class DownloadManager:
                     "attempt": attempt + 1,
                     "error": str(exc),
                 }))
-                time.sleep(2 ** (attempt + 1))
+                time.sleep(retry_wait(attempt + 1, exc))
 
         if last_error is not None:
             # Reported as a failure by download_drive_item's handler.
