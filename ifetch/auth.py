@@ -501,13 +501,23 @@ def classify_auth_error(error: Any) -> AuthFailure:
             raw=text,
         )
 
-    if "no stored password" in low or "nostoredpassword" in low:
+    if ("no stored password" in low or "nostoredpassword" in low
+            or "no password set" in low):
+        # "No password set" is pyicloud's text when the stored session has
+        # expired and a full sign-in needs a password the keyring lacks. The
+        # session hid the gap until then, so this often appears out of nowhere.
         return AuthFailure(
             code="no_stored_password",
-            summary="No password is stored in the system keyring for this Apple ID.",
+            summary=(
+                "A full sign-in is needed (the stored session is no longer "
+                "accepted) and no password is stored in the system keyring for "
+                "this Apple ID."
+            ),
             remedy=(
-                "Run 'icloud auth login --username you@example.com' "
-                '(requires: pip install "ifetch[auth]") to store it.'
+                "Run 'icloud auth login --username you@example.com' and answer "
+                "yes to 'Save password in keyring?'. It also completes 2FA and "
+                "saves a session iFetch reuses. On a machine with no keyring, "
+                "pass --password-command instead."
             ),
             raw=text,
         )

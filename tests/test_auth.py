@@ -732,3 +732,12 @@ class TestConflict409Rule:
 
         failure = classify_auth_error(TwoFactorCodeRejected("SMS"))
         assert failure.code == "two_factor_code_rejected"
+
+
+def test_pyicloud_no_password_set_is_named():
+    """pyicloud's text when the session expired and the keyring has no password."""
+    from ifetch.auth import classify_auth_error
+
+    failure = classify_auth_error(Exception("No password set"))
+    assert failure.code == "no_stored_password"
+    assert "Save password in keyring" in failure.remedy
