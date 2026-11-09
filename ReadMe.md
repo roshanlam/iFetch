@@ -352,6 +352,7 @@ ifetch <icloud_path> [local_path] [options]
 | `local_path` | Local destination directory | current directory |
 | `--email` | iCloud account email (or set `ICLOUD_EMAIL`) | env var / error |
 | `--max-workers N` | Concurrent download threads | `4` |
+| `--range-concurrency N` | Concurrent range requests within one large file (total stays capped at `--max-workers`; `1` = off) | same as `--max-workers` |
 | `--max-retries N` | Retry attempts for failed chunks (exponential backoff) | `3` |
 | `--chunk-size BYTES` | Size of the byte ranges requests are split into | `1048576` (1 MiB) |
 | `--no-fast-scan` | Bypass `.ifetch_state.json`; open every file over the network to check its size | fast path on |

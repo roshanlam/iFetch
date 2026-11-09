@@ -8,7 +8,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, List, Set, Dict, Any, Union, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, as_completed, wait
 import requests
 from requests.adapters import HTTPAdapter
 from pyicloud import PyiCloudService
@@ -397,6 +397,8 @@ class DownloadManager:
         password: Optional[str] = None,
         bwlimit: Optional[Union[str, BandwidthLimiter]] = None,
         skip_existing: bool = False,
+        range_concurrency: Optional[int] = None,
+        range_segment_size: int = 8 * 1024 * 1024,
         session_renewer: Optional[Callable[[AuthFailure], None]] = None,
         max_session_renewals: int = 3,
     ):
@@ -434,6 +436,18 @@ class DownloadManager:
         )
         self.http.mount("http://", adapter)
         self.http.mount("https://", adapter)
+
+        # Intra-file parallelism. A large file is split into segments fetched
+        # by up to ``range_concurrency`` concurrent range GETs, but every range
+        # GET in the process - from any file - first takes a slot from one
+        # shared budget of ``max_workers``. That keeps total in-flight requests
+        # at the same ceiling as before (and equal to the HTTP pool size), so a
+        # few big files can use idle capacity without ever fanning out past it.
+        self.range_concurrency = max(
+            1, int(range_concurrency if range_concurrency is not None else max_workers)
+        )
+        self.range_segment_size = max(int(chunk_size), int(range_segment_size))
+        self._range_slots = threading.BoundedSemaphore(max(1, max_workers))
 
         # Mid-run session renewal (single-flight). ``_auth_generation`` counts
         # successful renewals; a worker records it before each open so that,
@@ -788,22 +802,32 @@ class DownloadManager:
     def download_chunk(self, url: str, start: int, end: int, item: Any = None) -> bytes:
         """Download one inclusive byte range, retrying with jittered backoff.
 
-        Throttles (429/503) and connection errors are retried; a server-supplied ``Retry-After`` replaces the computed
+        Every attempt first takes a slot from the process-wide range budget, so
+        however many files and segments are in flight, concurrent range GETs
+        never exceed ``max_workers``. Throttles (429/503) and connection errors
+        are retried; a server-supplied ``Retry-After`` replaces the computed
         wait. 401/403/404/410 usually mean the signed URL aged out, so the item
         is re-opened for a fresh one - which is also where a dead session gets
         renewed.
         """
         headers = {'Range': f'bytes={start}-{end}'}
+        expected = end - start + 1
         attempts = max(1, self.max_retries)
         last_error: Optional[Exception] = None
 
         for attempt in range(attempts):
             try:
-                resp = self.http.get(url, headers=headers, stream=True, timeout=30)
-                resp.raise_for_status()  # Raise error for non-2xx status codes
-                status = resp.status_code
+                with self._range_slots:
+                    resp = self.http.get(url, headers=headers, stream=True, timeout=30)
+                    resp.raise_for_status()  # Raise error for non-2xx status codes
+                    status = resp.status_code
+                    payload = resp.content if status in (200, 206) else b""
                 if status in (200, 206):
-                    payload = resp.content
+                    if status == 200 and len(payload) > expected and len(payload) > end:
+                        # The server ignored Range and sent the whole body.
+                        # Keep only what was asked for: writing all of it at
+                        # ``start`` would corrupt everything after the range.
+                        payload = payload[start:end + 1]
                     # Charged on what actually arrived, not on what was asked
                     # for, and after the read rather than before it: a range is
                     # fetched in one call, so the throttle can only put the
@@ -1790,6 +1814,123 @@ class DownloadManager:
         )
         return True
 
+    # -- ranged transfer -------------------------------------------------
+    def _plan_segments(self, ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """Split merged ranges into segments that can be fetched concurrently.
+
+        With intra-file parallelism off, the merged ranges are returned as-is
+        (one GET per range, exactly as before). Otherwise each range is cut
+        into ``range_segment_size`` pieces, so a lone multi-GB file can use the
+        idle part of the range budget - and no single GET has to hold a whole
+        file in memory. A range no bigger than one segment stays one GET.
+        """
+        if self.range_concurrency <= 1:
+            return list(ranges)
+        size = self.range_segment_size
+        segments: List[Tuple[int, int]] = []
+        for start, end in ranges:
+            while start <= end:
+                stop = min(end, start + size - 1)
+                segments.append((start, stop))
+                start = stop + 1
+        return segments
+
+    def _fetch_ranges(
+        self,
+        url: str,
+        ranges: List[Tuple[int, int]],
+        out_file: Any,
+        *,
+        item: Any,
+        local_path: Path,
+        tracker: DownloadTracker,
+        total_size: int,
+    ) -> None:
+        """Fetch ``ranges`` into ``out_file``, in parallel where worthwhile.
+
+        Correctness rules, which hold however the segments interleave:
+
+        * segments never overlap, and every seek+write happens under one lock
+          on the single file handle, so concurrent writes cannot tear;
+        * the tracker and journal only ever advance to the end of the
+          *contiguous* run of finished segments from the first one, and only
+          after those bytes are flushed - so they move monotonically and a
+          crash resumes from a prefix that is genuinely on disk. Segments that
+          finished out of order beyond it are simply fetched again;
+        * on the first failure no new segment starts; in-flight ones finish,
+          and the first error is raised.
+        """
+        segments = self._plan_segments(ranges)
+        if not segments:
+            return
+        write_lock = threading.Lock()
+        finished = [False] * len(segments)
+        frontier = 0  # index of the first segment not yet durably contiguous
+
+        def store(index: int, payload: bytes) -> None:
+            nonlocal frontier
+            start, _end = segments[index]
+            with write_lock:
+                out_file.seek(start)
+                out_file.write(payload)
+                finished[index] = True
+                advanced_to: Optional[int] = None
+                while frontier < len(segments) and finished[frontier]:
+                    advanced_to = segments[frontier][1]
+                    frontier += 1
+                if advanced_to is None:
+                    return
+                # Flushed before it is recorded: a checkpoint must never claim
+                # bytes still sitting in a userspace buffer a crash would drop.
+                out_file.flush()
+                tracker.save_status(advanced_to + 1)
+                # Same durable write point the tracker already uses, so the
+                # journal costs no extra fsync boundary.
+                self.journal.progress(local_path, advanced_to + 1)
+                # Streaming progress event (generic)
+                self.plugin_manager.dispatch(
+                    "on_event",
+                    name="download_progress",
+                    remote_item=item,
+                    local_path=local_path,
+                    downloaded=advanced_to,
+                    total_size=total_size,
+                )
+
+        workers = min(self.range_concurrency, len(segments))
+        if workers <= 1:
+            for index, (start, end) in enumerate(segments):
+                store(index, self.download_chunk(url, start, end, item=item))
+            return
+
+        stop = threading.Event()
+
+        def fetch(index: int) -> None:
+            if stop.is_set():
+                return
+            start, end = segments[index]
+            try:
+                payload = self.download_chunk(url, start, end, item=item)
+            except BaseException:
+                stop.set()
+                raise
+            store(index, payload)
+
+        self.logger.info(json.dumps({
+            "event": "parallel_range_fetch",
+            "file": getattr(item, "name", "unknown"),
+            "segments": len(segments),
+            "concurrency": workers,
+        }))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ifetch-range") as pool:
+            futures = [pool.submit(fetch, index) for index in range(len(segments))]
+            wait(futures, return_when=FIRST_EXCEPTION)
+            if any(f.done() and f.exception() is not None for f in futures):
+                stop.set()
+        errors = [f.exception() for f in futures if f.exception() is not None]
+        if errors:
+            raise errors[0]
+
     def download_drive_item(
         self,
         item: Any,
@@ -2010,24 +2151,11 @@ class DownloadManager:
                         pass  # Non-fatal; continue with download
 
                 with temp_path.open('r+b') as out_file:
-                    for start, end in changed_ranges:
-                        chunk = self.download_chunk(response.url, start, end, item=item)
-                        out_file.seek(start)
-                        out_file.write(chunk)
-                        tracker.save_status(end + 1)
-                        # Same durable write point the tracker already uses, so
-                        # the journal costs no extra fsync boundary.
-                        self.journal.progress(local_path, end + 1)
-
-                        # Streaming progress event (generic)
-                        self.plugin_manager.dispatch(
-                            "on_event",
-                            name="download_progress",
-                            remote_item=item,
-                            local_path=local_path,
-                            downloaded=end,
-                            total_size=total_size,
-                        )
+                    self._fetch_ranges(
+                        response.url, changed_ranges, out_file,
+                        item=item, local_path=local_path, tracker=tracker,
+                        total_size=total_size,
+                    )
 
                 # Only calculate checksum if temp_path exists and has content
                 if temp_path.exists() and temp_path.stat().st_size > 0:

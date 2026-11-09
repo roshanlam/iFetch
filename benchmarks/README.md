@@ -56,3 +56,22 @@ IFETCH_BENCH_KEEP=1 bash benchmarks/compare.sh main HEAD --runs 1
 `compare.sh` resolves the repo root via `git rev-parse`, so it works from any
 cwd. Prefer `bash benchmarks/compare.sh …` so executable mode bits do not
 matter. Override the interpreter used for per-ref venvs with `PYTHON=…`.
+
+## Intra-file parallel range GETs (#45)
+
+The offline harness above runs without latency, so it cannot show the
+parallel range-GET gain. A simulated CDN that caps each connection at
+16 MiB/s with 30 ms of request latency shows what one 64 MiB file gets with
+`--max-workers 8`:
+
+| `--range-concurrency` | Throughput |
+|---|---|
+| 1 (previous behaviour) | ~16 MiB/s |
+| 2 | ~30 MiB/s |
+| 4 | ~59 MiB/s |
+| 8 (default = `--max-workers`) | ~115 MiB/s |
+
+Read this as an upper bound for when Apple's CDN limits each connection
+rather than your total link. The real gain depends on where the bottleneck
+is, and with a saturated link it shrinks towards zero. Run `benchmark.py`
+against a live account with one large file to get your own cold number.
