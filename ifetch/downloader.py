@@ -7,8 +7,8 @@ import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Set, Dict, Any, Union, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Optional, List, Set, Dict, Any, Union, Tuple
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, as_completed, wait
 import requests
 from requests.adapters import HTTPAdapter
 from pyicloud import PyiCloudService
@@ -27,7 +27,11 @@ from .auth import (
     DEFAULT_WARN_DAYS,
     TwoFactorResolver,
     TwoFactorUnavailable,
+    AuthFailure,
+    PyiCloudPCSTransport,
     classify_auth_error,
+    classify_session_death,
+    ensure_pcs_cookies,
     evaluate_expiry,
     read_session_snapshot,
     region_service_kwargs,
@@ -37,6 +41,7 @@ from .auth import (
 from .manifest import Manifest
 from . import sharing
 from .ratelimit import BandwidthLimiter, create_limiter
+from .backoff import is_throttle, retry_wait, status_from_error
 from .transfers import TransferJournal
 from .index import TRANSFER_ACTIVE, TRANSFER_FAILED, TRANSFER_PENDING
 from .naming import (
@@ -362,6 +367,15 @@ class SyncState:
                 self._dirty += 1
 
 
+class SessionRenewalError(Exception):
+    """The run's session died and could not be renewed mid-run.
+
+    Its message is the same cause-plus-remedy text :meth:`authenticate` gives,
+    so a run that dies at hour three reads exactly like one that failed at
+    sign-in.
+    """
+
+
 class DownloadManager:
     """Enhanced iCloud file downloader with differential updates support."""
     def __init__(
@@ -383,6 +397,10 @@ class DownloadManager:
         password: Optional[str] = None,
         bwlimit: Optional[Union[str, BandwidthLimiter]] = None,
         skip_existing: bool = False,
+        range_concurrency: Optional[int] = None,
+        range_segment_size: int = 8 * 1024 * 1024,
+        session_renewer: Optional[Callable[[AuthFailure], None]] = None,
+        max_session_renewals: int = 3,
     ):
         self.email = email or os.environ.get('ICLOUD_EMAIL')
         if not self.email:
@@ -418,6 +436,29 @@ class DownloadManager:
         )
         self.http.mount("http://", adapter)
         self.http.mount("https://", adapter)
+
+        # Intra-file parallelism. A large file is split into segments fetched
+        # by up to ``range_concurrency`` concurrent range GETs, but every range
+        # GET in the process - from any file - first takes a slot from one
+        # shared budget of ``max_workers``. That keeps total in-flight requests
+        # at the same ceiling as before (and equal to the HTTP pool size), so a
+        # few big files can use idle capacity without ever fanning out past it.
+        self.range_concurrency = max(
+            1, int(range_concurrency if range_concurrency is not None else max_workers)
+        )
+        self.range_segment_size = max(int(chunk_size), int(range_segment_size))
+        self._range_slots = threading.BoundedSemaphore(max(1, max_workers))
+
+        # Mid-run session renewal (single-flight). ``_auth_generation`` counts
+        # successful renewals; a worker records it before each open so that,
+        # after a failure, it can tell whether somebody else has already
+        # renewed in the meantime and it only needs to retry.
+        self.session_renewer = session_renewer
+        self.max_session_renewals = max(0, int(max_session_renewals))
+        self._auth_lock = threading.Lock()
+        self._auth_generation = 0
+        self._session_renewals = 0
+        self._renew_failure: Optional[str] = None
 
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
@@ -759,17 +800,34 @@ class DownloadManager:
         return merged
 
     def download_chunk(self, url: str, start: int, end: int, item: Any = None) -> bytes:
-        """Download a specific byte range with retries and backoff."""
-        headers = {'Range': f'bytes={start}-{end}'}
-        retries = 0
-        last_error = None
+        """Download one inclusive byte range, retrying with jittered backoff.
 
-        while retries < self.max_retries:
+        Every attempt first takes a slot from the process-wide range budget, so
+        however many files and segments are in flight, concurrent range GETs
+        never exceed ``max_workers``. Throttles (429/503) and connection errors
+        are retried; a server-supplied ``Retry-After`` replaces the computed
+        wait. 401/403/404/410 usually mean the signed URL aged out, so the item
+        is re-opened for a fresh one - which is also where a dead session gets
+        renewed.
+        """
+        headers = {'Range': f'bytes={start}-{end}'}
+        expected = end - start + 1
+        attempts = max(1, self.max_retries)
+        last_error: Optional[Exception] = None
+
+        for attempt in range(attempts):
             try:
-                resp = self.http.get(url, headers=headers, stream=True, timeout=30)
-                resp.raise_for_status()  # Raise error for non-200/206 status codes
-                if resp.status_code in (200, 206):
-                    payload = resp.content
+                with self._range_slots:
+                    resp = self.http.get(url, headers=headers, stream=True, timeout=30)
+                    resp.raise_for_status()  # Raise error for non-2xx status codes
+                    status = resp.status_code
+                    payload = resp.content if status in (200, 206) else b""
+                if status in (200, 206):
+                    if status == 200 and len(payload) > expected and len(payload) > end:
+                        # The server ignored Range and sent the whole body.
+                        # Keep only what was asked for: writing all of it at
+                        # ``start`` would corrupt everything after the range.
+                        payload = payload[start:end + 1]
                     # Charged on what actually arrived, not on what was asked
                     # for, and after the read rather than before it: a range is
                     # fetched in one call, so the throttle can only put the
@@ -777,28 +835,33 @@ class DownloadManager:
                     # guarantee - an average across chunks, not within one.
                     self._throttle(len(payload))
                     return payload
+                last_error = Exception(f"unexpected HTTP {status} for a range request")
             except requests.HTTPError as e:
                 last_error = e
-                status = e.response.status_code if e.response is not None else None
-                if status in (404, 410) and item is not None:
+                status = status_from_error(e)
+                if status in (401, 403, 404, 410) and item is not None:
                     # Signed URL likely expired; refresh and retry.
                     try:
                         with self._open_with_retry(item, max_retries=1) as refreshed:
                             url = refreshed.url
+                    except SessionRenewalError:
+                        raise
                     except Exception:
                         pass
-                retries += 1
-                retry_after = None
-                if e.response is not None:
-                    retry_after = e.response.headers.get("Retry-After")
-                if retry_after and retry_after.isdigit():
-                    time.sleep(min(int(retry_after), 60))
-                else:
-                    time.sleep(2 ** retries)  # Exponential backoff
             except requests.RequestException as e:
                 last_error = e
-                retries += 1
-                time.sleep(2 ** retries)  # Exponential backoff
+
+            if attempt < attempts - 1:
+                wait_time = retry_wait(attempt, last_error)
+                self.logger.warning(json.dumps({
+                    "event": "range_retry",
+                    "range": [start, end],
+                    "attempt": attempt + 1,
+                    "throttled": is_throttle(last_error),
+                    "wait_seconds": round(wait_time, 3),
+                    "error": str(last_error),
+                }))
+                time.sleep(wait_time)
 
         raise Exception(f"Failed to download chunk {start}-{end} after {self.max_retries} retries: {last_error}")
 
@@ -962,19 +1025,113 @@ class DownloadManager:
         text = f"{type(exc).__name__}: {exc}".replace("\n", " ")
         return text[:200]
 
+    # -- mid-run session renewal ----------------------------------------
+    def renew_session(self, observed_generation: int, cause: AuthFailure) -> None:
+        """Renew the shared session once, however many workers hit its death.
+
+        ``observed_generation`` is the value of ``_auth_generation`` the caller
+        read *before* the request that failed. The first worker through the
+        lock renews; everyone queued behind it finds the generation moved on
+        and simply retries on the renewed session. If the renewal failed, they
+        get the same failure immediately rather than each trying again - a
+        stampede of sign-ins is exactly what gets an account throttled.
+
+        Raises :class:`SessionRenewalError` (carrying the usual
+        cause-plus-remedy text) when the session cannot be renewed.
+        """
+        with self._auth_lock:
+            if self._auth_generation != observed_generation:
+                return  # Renewed by another worker while we were failing.
+            if self._renew_failure is not None:
+                raise SessionRenewalError(self._renew_failure)
+            if self._session_renewals >= self.max_session_renewals:
+                self._renew_failure = (
+                    f"{cause.summary}\n  -> {cause.remedy}\n"
+                    f"  (gave up after {self._session_renewals} mid-run renewals)"
+                )
+                raise SessionRenewalError(self._renew_failure)
+
+            self._session_renewals += 1
+            self.logger.warning(json.dumps({
+                "event": "session_renew_started",
+                "account": self.email,
+                "cause": cause.code,
+                "renewal": self._session_renewals,
+            }))
+            try:
+                renewer = self.session_renewer or self._default_session_renew
+                renewer(cause)
+            except Exception as exc:
+                failure = classify_auth_error(exc)
+                if failure.code == "unknown":
+                    failure = cause
+                message = (
+                    f"{failure.summary}\n  -> {failure.remedy}\n"
+                    f"  (mid-run session renewal failed: {self._brief(exc)})"
+                )
+                self._renew_failure = message
+                self.logger.error(json.dumps({
+                    "event": "session_renew_failed",
+                    "account": self.email,
+                    "cause": cause.code,
+                    **failure.to_dict(),
+                }))
+                raise SessionRenewalError(message) from exc
+
+            self._auth_generation += 1
+            self.logger.warning(json.dumps({
+                "event": "session_renewed",
+                "account": self.email,
+                "cause": cause.code,
+                "generation": self._auth_generation,
+            }))
+
+    def _default_session_renew(self, cause: AuthFailure) -> None:
+        """Re-validate the stored session in place, without any prompt.
+
+        ``authenticate(force_refresh=True)`` rebuilds the session from the
+        stored trust token on the *same* requests session, so every DriveNode
+        already in hand keeps working. A mid-run renew can never answer 2FA:
+        if Apple wants a code, that is a failure to report, not a prompt.
+        """
+        api = self.api
+        if api is None:
+            raise Exception("No authenticated session to renew")
+        api.authenticate(force_refresh=True)
+        if getattr(api, "requires_2fa", False) or getattr(api, "requires_2sa", False):
+            raise Exception(
+                "Invalid session token: Apple requires a fresh two-factor sign-in, "
+                "which an unattended run cannot provide"
+            )
+        if cause.code.startswith("adp_"):
+            # Raises ADPError (already classified) if the cookies cannot be had.
+            ensure_pcs_cookies(PyiCloudPCSTransport(api), timeout=120.0)
+
     def _open_with_retry(
         self,
         item: Any,
         max_retries: Optional[int] = None,
         remote_path: Optional[str] = None,
     ) -> Any:
-        """Open item with retry logic for transient connection errors."""
+        """Open an item, retrying transient failures and renewing a dead session.
+
+        * throttles (429/503) and connection errors back off with full jitter,
+          honouring ``Retry-After`` from the response or Apple's JSON body;
+        * a session-death error (401 / invalid session token / 423 PCS) triggers
+          one single-flight renew, after which the open is retried once without
+          spending an attempt; a second death on the same open is final;
+        * anything else (auth, permissions, not-found) is raised at once.
+        """
         if max_retries is None:
             max_retries = self.max_retries
+        max_retries = max(1, max_retries)
 
-        last_error = None
+        last_error: Optional[Exception] = None
         current_item = item
-        for attempt in range(max_retries):
+        renewed = False
+        attempt = 0
+        while attempt < max_retries:
+            generation = self._auth_generation
             try:
                 return current_item.open(stream=True)
             except Exception as e:
@@ -1009,6 +1166,14 @@ class DownloadManager:
                     }))
                     raise
 
+                death = None if is_generic_404 else classify_session_death(e)
+                if death is not None:
+                    if renewed:
+                        raise  # Renewed already and still refused: final.
+                    self.renew_session(generation, death)
+                    renewed = True
+                    continue  # The retry after a renew does not use an attempt.
+
                 if is_generic_404 and remote_path and attempt < max_retries - 1:
                     try:
                         current_item = self.get_drive_item(remote_path)
@@ -1018,37 +1183,33 @@ class DownloadManager:
                             "remote_path": remote_path,
                             "attempt": attempt + 1,
                         }))
+                        attempt += 1
                         continue
                     except Exception as refresh_error:
                         last_error = refresh_error
                         raise
 
-                # Retry on connection errors and server errors, not on auth or other permanent errors
-                retryable = any(x in error_str for x in [
+                # Retry on throttles, connection and server errors - never on
+                # auth or other permanent errors.
+                retryable = is_throttle(e) or any(x in error_str for x in [
                     'connection', 'remote', 'timeout', 'reset',
-                    '503', 'service unavailable', 'retry_needed', 'internal_failure'
+                    'retry_needed', 'internal_failure',
                 ])
                 if retryable and attempt < max_retries - 1:
-                    # Check if server specified retryAfter
-                    wait_time = 2 ** (attempt + 1)  # Default: 2, 4, 8 seconds
-                    if 'retryafter' in error_str:
-                        import re
-                        match = re.search(r'retryafter["\s:]+(\d+)', error_str)
-                        if match:
-                            wait_time = min(int(match.group(1)), 60)
+                    wait_time = retry_wait(attempt + 1, e)
                     self.logger.warning(json.dumps({
                         "event": "connection_retry",
                         "file": getattr(current_item, 'name', 'unknown'),
                         "attempt": attempt + 1,
-                        "wait_seconds": wait_time,
+                        "throttled": is_throttle(e),
+                        "wait_seconds": round(wait_time, 3),
                         "error": str(e)
                     }))
                     time.sleep(wait_time)
+                    attempt += 1
                     continue
                 raise  # Non-retryable error
         raise last_error  # All retries exhausted
-
-
 
     def _prefix_resume_is_proven(
         self, local_path: Path, remote_size: Optional[int]
@@ -1561,7 +1722,7 @@ class DownloadManager:
                     "attempt": attempt + 1,
                     "error": str(exc),
                 }))
-                time.sleep(2 ** (attempt + 1))
+                time.sleep(retry_wait(attempt + 1, exc))
 
         if last_error is not None:
             # Reported as a failure by download_drive_item's handler.
@@ -1652,6 +1813,123 @@ class DownloadManager:
             "after_download", remote_item=item, local_path=local_path, success=True
         )
         return True
+
+    # -- ranged transfer -------------------------------------------------
+    def _plan_segments(self, ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """Split merged ranges into segments that can be fetched concurrently.
+
+        With intra-file parallelism off, the merged ranges are returned as-is
+        (one GET per range, exactly as before). Otherwise each range is cut
+        into ``range_segment_size`` pieces, so a lone multi-GB file can use the
+        idle part of the range budget - and no single GET has to hold a whole
+        file in memory. A range no bigger than one segment stays one GET.
+        """
+        if self.range_concurrency <= 1:
+            return list(ranges)
+        size = self.range_segment_size
+        segments: List[Tuple[int, int]] = []
+        for start, end in ranges:
+            while start <= end:
+                stop = min(end, start + size - 1)
+                segments.append((start, stop))
+                start = stop + 1
+        return segments
+
+    def _fetch_ranges(
+        self,
+        url: str,
+        ranges: List[Tuple[int, int]],
+        out_file: Any,
+        *,
+        item: Any,
+        local_path: Path,
+        tracker: DownloadTracker,
+        total_size: int,
+    ) -> None:
+        """Fetch ``ranges`` into ``out_file``, in parallel where worthwhile.
+
+        Correctness rules, which hold however the segments interleave:
+
+        * segments never overlap, and every seek+write happens under one lock
+          on the single file handle, so concurrent writes cannot tear;
+        * the tracker and journal only ever advance to the end of the
+          *contiguous* run of finished segments from the first one, and only
+          after those bytes are flushed - so they move monotonically and a
+          crash resumes from a prefix that is genuinely on disk. Segments that
+          finished out of order beyond it are simply fetched again;
+        * on the first failure no new segment starts; in-flight ones finish,
+          and the first error is raised.
+        """
+        segments = self._plan_segments(ranges)
+        if not segments:
+            return
+        write_lock = threading.Lock()
+        finished = [False] * len(segments)
+        frontier = 0  # index of the first segment not yet durably contiguous
+
+        def store(index: int, payload: bytes) -> None:
+            nonlocal frontier
+            start, _end = segments[index]
+            with write_lock:
+                out_file.seek(start)
+                out_file.write(payload)
+                finished[index] = True
+                advanced_to: Optional[int] = None
+                while frontier < len(segments) and finished[frontier]:
+                    advanced_to = segments[frontier][1]
+                    frontier += 1
+                if advanced_to is None:
+                    return
+                # Flushed before it is recorded: a checkpoint must never claim
+                # bytes still sitting in a userspace buffer a crash would drop.
+                out_file.flush()
+                tracker.save_status(advanced_to + 1)
+                # Same durable write point the tracker already uses, so the
+                # journal costs no extra fsync boundary.
+                self.journal.progress(local_path, advanced_to + 1)
+                # Streaming progress event (generic)
+                self.plugin_manager.dispatch(
+                    "on_event",
+                    name="download_progress",
+                    remote_item=item,
+                    local_path=local_path,
+                    downloaded=advanced_to,
+                    total_size=total_size,
+                )
+
+        workers = min(self.range_concurrency, len(segments))
+        if workers <= 1:
+            for index, (start, end) in enumerate(segments):
+                store(index, self.download_chunk(url, start, end, item=item))
+            return
+
+        stop = threading.Event()
+
+        def fetch(index: int) -> None:
+            if stop.is_set():
+                return
+            start, end = segments[index]
+            try:
+                payload = self.download_chunk(url, start, end, item=item)
+            except BaseException:
+                stop.set()
+                raise
+            store(index, payload)
+
+        self.logger.info(json.dumps({
+            "event": "parallel_range_fetch",
+            "file": getattr(item, "name", "unknown"),
+            "segments": len(segments),
+            "concurrency": workers,
+        }))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ifetch-range") as pool:
+            futures = [pool.submit(fetch, index) for index in range(len(segments))]
+            wait(futures, return_when=FIRST_EXCEPTION)
+            if any(f.done() and f.exception() is not None for f in futures):
+                stop.set()
+        errors = [f.exception() for f in futures if f.exception() is not None]
+        if errors:
+            raise errors[0]
 
     def download_drive_item(
         self,
@@ -1873,24 +2151,11 @@ class DownloadManager:
                         pass  # Non-fatal; continue with download
 
                 with temp_path.open('r+b') as out_file:
-                    for start, end in changed_ranges:
-                        chunk = self.download_chunk(response.url, start, end, item=item)
-                        out_file.seek(start)
-                        out_file.write(chunk)
-                        tracker.save_status(end + 1)
-                        # Same durable write point the tracker already uses, so
-                        # the journal costs no extra fsync boundary.
-                        self.journal.progress(local_path, end + 1)
-
-                        # Streaming progress event (generic)
-                        self.plugin_manager.dispatch(
-                            "on_event",
-                            name="download_progress",
-                            remote_item=item,
-                            local_path=local_path,
-                            downloaded=end,
-                            total_size=total_size,
-                        )
+                    self._fetch_ranges(
+                        response.url, changed_ranges, out_file,
+                        item=item, local_path=local_path, tracker=tracker,
+                        total_size=total_size,
+                    )
 
                 # Only calculate checksum if temp_path exists and has content
                 if temp_path.exists() and temp_path.stat().st_size > 0:

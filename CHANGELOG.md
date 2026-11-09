@@ -11,6 +11,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Parallel range GETs within one large file** (#45). A file bigger than one
+  8 MiB segment is fetched as several concurrent range requests instead of a
+  single sequential stream, so a tree of a few multi-GB files no longer leaves
+  most of `--max-workers` idle. Every range GET in the process draws from one
+  shared budget of `--max-workers` slots, so total in-flight requests never
+  exceed what they did before. The tracker and transfer journal only advance
+  over the contiguous, flushed prefix, so a crash still resumes from bytes that
+  are really on disk. Tune with `--range-concurrency N` (`1` turns it off).
+
+### Fixed
+
+- **Throttle retries no longer stampede** (#46). Open and range-GET retries
+  use capped exponential backoff with full jitter instead of a fixed `2**n`
+  sleep. `429` is retried like `503` on both paths, and `Retry-After` is
+  honoured from response headers, Apple's JSON body or the error text (capped
+  at 60 s).
+- **Session death mid-run is renewed once, not fatal** (#44). A `401`,
+  `Invalid Session Token`, or `423` / missing PCS during a download triggers a
+  single process-wide session renew; other workers wait for its result and
+  retry rather than each signing in again. A renew that fails (for example
+  because Apple now wants a 2FA code) fails every affected file with the usual
+  cause-and-remedy message, and later files fail fast without retrying it.
+
 ## [1.1.0] - 2026-09-29
 
 ### Fixed
