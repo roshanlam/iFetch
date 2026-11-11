@@ -312,6 +312,14 @@ def main(argv=None):
         except BandwidthLimitError as exc:
             parser.error(str(exc))
 
+    # Reject non-positive worker counts before the banner prints and before
+    # any network I/O: ThreadPoolExecutor would otherwise die with ValueError
+    # deep inside the first download, after authentication already happened.
+    if args.max_workers < 1:
+        parser.error("--max-workers must be a positive integer")
+    if args.range_concurrency is not None and args.range_concurrency < 1:
+        parser.error("--range-concurrency must be a positive integer")
+
     try:
         # Create a progress banner
         print("=" * 70)
